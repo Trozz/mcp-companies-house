@@ -69,6 +69,8 @@ impl Injected {
 pub struct FakeState {
     /// Company profiles by company number.
     pub companies: BTreeMap<String, Value>,
+    /// Other resources by request path (see `fake_records`).
+    pub resources: BTreeMap<String, Value>,
     pub log: Vec<Logged>,
     /// Responses to send instead of the normal ones, one per request, in order.
     pub inject: VecDeque<Injected>,
@@ -228,6 +230,7 @@ impl FakeState {
         add(holdings);
         FakeState {
             companies,
+            resources: super::fake_records::fixtures(),
             log: Vec::new(),
             inject: VecDeque::new(),
             rate_remaining: RATE_LIMIT,
@@ -538,6 +541,14 @@ async fn handle(
     let (status, body) = match segments.as_slice() {
         ["search", "companies"] => search(&st, &query),
         ["advanced-search", "companies"] => advanced(&st, &query),
+        ["search", "officers"] => (200, super::fake_records::officer_search(&query)),
+        ["search", "disqualified-officers"] => {
+            (200, super::fake_records::disqualified_search(&query))
+        }
+        ["dissolved-search", "companies"] => super::fake_records::dissolved(&st.companies, &query),
+        ["alphabetical-search", "companies"] => {
+            super::fake_records::alphabetical(&st.companies, &query)
+        }
         ["company", number] => match st.companies.get(*number) {
             Some(p) => (200, p.clone()),
             None => (
@@ -548,7 +559,10 @@ async fn handle(
                 }),
             ),
         },
-        _ => (404, json!({"error": "Not found"})),
+        _ => match super::fake_records::canned(&st.resources, &path, &query) {
+            Some(v) => (200, v),
+            None => (404, json!({"error": "Not found"})),
+        },
     };
     respond(status, body.to_string(), rate, &[]).into_response()
 }

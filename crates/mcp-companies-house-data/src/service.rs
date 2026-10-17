@@ -73,7 +73,26 @@ mod tests {
         assert!(svc.log_caps().is_empty());
         assert_eq!(
             svc.tool_names(),
-            vec!["filter_companies", "get_company", "search_companies"]
+            vec![
+                "browse_company_names",
+                "check_company_name_availability",
+                "company_report",
+                "filter_companies",
+                "get_charge",
+                "get_company",
+                "get_disqualified_officer",
+                "get_insolvency",
+                "get_officer_appointments",
+                "list_charges",
+                "list_filing_history",
+                "list_officers",
+                "list_persons_with_significant_control",
+                "lookup_sic_codes",
+                "search_companies",
+                "search_disqualified_officers",
+                "search_dissolved_companies",
+                "search_officers",
+            ]
         );
     }
 

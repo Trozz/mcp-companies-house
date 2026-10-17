@@ -1,10 +1,10 @@
 # mcp-companies-house
 
-A self-hosted [Model Context Protocol](https://modelcontextprotocol.io) server for the UK [Companies House](https://developer.company-information.service.gov.uk) register. MCP clients such as claude.ai, Claude Desktop and Claude Code can search for companies, filter the register and read company profiles.
+A self-hosted [Model Context Protocol](https://modelcontextprotocol.io) server for the UK [Companies House](https://developer.company-information.service.gov.uk) register. MCP clients such as claude.ai, Claude Desktop and Claude Code can search and filter the register, read company profiles, officers, owners, filings, charges and insolvency records, and put together a due-diligence overview of a company.
 
 | Service | Path | What it does |
 |---|---|---|
-| Companies | `/companies` | Search companies by name or number, filter the register (status, type, SIC code, location, dates) and read company profiles |
+| Companies | `/companies` | Search and filter companies; read profiles, officers and their appointments, persons with significant control, filing history, charges, insolvency and disqualifications; look up SIC codes; one-call company reports |
 
 - Single static Rust binary, shipped as a `FROM scratch` container image.
 - TLS end to end: the server terminates TLS itself, and every call to Companies House is verified.
@@ -30,21 +30,54 @@ MCP clients reach each service over HTTPS at its path (`https://<host>/companies
 
 ## Company tools (`/companies`)
 
+### Finding companies
+
 | Tool | What it does |
 |---|---|
 | `search_companies` | Search by company name or number, best match first. Optional `active_only`. Paged with `limit` (1 to 100, default 20) and `start_index` |
 | `filter_companies` | The Companies House advanced search: `name_includes`, `name_excludes`, `status`, `company_type`, `subtype`, `sic_codes`, `location` (registered office), `incorporated_from`/`incorporated_to`, `dissolved_from`/`dissolved_to`. Filters combine with AND, values within a filter with OR. `total` counts every match, so `limit: 1` counts cheaply |
-| `get_company` | One company's profile: status, type, dates, registered office, SIC codes, previous names, accounts and confirmation statement due dates (and whether overdue), and `records_available` (for example `officers`, `charges`, `insolvency`) |
+| `search_dissolved_companies` | Search dissolved companies by name, or by a name they had before (`match_on: previous_names`) |
+| `check_company_name_availability` | Active companies whose name Companies House treats as the same as a proposed name; `available` is true when there are none. Sensitive words and "too like" rules are not checked |
+| `browse_company_names` | Companies in register (alphabetical) order around a name |
+| `lookup_sic_codes` | Find SIC 2007 codes by words ("bakery", "software development") or digits, or describe codes. Works offline from the Companies House condensed list |
 
-- Companies are addressed by company number. `get_company` ignores spaces, upper-cases letters and pads short numbers with zeros (`445790` becomes `00445790`, `SC1234` becomes `SC001234`).
+### Reading a company
+
+| Tool | What it does |
+|---|---|
+| `get_company` | Profile: status, type, dates, registered office, SIC codes with descriptions (`nature_of_business`), previous names, accounts and confirmation statement due dates (and whether overdue), and `records_available` (for example `officers`, `charges`, `insolvency`) |
+| `company_report` | One call for due diligence: profile, current officers, current persons with significant control and PSC statements, recent filings, charges not yet satisfied and insolvency cases. Up to 6 Companies House requests; sections that fail are listed under `unavailable` instead of failing the call |
+| `list_officers` | Directors, secretaries, LLP members and others, current and resigned, with `officer_id` |
+| `list_persons_with_significant_control` | Owners and controllers (and beneficial owners of overseas entities) with natures of control; the first page also has PSC statements |
+| `list_filing_history` | Filings newest first, optionally by `categories` (for example `accounts`, `officers`), with the Companies House description key and `document_id` |
+| `list_charges`, `get_charge` | Mortgages and other secured lending: status, lender, what is charged, dates; `get_charge` gives the full record |
+| `get_insolvency` | Insolvency cases with their dates and practitioners |
+
+### People
+
+| Tool | What it does |
+|---|---|
+| `search_officers` | Officers by name, with `officer_id` and number of appointments |
+| `get_officer_appointments` | Every appointment of one officer across companies, optionally only current ones |
+| `search_disqualified_officers`, `get_disqualified_officer` | People and companies disqualified from being directors, and the details of each disqualification |
+
+### Conventions
+
+- Companies are addressed by company number. Tools ignore spaces, upper-case letters and pad short numbers with zeros (`445790` becomes `00445790`, `SC1234` becomes `SC001234`). Officers, charges and disqualified officers are addressed by the ids the list and search tools return.
 - Status, type and subtype are the exact Companies House codes (`active`, `liquidation`, `ltd`, `llp`, `community-interest-company`, ...). The tool schema lists every accepted value, so clients cannot send a code the API does not know.
-- Dates are `YYYY-MM-DD`. SIC codes are the 4 or 5 digit SIC 2007 codes, for example `62012`.
+- Dates are `YYYY-MM-DD`. SIC codes are the 4 or 5 digit SIC 2007 codes, for example `62012`; `lookup_sic_codes` finds them.
+- Officers' and owners' dates of birth are shown as month and year only, as Companies House publishes them.
+- Filing descriptions are Companies House description keys (for example `accounts-with-accounts-type-micro-entity`) with their values, not the wording shown on the Companies House website.
 - List results share one shape: `total`, `start_index`, `count`, `items` and, when more results exist, `next_start_index` to pass as the next `start_index`.
 - Errors are tool results whose text starts with a kind: `validation`, `not_found`, `auth`, `rate_limited`, `upstream` or `internal`.
 
 ### Rate limit
 
 Companies House allows 600 requests per 5 minutes per key and answers `429` for the rest of the window once it is used up; applications that keep exceeding it can be banned. The server tracks the `X-Ratelimit-*` headers: when the window is used up, tools return `rate_limited` with the seconds until it resets, without calling Companies House again until then. A request is retried once only after a network error or a `5xx`.
+
+### SIC codes
+
+`lookup_sic_codes` and the `nature_of_business` descriptions use Companies House's [SIC 2007 condensed list](https://www.gov.uk/government/publications/standard-industrial-classification-of-economic-activities-sic) (731 codes, including the Companies House codes `74990` Non-trading company and `99999` Dormant Company), stored in `crates/mcp-companies-house-data/data/sic2007.tsv`. Contains public sector information licensed under the Open Government Licence v3.0.
 
 ## Quick start
 
@@ -183,7 +216,7 @@ cargo deny check
 bash scripts/test-next-version.sh
 ```
 
-The tests run against an in-memory fake of the Companies House API. Live smoke tests against the sandbox are ignored by default; they need a sandbox REST key and create one test company with the [test data generator](https://developer.company-information.service.gov.uk/api-testing), which they always delete again:
+The tests run against an in-memory fake of the Companies House API. Live smoke tests against the sandbox are ignored by default; they need a sandbox REST key and create test companies with the [test data generator](https://developer.company-information.service.gov.uk/api-testing), which they always delete again. The sandbox serves profiles, officers and PSCs for generated companies, but its search index is empty and filing history and PSC statements answer HTTP 500, so those tests check shapes and graceful failure rather than content:
 
 ```bash
 COMPANIES_HOUSE_API_KEY=... cargo test -p mcp-companies-house-data --test live_sandbox -- --ignored --nocapture

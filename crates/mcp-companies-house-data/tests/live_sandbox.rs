@@ -120,6 +120,47 @@ async fn get_company_round_trip_with_a_generated_company() {
 
 #[tokio::test]
 #[ignore = "needs a sandbox COMPANIES_HOUSE_API_KEY and network access"]
+async fn company_report_on_a_generated_company() {
+    let (number, auth_code) = create_company().await;
+    println!("created sandbox company {number}");
+    let s = server();
+    let report = s
+        .company_report(params(json!({"company_number": number})))
+        .await
+        .unwrap();
+    let officers = s
+        .list_officers(params(json!({"company_number": number})))
+        .await
+        .unwrap();
+    let filings = s
+        .list_filing_history(params(json!({"company_number": number})))
+        .await
+        .unwrap();
+    delete_company(&number, &auth_code).await;
+    println!("deleted sandbox company {number}");
+
+    // The sandbox serves profiles reliably but often fails officers and filing history (HTTP
+    // 500/502): the report must still answer, listing what it could not read.
+    let v = json(&report);
+    println!("company_report: {v}");
+    assert_eq!(v["company"]["company_number"], number.as_str());
+    assert!(v["company"]["nature_of_business"].is_array(), "{v}");
+    for section in [
+        "officers",
+        "persons_with_significant_control",
+        "recent_filings",
+    ] {
+        assert!(
+            v.get(section).is_some() || v["unavailable"].get(section).is_some(),
+            "{section} neither present nor listed as unavailable: {v}"
+        );
+    }
+    println!("list_officers: {}", support::tools::text(&officers));
+    println!("list_filing_history: {}", support::tools::text(&filings));
+}
+
+#[tokio::test]
+#[ignore = "needs a sandbox COMPANIES_HOUSE_API_KEY and network access"]
 async fn searches_answer_in_the_expected_shape() {
     let s = server();
     let v = json(

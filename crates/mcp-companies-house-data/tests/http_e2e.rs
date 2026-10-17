@@ -158,13 +158,26 @@ async fn tools_are_listed_read_only_with_their_schemas() {
     let list = call(&app, &session, 2, "tools/list", json!({})).await;
     let tools = list["result"]["tools"].as_array().unwrap();
     let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
-    assert_eq!(
-        names,
-        vec!["filter_companies", "get_company", "search_companies"]
-    );
+    assert_eq!(names.len(), 18, "{names:?}");
+    for name in [
+        "search_companies",
+        "filter_companies",
+        "get_company",
+        "list_officers",
+        "list_persons_with_significant_control",
+        "list_filing_history",
+        "list_charges",
+        "get_insolvency",
+        "company_report",
+        "lookup_sic_codes",
+    ] {
+        assert!(names.contains(&name), "{name} missing from {names:?}");
+    }
     for t in tools {
         assert_eq!(t["annotations"]["readOnlyHint"], true, "{t}");
-        assert_eq!(t["annotations"]["openWorldHint"], true, "{t}");
+        // Only the SIC lookup works offline; every other tool calls Companies House.
+        let offline = t["name"] == "lookup_sic_codes";
+        assert_eq!(t["annotations"]["openWorldHint"], !offline, "{t}");
     }
     let filter = tools
         .iter()

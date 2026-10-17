@@ -144,7 +144,7 @@ fn map_status(path: &str, status: StatusCode, body: &str, reset_in_secs: Option<
         403 => ChError::Upstream(with_detail(format!(
             "GET {path} was refused (HTTP 403); check the API key's IP or domain restrictions in the Developer Hub"
         ))),
-        404 => ChError::NotFound(path.to_string()),
+        404 => ChError::NotFound(format!("nothing found at {path}")),
         429 => ChError::RateLimited { reset_in_secs },
         400 | 416 | 422 => ChError::Validation(with_detail(format!(
             "Companies House rejected the request (HTTP {})",

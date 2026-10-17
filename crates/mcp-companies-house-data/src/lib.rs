@@ -3,6 +3,7 @@ pub mod codes;
 pub mod config;
 pub mod error;
 pub mod service;
+pub mod sic;
 pub mod tools;
 pub mod view;
 

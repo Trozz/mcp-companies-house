@@ -4,7 +4,8 @@ pub enum ChError {
         "Companies House rejected the API key. Check COMPANIES_HOUSE_API_KEY is a REST API key (not a stream key) for the environment COMPANIES_HOUSE_API_URL points at: sandbox keys only work against the sandbox"
     )]
     Auth,
-    #[error("not found: {0}")]
+    /// A complete message: tool errors are already prefixed with the kind, `not_found: `.
+    #[error("{0}")]
     NotFound(String),
     #[error("{}", rate_limited_message(*.reset_in_secs))]
     RateLimited {
@@ -75,6 +76,15 @@ mod tests {
         let msg = ChError::Auth.to_string();
         assert!(msg.contains("COMPANIES_HOUSE_API_KEY"), "{msg}");
         assert!(msg.contains("sandbox"), "{msg}");
+    }
+
+    #[test]
+    fn not_found_messages_are_not_prefixed_twice() {
+        let e = ChError::NotFound("no company with number 1".into());
+        assert_eq!(
+            format!("{}: {e}", e.kind()),
+            "not_found: no company with number 1"
+        );
     }
 
     #[test]

@@ -4,6 +4,9 @@
 
 use serde_json::{Map, Value, json};
 
+pub mod people;
+pub mod records;
+
 /// Profile members that are deprecated in favour of `links` or `subtype`, or are noise to a reader.
 const PROFILE_DROPPED: &[&str] = &[
     "etag",
@@ -35,7 +38,7 @@ pub fn prune(v: Value) -> Option<Value> {
     }
 }
 
-fn text<'a>(v: &'a Value, key: &str) -> Option<&'a str> {
+pub(crate) fn text<'a>(v: &'a Value, key: &str) -> Option<&'a str> {
     v.get(key)
         .and_then(Value::as_str)
         .map(str::trim)
@@ -68,7 +71,7 @@ pub fn one_line_address(addr: &Value) -> Option<String> {
     (!parts.is_empty()).then(|| parts.join(", "))
 }
 
-fn object(pairs: Vec<(&str, Option<Value>)>) -> Value {
+pub(crate) fn object(pairs: Vec<(&str, Option<Value>)>) -> Value {
     let map: Map<String, Value> = pairs
         .into_iter()
         .filter_map(|(k, v)| v.and_then(prune).map(|v| (k.to_string(), v)))
@@ -76,8 +79,53 @@ fn object(pairs: Vec<(&str, Option<Value>)>) -> Value {
     Value::Object(map)
 }
 
-fn field(v: &Value, key: &str) -> Option<Value> {
+pub(crate) fn field(v: &Value, key: &str) -> Option<Value> {
     v.get(key).cloned()
+}
+
+/// A value at a `/`-separated path of object keys, e.g. `links/officer/appointments`.
+pub(crate) fn at<'a>(v: &'a Value, path: &str) -> Option<&'a Value> {
+    path.split('/').try_fold(v, |v, k| v.get(k))
+}
+
+/// The path segment after `key` in a Companies House link, for example the officer id in
+/// `/officers/{id}/appointments`.
+pub fn segment_after(link: &str, key: &str) -> Option<String> {
+    let mut parts = link.split(['/', '?']).filter(|p| !p.is_empty());
+    parts.find(|p| *p == key)?;
+    parts.next().map(str::to_string)
+}
+
+/// The last path segment of a Companies House link.
+pub fn last_segment(link: &str) -> Option<String> {
+    link.split('?')
+        .next()?
+        .rsplit('/')
+        .find(|p| !p.is_empty())
+        .map(str::to_string)
+}
+
+/// A partial date of birth `{"month": 3, "year": 1970}` as `1970-03`; a full date string as is.
+pub fn birth(v: Option<&Value>) -> Option<Value> {
+    let v = v?;
+    if let Some(s) = v.as_str() {
+        return Some(Value::from(s));
+    }
+    let year = v.get("year").and_then(Value::as_u64)?;
+    match v.get("month").and_then(Value::as_u64) {
+        Some(m) => Some(Value::from(format!("{year}-{m:02}"))),
+        None => Some(Value::from(year.to_string())),
+    }
+}
+
+/// A resource without `etag`, `links` and empty members.
+pub fn detail(v: Value) -> Value {
+    let Value::Object(mut map) = v else {
+        return Value::Object(Map::new());
+    };
+    map.remove("etag");
+    map.remove("links");
+    prune(Value::Object(map)).unwrap_or_else(|| Value::Object(Map::new()))
 }
 
 /// One result of `/search/companies`.
@@ -112,6 +160,56 @@ pub fn advanced_item(item: &Value) -> Value {
         ("date_of_cessation", field(item, "date_of_cessation")),
         ("address", address.map(Value::from)),
         ("sic_codes", field(item, "sic_codes")),
+    ])
+}
+
+/// One result of `/dissolved-search/companies`.
+pub fn dissolved_item(item: &Value) -> Value {
+    let previous: Vec<Value> = item
+        .get("previous_company_names")
+        .and_then(Value::as_array)
+        .map(|names| {
+            names
+                .iter()
+                .map(|n| {
+                    object(vec![
+                        ("name", field(n, "name")),
+                        ("effective_from", field(n, "effective_from")),
+                        ("ceased_on", field(n, "ceased_on")),
+                    ])
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    object(vec![
+        ("company_number", field(item, "company_number")),
+        ("company_name", field(item, "company_name")),
+        ("company_status", field(item, "company_status")),
+        ("date_of_creation", field(item, "date_of_creation")),
+        ("date_of_cessation", field(item, "date_of_cessation")),
+        (
+            "address",
+            item.get("registered_office_address")
+                .and_then(one_line_address)
+                .map(Value::from),
+        ),
+        ("previous_company_names", Some(Value::Array(previous))),
+        (
+            "matched_previous_name",
+            item.get("matched_previous_company_name")
+                .and_then(|m| m.get("name"))
+                .cloned(),
+        ),
+    ])
+}
+
+/// One result of `/alphabetical-search/companies`.
+pub fn alphabetical_item(item: &Value) -> Value {
+    object(vec![
+        ("company_number", field(item, "company_number")),
+        ("company_name", field(item, "company_name")),
+        ("company_status", field(item, "company_status")),
+        ("company_type", field(item, "company_type")),
     ])
 }
 
@@ -265,6 +363,83 @@ mod tests {
             })
         );
         assert_eq!(company_profile(json!("odd")), json!({}));
+    }
+
+    #[test]
+    fn link_segments_are_extracted() {
+        assert_eq!(
+            segment_after("/officers/AbC-1_x/appointments", "officers").as_deref(),
+            Some("AbC-1_x")
+        );
+        assert_eq!(
+            segment_after("/disqualified-officers/natural/xyz", "natural").as_deref(),
+            Some("xyz")
+        );
+        assert_eq!(segment_after("/company/1", "officers"), None);
+        assert_eq!(
+            last_segment("/company/1/charges/ch-1?x=1").as_deref(),
+            Some("ch-1")
+        );
+        assert_eq!(
+            last_segment("https://document-api.example/document/doc-9/").as_deref(),
+            Some("doc-9")
+        );
+        assert_eq!(at(&json!({"a": {"b": {"c": 1}}}), "a/b/c"), Some(&json!(1)));
+    }
+
+    #[test]
+    fn births_are_shown_as_year_and_month() {
+        assert_eq!(
+            birth(Some(&json!({"month": 3, "year": 1970}))),
+            Some(json!("1970-03"))
+        );
+        assert_eq!(birth(Some(&json!({"year": 1970}))), Some(json!("1970")));
+        assert_eq!(birth(Some(&json!("1970-03-15"))), Some(json!("1970-03-15")));
+        assert_eq!(birth(Some(&json!({}))), None);
+        assert_eq!(birth(None), None);
+    }
+
+    #[test]
+    fn details_drop_etag_links_and_empties() {
+        assert_eq!(
+            detail(json!({"etag": "e", "links": {"self": "/x"}, "a": "", "b": 1})),
+            json!({"b": 1})
+        );
+        assert_eq!(detail(json!([1])), json!({}));
+    }
+
+    #[test]
+    fn dissolved_items_show_previous_names() {
+        let item = json!({
+            "company_name": "OLD CO LIMITED", "company_number": "01234567",
+            "company_status": "dissolved", "date_of_creation": "1990-01-01",
+            "date_of_cessation": "2010-01-01", "kind": "search-results#dissolved-company",
+            "ordered_alpha_key_with_id": "OLDCO:01234567",
+            "registered_office_address": {"address_line_1": "1 Street", "locality": "Hull", "postal_code": "HU1 1AA"},
+            "previous_company_names": [{"name": "OLDER CO LIMITED", "company_number": "01234567", "effective_from": "1990-01-01", "ceased_on": "2000-01-01"}],
+            "matched_previous_company_name": {"name": "OLDER CO LIMITED"}
+        });
+        assert_eq!(
+            dissolved_item(&item),
+            json!({
+                "company_number": "01234567", "company_name": "OLD CO LIMITED",
+                "company_status": "dissolved", "date_of_creation": "1990-01-01",
+                "date_of_cessation": "2010-01-01", "address": "1 Street, Hull, HU1 1AA",
+                "previous_company_names": [{"name": "OLDER CO LIMITED", "effective_from": "1990-01-01", "ceased_on": "2000-01-01"}],
+                "matched_previous_name": "OLDER CO LIMITED"
+            })
+        );
+    }
+
+    #[test]
+    fn alphabetical_items_are_compact() {
+        let item = json!({"company_name": "A LTD", "company_number": "1", "company_status": "active",
+            "company_type": "ltd", "ordered_alpha_key_with_id": "A:1", "kind": "search-results#alphabetical-search",
+            "links": {"company_profile": "/company/1"}});
+        assert_eq!(
+            alphabetical_item(&item),
+            json!({"company_number": "1", "company_name": "A LTD", "company_status": "active", "company_type": "ltd"})
+        );
     }
 
     #[test]
