@@ -241,6 +241,10 @@ pub trait Service: Send + Sync + 'static {
 
 Routing, OAuth metadata, token audiences, `COMPANIES_HOUSE_SERVICES` and the release pipeline pick the new service up without further changes.
 
+### Planned services
+
+`docs/plans/streaming-and-filing.md` proposes a `/streaming` service (Streaming API, needs a stream key from a live application) and a `/filing` service (registered office and registered email address changes through the Companies House filing API and OAuth). Neither is built yet.
+
 ### Updating the shared core
 
 `mcp-server-core` comes from `Trozz/mcp-icloud` at the commit in the workspace `Cargo.toml`. To pick up core changes, set `rev` to the new commit and run `cargo update -p mcp-server-core`, then the checks above.
