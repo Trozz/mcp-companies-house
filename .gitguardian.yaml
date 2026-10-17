@@ -1,0 +1,7 @@
+version: 2
+secret:
+  ignored_matches:
+    - name: test-only Companies House API key placeholder
+      match: test-api-key
+    - name: test-only Basic authorization value for the placeholder key
+      match: dGVzdC1hcGkta2V5Og==

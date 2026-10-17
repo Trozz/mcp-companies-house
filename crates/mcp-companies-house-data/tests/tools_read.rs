@@ -1,0 +1,380 @@
+mod support;
+use serde_json::{Value, json};
+use support::fake_ch::{FakeCh, FakeState, Injected, now_unix};
+use support::tools::{error_text, json, params, server, server_with_key};
+
+async fn fake() -> FakeCh {
+    FakeCh::start(FakeState::register()).await
+}
+
+fn numbers(v: &Value) -> Vec<&str> {
+    v["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|i| i["company_number"].as_str().unwrap())
+        .collect()
+}
+
+#[tokio::test]
+async fn search_companies_returns_compact_matches() {
+    let fake = fake().await;
+    let r = server(&fake)
+        .search_companies(params(json!({"query": "acme"})))
+        .await
+        .unwrap();
+    let v = json(&r);
+    assert_eq!(v["total"], 3);
+    assert_eq!(v["count"], 3);
+    assert_eq!(v["start_index"], 0);
+    assert!(v.get("next_start_index").is_none(), "{v}");
+    assert_eq!(
+        v["items"][0],
+        json!({
+            "company_number": "00000001",
+            "company_name": "ACME WIDGETS LIMITED",
+            "company_status": "active",
+            "company_type": "ltd",
+            "date_of_creation": "2015-03-01",
+            "address": "1, Park Row, Leeds, LS1 5AB, England"
+        })
+    );
+    let log = fake.requests();
+    assert_eq!(log[0].path, "/search/companies");
+    assert_eq!(log[0].param("q"), Some("acme"));
+    assert_eq!(log[0].param("items_per_page"), Some("20"));
+    assert_eq!(log[0].param("start_index"), Some("0"));
+    assert_eq!(log[0].param("restrictions"), None);
+}
+
+#[tokio::test]
+async fn search_companies_pages_and_filters_to_active() {
+    let fake = fake().await;
+    let s = server(&fake);
+    let v = json(
+        &s.search_companies(params(json!({"query": "acme", "limit": 2})))
+            .await
+            .unwrap(),
+    );
+    assert_eq!(numbers(&v), vec!["00000001", "00000002"]);
+    assert_eq!(v["next_start_index"], 2);
+    let v = json(
+        &s.search_companies(params(
+            json!({"query": "acme", "limit": 2, "start_index": 2}),
+        ))
+        .await
+        .unwrap(),
+    );
+    assert_eq!(numbers(&v), vec!["00000006"]);
+    assert!(v.get("next_start_index").is_none(), "{v}");
+
+    let v = json(
+        &s.search_companies(params(json!({"query": "acme", "active_only": true})))
+            .await
+            .unwrap(),
+    );
+    assert_eq!(numbers(&v), vec!["00000001", "00000002"]);
+    let last = fake.requests().pop().unwrap();
+    assert_eq!(last.param("restrictions"), Some("active-companies"));
+}
+
+#[tokio::test]
+async fn search_companies_shows_cessation_dates() {
+    let fake = fake().await;
+    let v = json(
+        &server(&fake)
+            .search_companies(params(json!({"query": "thistle"})))
+            .await
+            .unwrap(),
+    );
+    assert_eq!(v["items"][0]["company_status"], "dissolved");
+    assert_eq!(v["items"][0]["date_of_cessation"], "2020-05-05");
+}
+
+#[tokio::test]
+async fn search_companies_validates_before_calling() {
+    let fake = fake().await;
+    let s = server(&fake);
+    for (args, msg) in [
+        (json!({"query": "   "}), "query must not be empty"),
+        (
+            json!({"query": "acme", "limit": 0}),
+            "limit must be between 1 and 100",
+        ),
+        (
+            json!({"query": "acme", "limit": 500}),
+            "limit must be between 1 and 100",
+        ),
+        (
+            json!({"query": "x".repeat(201)}),
+            "query is limited to 200 characters",
+        ),
+    ] {
+        let r = s.search_companies(params(args.clone())).await.unwrap();
+        let text = error_text(&r);
+        assert!(text.starts_with("validation: "), "{args}: {text}");
+        assert!(text.contains(msg), "{args}: {text}");
+    }
+    assert!(fake.requests().is_empty());
+}
+
+#[tokio::test]
+async fn filter_companies_combines_filters() {
+    let fake = fake().await;
+    let s = server(&fake);
+    let v = json(
+        &s.filter_companies(params(json!({
+            "location": "leeds",
+            "status": ["active"],
+            "company_type": ["ltd"],
+        })))
+        .await
+        .unwrap(),
+    );
+    assert_eq!(v["total"], 3);
+    assert_eq!(numbers(&v), vec!["00000001", "00000002", "00000005"]);
+    assert_eq!(
+        v["items"][1],
+        json!({
+            "company_number": "00000002",
+            "company_name": "ACME BAKERY LIMITED",
+            "company_status": "active",
+            "company_type": "ltd",
+            "date_of_creation": "2021-06-15",
+            "address": "Unit 4, Kirkstall Road, Leeds, LS3 1LH, England",
+            "sic_codes": ["10710", "47240"]
+        })
+    );
+    let log = fake.requests();
+    assert_eq!(log[0].path, "/advanced-search/companies");
+    assert_eq!(log[0].param("location"), Some("leeds"));
+    assert_eq!(log[0].param("company_status"), Some("active"));
+    assert_eq!(log[0].param("company_type"), Some("ltd"));
+    assert_eq!(log[0].param("size"), Some("20"));
+    assert_eq!(log[0].param("start_index"), Some("0"));
+}
+
+#[tokio::test]
+async fn filter_companies_by_sic_code_subtype_and_dates() {
+    let fake = fake().await;
+    let s = server(&fake);
+    let v = json(
+        &s.filter_companies(params(json!({"sic_codes": ["62012", "62020"]})))
+            .await
+            .unwrap(),
+    );
+    assert_eq!(numbers(&v), vec!["00000001", "SC000003"]);
+    assert_eq!(
+        fake.requests().pop().unwrap().param("sic_codes"),
+        Some("62012,62020")
+    );
+
+    let v = json(
+        &s.filter_companies(params(json!({"subtype": ["community-interest-company"]})))
+            .await
+            .unwrap(),
+    );
+    assert_eq!(numbers(&v), vec!["00000005"]);
+    assert_eq!(
+        v["items"][0]["company_subtype"],
+        "community-interest-company"
+    );
+
+    let v = json(
+        &s.filter_companies(params(json!({
+            "incorporated_from": "2018-01-01",
+            "incorporated_to": "2021-12-31"
+        })))
+        .await
+        .unwrap(),
+    );
+    assert_eq!(numbers(&v), vec!["00000002", "OC000004"]);
+
+    let v = json(
+        &s.filter_companies(params(json!({
+            "status": ["dissolved"],
+            "dissolved_from": "2020-01-01",
+            "dissolved_to": "2020-12-31"
+        })))
+        .await
+        .unwrap(),
+    );
+    assert_eq!(numbers(&v), vec!["SC000003"]);
+    assert_eq!(v["items"][0]["date_of_cessation"], "2020-05-05");
+}
+
+#[tokio::test]
+async fn filter_companies_counts_with_limit_one_and_pages() {
+    let fake = fake().await;
+    let s = server(&fake);
+    let v = json(
+        &s.filter_companies(params(json!({"name_includes": "acme", "limit": 1})))
+            .await
+            .unwrap(),
+    );
+    assert_eq!(v["total"], 3);
+    assert_eq!(v["count"], 1);
+    assert_eq!(v["next_start_index"], 1);
+    let v = json(
+        &s.filter_companies(params(json!({
+            "name_includes": "acme", "name_excludes": "bakery", "limit": 1, "start_index": 1
+        })))
+        .await
+        .unwrap(),
+    );
+    assert_eq!(v["total"], 2);
+    assert_eq!(numbers(&v), vec!["00000006"]);
+    assert!(v.get("next_start_index").is_none(), "{v}");
+}
+
+#[tokio::test]
+async fn filter_companies_with_no_matches_is_an_empty_page() {
+    let fake = fake().await;
+    let r = server(&fake)
+        .filter_companies(params(json!({"location": "Aberystwyth"})))
+        .await
+        .unwrap();
+    assert_eq!(
+        json(&r),
+        json!({"total": 0, "start_index": 0, "count": 0, "items": []})
+    );
+}
+
+#[tokio::test]
+async fn filter_companies_rejects_bad_arguments_before_calling() {
+    let fake = fake().await;
+    let s = server(&fake);
+    for (args, msg) in [
+        (json!({}), "at least one filter"),
+        (json!({"incorporated_from": "2024-13-01"}), "YYYY-MM-DD"),
+        (json!({"sic_codes": ["software"]}), "SIC 2007"),
+        (json!({"location": "Leeds", "limit": 101}), "limit"),
+    ] {
+        let r = s.filter_companies(params(args.clone())).await.unwrap();
+        let text = error_text(&r);
+        assert!(text.starts_with("validation: "), "{args}: {text}");
+        assert!(text.contains(msg), "{args}: {text}");
+    }
+    assert!(fake.requests().is_empty());
+}
+
+#[tokio::test]
+async fn get_company_returns_the_profile_without_noise() {
+    let fake = fake().await;
+    let v = json(
+        &server(&fake)
+            .get_company(params(json!({"company_number": "6"})))
+            .await
+            .unwrap(),
+    );
+    assert_eq!(fake.requests()[0].path, "/company/00000006");
+    assert_eq!(v["company_name"], "ACME HOLDINGS PLC");
+    assert_eq!(v["company_status"], "liquidation");
+    assert_eq!(v["type"], "plc");
+    assert_eq!(v["registered_office_address"]["postal_code"], "EC2R 8EJ");
+    assert!(
+        v["registered_office_address"].get("po_box").is_none(),
+        "{v}"
+    );
+    assert_eq!(v["accounts"]["next_due"], "2027-12-31");
+    assert_eq!(
+        v["records_available"],
+        json!(["charges", "filing_history", "insolvency", "officers"])
+    );
+    for gone in ["etag", "links", "has_charges", "has_insolvency_history"] {
+        assert!(v.get(gone).is_none(), "{gone} still present: {v}");
+    }
+}
+
+#[tokio::test]
+async fn get_company_keeps_previous_names() {
+    let fake = fake().await;
+    let v = json(
+        &server(&fake)
+            .get_company(params(json!({"company_number": "sc 000003"})))
+            .await
+            .unwrap(),
+    );
+    assert_eq!(v["company_number"], "SC000003");
+    assert_eq!(v["jurisdiction"], "scotland");
+    assert_eq!(v["previous_company_names"][0]["name"], "THISTLE CODE LTD");
+}
+
+#[tokio::test]
+async fn get_company_reports_unknown_and_invalid_numbers() {
+    let fake = fake().await;
+    let s = server(&fake);
+    let text = error_text(
+        &s.get_company(params(json!({"company_number": "12345678"})))
+            .await
+            .unwrap(),
+    );
+    assert!(text.starts_with("not_found: "), "{text}");
+    assert!(text.contains("12345678"), "{text}");
+    assert!(text.contains("search_companies"), "{text}");
+    let text = error_text(
+        &s.get_company(params(json!({"company_number": "../search"})))
+            .await
+            .unwrap(),
+    );
+    assert!(text.starts_with("validation: "), "{text}");
+    assert_eq!(fake.requests().len(), 1);
+}
+
+#[tokio::test]
+async fn upstream_failures_are_tool_errors_with_a_kind() {
+    let fake = fake().await;
+    let text = error_text(
+        &server_with_key(&fake, "wrong-key")
+            .search_companies(params(json!({"query": "acme"})))
+            .await
+            .unwrap(),
+    );
+    assert!(text.starts_with("auth: "), "{text}");
+    assert!(text.contains("COMPANIES_HOUSE_API_KEY"), "{text}");
+
+    fake.inject(Injected::json(429, json!({})).header("retry-after", "60"));
+    let s = server(&fake);
+    let text = error_text(
+        &s.get_company(params(json!({"company_number": "00000001"})))
+            .await
+            .unwrap(),
+    );
+    assert!(text.starts_with("rate_limited: "), "{text}");
+    assert!(text.contains("600 requests per 5 minutes"), "{text}");
+
+    let fake = FakeCh::start(FakeState::register()).await;
+    fake.inject(Injected::status(500));
+    fake.inject(Injected::status(500));
+    let text = error_text(
+        &server(&fake)
+            .filter_companies(params(json!({"location": "leeds"})))
+            .await
+            .unwrap(),
+    );
+    assert!(text.starts_with("upstream: "), "{text}");
+}
+
+#[tokio::test]
+async fn a_used_up_rate_limit_stops_calls_until_the_reset() {
+    let fake = fake().await;
+    {
+        let mut st = fake.state();
+        st.rate_remaining = 1;
+        st.rate_reset_unix = now_unix() + 60;
+    }
+    let s = server(&fake);
+    // This call uses the last request of the window (remaining becomes 0).
+    json(
+        &s.get_company(params(json!({"company_number": "00000001"})))
+            .await
+            .unwrap(),
+    );
+    let text = error_text(
+        &s.search_companies(params(json!({"query": "acme"})))
+            .await
+            .unwrap(),
+    );
+    assert!(text.starts_with("rate_limited: "), "{text}");
+    assert_eq!(fake.requests().len(), 1);
+}
