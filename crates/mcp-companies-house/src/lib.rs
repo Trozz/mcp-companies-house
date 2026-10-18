@@ -34,7 +34,7 @@ pub fn server() -> Server {
             include_bytes!("../assets/favicon.png"),
             include_str!("../assets/favicon.svg"),
         )
-        .docs_url("https://github.com/Trozz/mcp-companies-house#configuration")
+        .docs_url("https://trozz.github.io/mcp-companies-house/configuration.html")
 }
 
 #[cfg(test)]
