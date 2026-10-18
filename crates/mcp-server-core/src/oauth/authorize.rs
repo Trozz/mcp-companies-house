@@ -87,13 +87,20 @@ pub fn validate(st: &AuthState, p: &AuthorizeParams) -> Result<ValidRequest, Rej
     let Some(code_challenge) = p.code_challenge.clone().filter(|c| c.len() == 43) else {
         return Err(redirect("invalid_request", "code_challenge is required"));
     };
-    let resource = match (p.resource.as_deref(), st.services()) {
+    // A request without `resource` (clients older than the 2025-06-18 MCP auth spec) gets the
+    // only service when there is one; the combined endpoint is never chosen by default.
+    let services: Vec<&String> = st
+        .services()
+        .iter()
+        .filter(|s| s.as_str() != crate::combined::COMBINED)
+        .collect();
+    let resource = match (p.resource.as_deref(), services.as_slice()) {
         (Some(r), _) => r.to_string(),
         (None, [only]) => st.resource(only),
         (None, _) => {
             return Err(redirect(
                 "invalid_target",
-                "resource is required because this server hosts several services",
+                "resource is required: name the URL of the service, or of /mcp for every service",
             ));
         }
     };
@@ -512,6 +519,17 @@ mod tests {
         let v = validate(&st, &p).unwrap();
         assert_eq!(v.resource, "https://mail.example.com/mail");
         assert_eq!(v.scope, "mail");
+    }
+
+    #[test]
+    fn missing_resource_defaults_to_the_only_service_not_the_combined_endpoint() {
+        let st = st_with(&["mail", crate::combined::COMBINED]);
+        let mut p = params(&client(&st));
+        p.resource = None;
+        let v = validate(&st, &p).unwrap();
+        assert_eq!(v.scope, "mail");
+        p.resource = Some("https://mail.example.com/mcp".into());
+        assert_eq!(validate(&st, &p).unwrap().scope, "mcp");
     }
 
     #[test]

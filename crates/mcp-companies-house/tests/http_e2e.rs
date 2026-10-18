@@ -470,3 +470,44 @@ async fn oauth_metadata_lists_the_companies_resource() {
     let v: Value = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(v["issuer"], "https://ch.example.com");
 }
+
+#[tokio::test]
+async fn sign_in_without_a_resource_defaults_to_companies() {
+    let app = server(&[]);
+    let res = app
+        .clone()
+        .oneshot(
+            Request::post("/register")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({"redirect_uris": ["https://app.example.com/cb"], "token_endpoint_auth_method": "none"})
+                        .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::CREATED);
+    let bytes = res.into_body().collect().await.unwrap().to_bytes();
+    let client: Value = serde_json::from_slice(&bytes).unwrap();
+    let client_id = client["client_id"].as_str().unwrap();
+    let query = format!(
+        "response_type=code&client_id={client_id}&redirect_uri=https%3A%2F%2Fapp.example.com%2Fcb&code_challenge={}&code_challenge_method=S256&state=s",
+        "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"
+    );
+    let res = app
+        .oneshot(
+            Request::get(format!("/authorize?{query}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let bytes = res.into_body().collect().await.unwrap().to_bytes();
+    let html = String::from_utf8_lossy(&bytes);
+    assert!(
+        html.contains("the <strong>companies</strong> service"),
+        "{html}"
+    );
+}

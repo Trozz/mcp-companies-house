@@ -89,8 +89,8 @@ impl Combined {
         let mut instructions = String::from(
             "This server combines several services. Each tool name starts with the name of the \
              service it belongs to and an underscore: the companies service's search_companies \
-             is companies_search_companies here. The notes below come from each service and use \
-             tool names without that prefix.",
+             is companies_search_companies here. The notes below, tool descriptions and error \
+             messages come from each service and name tools without that prefix.",
         );
         for (name, set) in &sets {
             if let Some(text) = set.info().instructions {

@@ -145,7 +145,7 @@ claude mcp add --transport http companies-house https://companies-house.example.
   --header "Authorization: Bearer $COMPANIES_HOUSE_API_KEY"
 ```
 
-`$COMPANIES_HOUSE_API_KEY` here is your own key on your own machine. Without `--header`, Claude Code uses the sign-in page instead (run `/mcp` to authenticate).
+`$COMPANIES_HOUSE_API_KEY` here is your own key on your own machine. Keep the client's name for the server short (`companies-house` or `ch`): some clients and model providers limit the full tool name, including the prefix they add, to 64 characters. Without `--header`, Claude Code uses the sign-in page instead (run `/mcp` to authenticate).
 
 ## Configuration
 
