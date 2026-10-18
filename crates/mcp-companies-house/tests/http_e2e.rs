@@ -35,7 +35,7 @@ fn server(extra: &[(&str, &str)]) -> axum::Router {
         http: HttpSettings::from_core(&loaded.core),
         shutdown: CancellationToken::new(),
     };
-    app(loaded.core.oauth, &loaded.services, &ctx)
+    app(loaded.core.oauth, &loaded.services, &ctx, loaded.combined)
 }
 
 fn rpc(path: &str, body: Value, token: Option<&str>, session: Option<&str>) -> Request<Body> {
@@ -274,6 +274,29 @@ async fn mcp_serves_every_tool_with_its_service_prefix() {
             .contains("10710"),
         "{call}"
     );
+}
+
+#[tokio::test]
+async fn the_combined_endpoint_can_be_turned_off() {
+    let res = server(&[("COMPANIES_HOUSE_COMBINED", "false")])
+        .oneshot(rpc(
+            "/mcp",
+            initialize(),
+            Some(&access_token_for("companies")),
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::NOT_FOUND);
+    let res = server(&[("COMPANIES_HOUSE_COMBINED", "false")])
+        .oneshot(
+            Request::get("/.well-known/oauth-protected-resource/mcp")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::NOT_FOUND);
 }
 
 #[tokio::test]

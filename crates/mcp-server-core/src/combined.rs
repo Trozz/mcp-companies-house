@@ -1,40 +1,34 @@
-//! The combined endpoint, `/mcp`: every enabled service's tools in one MCP server, each tool name
-//! prefixed with its service's name and an underscore (`companies_search_companies`). Calls go to
-//! the service's own handler with the request context unchanged, so tools see the same request
-//! extensions (the caller's credential) as on the service's own path.
+//! Several services' MCP handlers served as one MCP server: the combined `/mcp` endpoint.
+//!
+//! Each service's tools appear as `<service>_<tool>`; a call is routed by that prefix to the
+//! service's handler with the original tool name. [`DynHandler`] erases a handler's type so
+//! handlers of different services fit in one list. Calls keep their request context, so tools
+//! read the caller's credential from the request extensions exactly as on `/<service>`.
+//!
+//! Kept in step with mcp-icloud's `mcp-server-core::combined`.
 
-use crate::service::{Service, ServiceContext, mcp_service};
 use rmcp::model::{
     CallToolRequestParams, CallToolResponse, Implementation, ListToolsResult,
     PaginatedRequestParams, ServerCapabilities, ServerConfig, Tool,
 };
-use rmcp::service::RequestContext;
-use rmcp::{ErrorData as McpError, RoleServer, ServerHandler};
+use rmcp::service::{RequestContext, RoleServer};
+use rmcp::{ErrorData as McpError, ServerHandler};
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::Arc;
 
-/// Path segment, OAuth resource suffix and scope of the combined endpoint.
+/// Path segment, OAuth resource suffix and scope of the combined endpoint; never a service name.
 pub const COMBINED: &str = "mcp";
 
-/// Longest tool name clients accept.
-pub const MAX_TOOL_NAME: usize = 64;
+type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
-/// Most pages read from one service's tool list.
-const MAX_PAGES: usize = 50;
-
-pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
-
-/// One service's tools behind a type-erased handler, so the combined server can hold services of
-/// different handler types. Implemented for every [`ServerHandler`].
-pub trait ToolSet: Send + Sync + 'static {
+/// The parts of an MCP handler the combined endpoint uses, in a form that can be boxed.
+pub trait ToolHandler: Send + Sync + 'static {
     fn info(&self) -> ServerConfig;
     fn tool(&self, name: &str) -> Option<Tool>;
     fn list(
         &self,
-        request: Option<PaginatedRequestParams>,
         context: RequestContext<RoleServer>,
-    ) -> BoxFuture<'_, Result<ListToolsResult, McpError>>;
+    ) -> BoxFuture<'_, Result<Vec<Tool>, McpError>>;
     fn call(
         &self,
         request: CallToolRequestParams,
@@ -42,21 +36,21 @@ pub trait ToolSet: Send + Sync + 'static {
     ) -> BoxFuture<'_, Result<CallToolResponse, McpError>>;
 }
 
-impl<S: ServerHandler + Sync> ToolSet for S {
+impl<S: ServerHandler> ToolHandler for S {
     fn info(&self) -> ServerConfig {
-        ServerHandler::get_info(self)
+        self.get_info()
     }
 
     fn tool(&self, name: &str) -> Option<Tool> {
-        ServerHandler::get_tool(self, name)
+        self.get_tool(name)
     }
 
+    /// Services list every tool in one page.
     fn list(
         &self,
-        request: Option<PaginatedRequestParams>,
         context: RequestContext<RoleServer>,
-    ) -> BoxFuture<'_, Result<ListToolsResult, McpError>> {
-        Box::pin(ServerHandler::list_tools(self, request, context))
+    ) -> BoxFuture<'_, Result<Vec<Tool>, McpError>> {
+        Box::pin(async move { Ok(self.list_tools(None, context).await?.tools) })
     }
 
     fn call(
@@ -64,60 +58,104 @@ impl<S: ServerHandler + Sync> ToolSet for S {
         request: CallToolRequestParams,
         context: RequestContext<RoleServer>,
     ) -> BoxFuture<'_, Result<CallToolResponse, McpError>> {
-        Box::pin(ServerHandler::call_tool(self, request, context))
+        Box::pin(self.call_tool(request, context))
     }
 }
 
-/// `service_tool`, the name a service's tool has on `/mcp`.
-pub fn prefixed(service: &str, tool: &str) -> String {
+/// A boxed service handler that is itself an MCP handler (tools only).
+pub struct DynHandler(Box<dyn ToolHandler>);
+
+impl DynHandler {
+    pub fn new(handler: impl ToolHandler) -> Self {
+        Self(Box::new(handler))
+    }
+}
+
+impl ServerHandler for DynHandler {
+    fn get_info(&self) -> ServerConfig {
+        self.0.info()
+    }
+
+    fn get_tool(&self, name: &str) -> Option<Tool> {
+        self.0.tool(name)
+    }
+
+    async fn list_tools(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<ListToolsResult, McpError> {
+        Ok(ListToolsResult::with_all_items(self.0.list(context).await?))
+    }
+
+    async fn call_tool(
+        &self,
+        request: CallToolRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResponse, McpError> {
+        self.0.call(request, context).await
+    }
+}
+
+/// `<service>_<tool>`.
+pub fn prefixed_name(service: &str, tool: &str) -> String {
     format!("{service}_{tool}")
 }
 
-/// The MCP server behind `/mcp`. Built once per session.
+fn prefixed(service: &str, mut tool: Tool) -> Tool {
+    tool.name = prefixed_name(service, &tool.name).into();
+    tool
+}
+
+/// The service a prefixed tool name belongs to, and the tool's own name. Service names never
+/// contain `_`, so the first `_` ends the prefix.
+fn split<'a>(services: &[&str], name: &'a str) -> Option<(usize, &'a str)> {
+    let (service, tool) = name.split_once('_')?;
+    let index = services.iter().position(|s| *s == service)?;
+    (!tool.is_empty()).then_some((index, tool))
+}
+
+/// A short guide to the prefixes, then each service's own instructions under its name.
+fn instructions(services: &[(&str, Option<String>)]) -> String {
+    let prefixes: Vec<String> = services.iter().map(|(s, _)| format!("{s}_")).collect();
+    let mut text = format!(
+        "This server combines several services. Each tool name starts with its service: {}. \
+         The notes below, tool descriptions and error messages name tools without that prefix.",
+        prefixes.join(", ")
+    );
+    for (service, own) in services {
+        if let Some(own) = own.as_deref().filter(|t| !t.trim().is_empty()) {
+            text.push_str(&format!("\n\n{service}:\n{}", own.trim()));
+        }
+    }
+    text
+}
+
+/// One MCP server over several services' handlers.
 pub struct Combined {
     info: ServerConfig,
-    sets: Vec<(&'static str, Box<dyn ToolSet>)>,
+    names: Vec<&'static str>,
+    handlers: Vec<DynHandler>,
 }
 
 impl Combined {
-    /// `sets` pairs each service name with its tools, in the order they are listed. Server
-    /// instructions are put together from each service's own.
-    pub fn new(
-        implementation: Implementation,
-        sets: Vec<(&'static str, Box<dyn ToolSet>)>,
-    ) -> Self {
-        let mut instructions = String::from(
-            "This server combines several services. Each tool name starts with the name of the \
-             service it belongs to and an underscore: the companies service's search_companies \
-             is companies_search_companies here. The notes below, tool descriptions and error \
-             messages come from each service and name tools without that prefix.",
-        );
-        for (name, set) in &sets {
-            if let Some(text) = set.info().instructions {
-                instructions.push_str(&format!("\n\n## {name}\n\n{text}"));
-            }
-        }
-        let info = ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
-            .with_server_info(implementation)
-            .with_instructions(instructions);
-        Combined { info, sets }
-    }
-
-    /// The service handling `name` on `/mcp`, and the tool's name in that service. When one
-    /// service name extends another ("a" and "a_b"), the longer match wins.
-    fn route(&self, name: &str) -> Option<(&dyn ToolSet, &'static str, String)> {
-        self.sets
+    /// `services` in mount order. Service names must not contain `_` (they are lowercase path
+    /// segments).
+    pub fn new(server_info: Implementation, services: Vec<(&'static str, DynHandler)>) -> Self {
+        let own: Vec<(&str, Option<String>)> = services
             .iter()
-            .filter_map(|(service, set)| {
-                let rest = name.strip_prefix(service)?.strip_prefix('_')?;
-                (!rest.is_empty()).then(|| (set.as_ref(), *service, rest.to_string()))
-            })
-            .max_by_key(|(_, service, _)| service.len())
+            .map(|(name, h)| (*name, h.get_info().instructions))
+            .collect();
+        let info = ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
+            .with_server_info(server_info)
+            .with_instructions(instructions(&own));
+        let (names, handlers) = services.into_iter().unzip();
+        Self {
+            info,
+            names,
+            handlers,
+        }
     }
-}
-
-fn unknown_tool(name: &str) -> McpError {
-    McpError::invalid_params(format!("tool not found: {name}"), None)
 }
 
 impl ServerHandler for Combined {
@@ -126,10 +164,10 @@ impl ServerHandler for Combined {
     }
 
     fn get_tool(&self, name: &str) -> Option<Tool> {
-        let (set, service, tool) = self.route(name)?;
-        let mut t = set.tool(&tool)?;
-        t.name = prefixed(service, &t.name).into();
-        Some(t)
+        let (index, tool) = split(&self.names, name)?;
+        self.handlers[index]
+            .get_tool(tool)
+            .map(|t| prefixed(self.names[index], t))
     }
 
     async fn list_tools(
@@ -138,21 +176,9 @@ impl ServerHandler for Combined {
         context: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, McpError> {
         let mut tools = Vec::new();
-        for (service, set) in &self.sets {
-            let mut cursor = None;
-            for _ in 0..MAX_PAGES {
-                let request =
-                    cursor.map(|c| PaginatedRequestParams::default().with_cursor(Some(c)));
-                let page = set.list(request, context.clone()).await?;
-                for mut t in page.tools {
-                    t.name = prefixed(service, &t.name).into();
-                    tools.push(t);
-                }
-                cursor = page.next_cursor;
-                if cursor.is_none() {
-                    break;
-                }
-            }
+        for (service, handler) in self.names.iter().zip(&self.handlers) {
+            let listed = handler.list_tools(None, context.clone()).await?.tools;
+            tools.extend(listed.into_iter().map(|t| prefixed(service, t)));
         }
         Ok(ListToolsResult::with_all_items(tools))
     }
@@ -162,74 +188,58 @@ impl ServerHandler for Combined {
         mut request: CallToolRequestParams,
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, McpError> {
-        let Some((set, _, tool)) = self.route(&request.name) else {
-            return Err(unknown_tool(&request.name));
+        let Some((index, tool)) = split(&self.names, &request.name) else {
+            return Err(McpError::invalid_params("tool not found", None));
         };
-        request.name = tool.into();
-        set.call(request, context).await
+        request.name = tool.to_string().into();
+        self.handlers[index].call_tool(request, context).await
     }
-}
-
-/// The `/mcp` router over every service that offers its tools there ([`Service::tool_set`]), or
-/// `None` when none does.
-pub fn router(
-    ctx: &ServiceContext,
-    services: &[Arc<dyn Service>],
-    implementation: Implementation,
-) -> Option<axum::Router> {
-    let services: Vec<Arc<dyn Service>> = services
-        .iter()
-        .filter(|s| s.tool_set().is_some())
-        .cloned()
-        .collect();
-    if services.is_empty() {
-        return None;
-    }
-    Some(mcp_service(ctx, move || {
-        let sets = services
-            .iter()
-            .filter_map(|s| s.tool_set().map(|t| (s.name(), t)))
-            .collect();
-        Ok(Combined::new(implementation.clone(), sets))
-    }))
-}
-
-/// The names the combined endpoint gives `service`'s tools.
-pub fn tool_names(service: &dyn Service) -> Vec<String> {
-    service
-        .tool_names()
-        .iter()
-        .map(|t| prefixed(service.name(), t))
-        .collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
 
     #[test]
-    fn names_are_prefixed_with_the_service() {
+    fn names_are_prefixed_with_their_service() {
         assert_eq!(
-            prefixed("companies", "search_companies"),
+            prefixed_name("companies", "search_companies"),
             "companies_search_companies"
         );
+        let tool = Tool::new("get_company", "d", Arc::new(serde_json::Map::new()));
+        assert_eq!(prefixed("companies", tool).name, "companies_get_company");
     }
 
     #[test]
-    fn calls_route_by_the_longest_matching_service() {
-        #[derive(Clone)]
-        struct Empty;
-        impl ServerHandler for Empty {}
-        let c = Combined::new(
-            Implementation::new("t", "1"),
-            vec![("a", Box::new(Empty)), ("a_b", Box::new(Empty))],
+    fn a_prefixed_name_routes_to_its_service_and_original_tool() {
+        let services = ["companies", "streaming"];
+        assert_eq!(
+            split(&services, "streaming_read_stream"),
+            Some((1, "read_stream"))
         );
-        let (_, service, tool) = c.route("a_tool").unwrap();
-        assert_eq!((service, tool.as_str()), ("a", "tool"));
-        let (_, service, tool) = c.route("a_b_tool").unwrap();
-        assert_eq!((service, tool.as_str()), ("a_b", "tool"));
-        assert!(c.route("a_").is_none());
-        assert!(c.route("atool").is_none());
-        assert!(c.route("b_tool").is_none());
+        assert_eq!(
+            split(&services, "companies_get_company"),
+            Some((0, "get_company"))
+        );
+        assert_eq!(split(&services, "get_company"), None);
+        assert_eq!(split(&services, "filing_submit"), None);
+        assert_eq!(split(&services, "companies_"), None);
+        assert_eq!(split(&services, "companies"), None);
+    }
+
+    #[test]
+    fn instructions_name_the_prefixes_and_keep_each_services_own() {
+        let text = instructions(&[
+            ("companies", Some("Find companies.\n".into())),
+            ("streaming", None),
+            ("filing", Some("File changes.".into())),
+        ]);
+        assert_eq!(
+            text,
+            "This server combines several services. Each tool name starts with its service: \
+companies_, streaming_, filing_. The notes below, tool descriptions and error messages name \
+tools without that prefix.\n\ncompanies:\nFind companies.\n\nfiling:\nFile changes."
+        );
     }
 }

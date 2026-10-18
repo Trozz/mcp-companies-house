@@ -1,4 +1,6 @@
-use mcp_companies_house::{Loaded, SERVICES, VERSION, app, combined_tool_names, load, log_filter};
+use mcp_companies_house::{
+    COMBINED, Loaded, SERVICES, VERSION, app, combined_tool_names, load, log_filter,
+};
 use mcp_server_core::config::EnvReader;
 use mcp_server_core::service::{HttpSettings, ServiceContext, ServiceEnv};
 use mcp_server_core::{install_crypto_provider, observability, shutdown_signal, tls};
@@ -58,7 +60,11 @@ async fn healthcheck() -> ExitCode {
 }
 
 async fn run(loaded: Loaded) -> anyhow::Result<()> {
-    let Loaded { core, services } = loaded;
+    let Loaded {
+        core,
+        services,
+        combined,
+    } = loaded;
     let caps: Vec<&str> = services
         .iter()
         .flat_map(|s| s.log_caps().iter().copied())
@@ -75,11 +81,10 @@ async fn run(loaded: Loaded) -> anyhow::Result<()> {
             "service enabled"
         );
     }
-    let combined = combined_tool_names(&services);
-    if !combined.is_empty() {
+    if combined && !services.is_empty() {
         tracing::info!(
-            url = core.service_url(mcp_server_core::combined::COMBINED),
-            tools = combined.len(),
+            url = core.service_url(COMBINED),
+            tools = combined_tool_names(&services).len(),
             "combined endpoint enabled"
         );
     }
@@ -89,7 +94,7 @@ async fn run(loaded: Loaded) -> anyhow::Result<()> {
         http: HttpSettings::from_core(&core),
         shutdown: shutdown.clone(),
     };
-    let app = app(core.oauth, &services, &ctx);
+    let app = app(core.oauth, &services, &ctx, combined);
     tracing::info!(addr = %core.bind_addr, "listening");
     tls::serve(app, core.bind_addr, core.tls, shutdown).await
 }

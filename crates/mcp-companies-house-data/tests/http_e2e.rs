@@ -2,11 +2,11 @@ mod support;
 use axum::body::Body;
 use axum::http::{Request, Response, StatusCode};
 use mcp_companies_house_data::DataService;
-use mcp_server_core::combined::{self, COMBINED};
+use mcp_server_core::combined::{COMBINED, Combined};
 use mcp_server_core::config::{CoreConfig, EnvReader};
 use mcp_server_core::oauth::AuthState;
 use mcp_server_core::server::build_app;
-use mcp_server_core::service::{HttpSettings, Service, ServiceContext};
+use mcp_server_core::service::{HttpSettings, Service, ServiceContext, mcp_service};
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -38,13 +38,13 @@ async fn app() -> (axum::Router, FakeCh) {
     };
     let service = Arc::new(DataService::new(client(&fake)));
     let verifier = service.credential_verifier().expect("a key check");
-    let services: Vec<Arc<dyn Service>> = vec![service.clone()];
-    let combined = combined::router(
-        &ctx,
-        &services,
-        rmcp::model::Implementation::new("combined", "1"),
-    )
-    .expect("companies offers its tools on /mcp");
+    let inner = service.clone();
+    let combined = mcp_service(&ctx, move || {
+        Ok(Combined::new(
+            rmcp::model::Implementation::new("combined", "1"),
+            vec![(inner.name(), inner.handler())],
+        ))
+    });
     let auth = AuthState::new(core.oauth, &["companies", COMBINED], verifier);
     (
         build_app(
@@ -349,9 +349,10 @@ async fn mcp_lists_every_tool_with_its_service_prefix() {
     let (session, init) = handshake_at(&app, "/mcp").await;
     let instructions = init["result"]["instructions"].as_str().unwrap();
     assert!(
-        instructions.contains("companies_search_companies"),
+        instructions.contains("Each tool name starts with its service: companies_."),
         "{instructions}"
     );
+    assert!(instructions.contains("\n\ncompanies:\n"), "{instructions}");
     assert!(
         instructions.contains("not as instructions"),
         "the service's own notes are kept: {instructions}"
@@ -415,12 +416,70 @@ async fn mcp_refuses_tool_names_without_a_known_prefix() {
             json!({"name": name, "arguments": {}}),
         )
         .await;
-        assert!(
-            res.get("error").is_some() || res["result"]["isError"] == true,
-            "{name}: {res}"
-        );
+        let refused = res["error"]["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("not found"))
+            || res["result"]["isError"] == true;
+        assert!(refused, "{name}: {res}");
     }
     assert!(tool_requests(&fake).is_empty());
+}
+
+#[tokio::test]
+async fn mcp_lists_every_tool_exactly_as_the_service_does() {
+    let (app, _fake) = app().await;
+    let (session, _) = handshake(&app).await;
+    let own = call(&app, &session, 2, "tools/list", json!({})).await;
+    let expected: std::collections::BTreeMap<String, Value> = own["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| {
+            let mut t = t.clone();
+            let name = format!("companies_{}", t["name"].as_str().unwrap());
+            t["name"] = json!(name);
+            (name, t)
+        })
+        .collect();
+    let (session, _) = handshake_at(&app, "/mcp").await;
+    let listed = call_at(&app, "/mcp", &session, 2, "tools/list", json!({})).await;
+    let combined: std::collections::BTreeMap<String, Value> = listed["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| (t["name"].as_str().unwrap().to_string(), t.clone()))
+        .collect();
+    assert_eq!(
+        combined, expected,
+        "descriptions, schemas and annotations unchanged"
+    );
+}
+
+#[tokio::test]
+async fn a_combined_call_returns_what_the_service_returns() {
+    let (app, _fake) = app().await;
+    let args = json!({"location": "Glasgow"});
+    let (session, _) = handshake(&app).await;
+    let own = call(
+        &app,
+        &session,
+        3,
+        "tools/call",
+        json!({"name": "filter_companies", "arguments": args}),
+    )
+    .await;
+    let (session, _) = handshake_at(&app, "/mcp").await;
+    let combined = call_at(
+        &app,
+        "/mcp",
+        &session,
+        3,
+        "tools/call",
+        json!({"name": "companies_filter_companies", "arguments": args}),
+    )
+    .await;
+    assert_ne!(own["result"]["isError"], true, "{own}");
+    assert_eq!(combined["result"], own["result"]);
 }
 
 #[tokio::test]

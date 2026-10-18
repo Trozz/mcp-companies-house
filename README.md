@@ -118,7 +118,7 @@ PUBLIC_URL=... OAUTH_SIGNING_KEY=... ./mcp-companies-house
 
 ## Connecting clients
 
-Add one connector for `/mcp` to get every service, or one connector per service you want (`/companies`). They work the same way; `/mcp` only adds the service prefix to tool names.
+Add one connector for `/mcp` to get every service, or one connector per service you want (`/companies`). They work the same way; `/mcp` only adds the service prefix to tool names. Use one or the other, not both: with both, every tool appears twice. `/mcp` is served whenever a service runs; set `COMPANIES_HOUSE_COMBINED=false` to turn it off.
 
 ### Get your API key
 
@@ -158,6 +158,7 @@ The server has no Companies House key of its own, and has no admin password or s
 | Variable | Required | Default | Description |
 |---|---|---|---|
 | `COMPANIES_HOUSE_SERVICES` | no | all (`companies`) | Comma separated services to run. An unknown name or an empty list stops startup |
+| `COMPANIES_HOUSE_COMBINED` | no | `true` | Serve every running service's tools together at `/mcp`. `false` turns `/mcp` off (it then answers 404) |
 | `PUBLIC_URL` | yes | | External base URL, for example `https://companies-house.example.com`. `http` is accepted only for `localhost` |
 | `OAUTH_SIGNING_KEY` | yes | | At least 32 bytes. Signs OAuth tokens and encrypts the keys inside them. Rotating it signs everyone out |
 | `TRUSTED_PROXIES` | no | | Comma separated proxy IPs whose `X-Forwarded-For` is trusted for sign-in rate limiting |
@@ -247,13 +248,13 @@ pub trait Service: Send + Sync + 'static {
     fn router(self: Arc<Self>, ctx: &ServiceContext) -> axum::Router;
     // How people sign in: checks their credential with the upstream service.
     fn credential_verifier(&self) -> Option<Arc<dyn CredentialVerifier>> { None }
-    // This service's tools on /mcp, built once per session there; None keeps it off /mcp.
-    fn tool_set(&self) -> Option<Box<dyn ToolSet>> { None }
+    // This service's handler for /mcp, built once per session there.
+    fn handler(&self) -> DynHandler;
 }
 ```
 
 1. Create `crates/mcp-companies-house-<name>` as a library. Read its own variables in `pub fn from_env(env: &mut ServiceEnv) -> Option<Arc<dyn Service>>`, reporting problems through `env.errors`. Never read the server variables.
-2. Build the MCP endpoint in `router()` with `mcp_server_core::service::mcp_service(ctx, move || Ok(MyServer::new(...)))`, and return `Some(Box::new(MyServer::new(...)))` from `tool_set()` to put the tools on `/mcp` too (any rmcp `ServerHandler` is a `ToolSet`). Tools read the caller's key from the request: take `Extension(parts): Extension<http::request::Parts>` and get `mcp_server_core::credential::Credential` from `parts.extensions`.
+2. Build the MCP endpoint in `router()` with `mcp_server_core::service::mcp_service(ctx, move || Ok(MyServer::new(...)))`, and return `DynHandler::new(MyServer::new(...))` from `handler()` so the tools are on `/mcp` too (any rmcp `ServerHandler` fits). The combined endpoint is the same as mcp-icloud's (`mcp_server_core::combined`). Tools read the caller's key from the request: take `Extension(parts): Extension<http::request::Parts>` and get `mcp_server_core::credential::Credential` from `parts.extensions`.
 3. Add the crate to `crates/mcp-companies-house/Cargo.toml` and one line to `SERVICES` in `crates/mcp-companies-house/src/lib.rs`.
 
 Routing, OAuth metadata, token audiences, `COMPANIES_HOUSE_SERVICES` and the release pipeline pick the new service up without further changes. The server has one sign-in, taken from the first enabled service that defines `credential_verifier`, so a service that needs a different credential (for example a stream key) needs a core change first.

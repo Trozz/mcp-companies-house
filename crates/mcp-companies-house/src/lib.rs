@@ -1,9 +1,12 @@
-use mcp_server_core::combined::{self, COMBINED};
+pub use mcp_server_core::combined::COMBINED;
+use mcp_server_core::combined::{Combined, prefixed_name};
 use mcp_server_core::config::CoreConfig;
 use mcp_server_core::credential::CredentialVerifier;
 use mcp_server_core::oauth::{AuthState, OAuthSettings};
 use mcp_server_core::server::build_app;
-use mcp_server_core::service::{Service, ServiceContext, ServiceEnv, ServiceFactory, icons};
+use mcp_server_core::service::{
+    Service, ServiceContext, ServiceEnv, ServiceFactory, icons, mcp_service,
+};
 use rmcp::model::Implementation;
 use std::sync::Arc;
 
@@ -61,6 +64,8 @@ pub fn select<'a>(
 pub struct Loaded {
     pub core: CoreConfig,
     pub services: Vec<Arc<dyn Service>>,
+    /// Serve every service's tools together at `/mcp` (`COMPANIES_HOUSE_COMBINED`, default true).
+    pub combined: bool,
 }
 
 /// The credential check people sign in with: the first enabled service that defines one.
@@ -73,6 +78,7 @@ pub fn verifier(services: &[Arc<dyn Service>]) -> Option<Arc<dyn CredentialVerif
 pub fn load(env: &mut ServiceEnv, registry: &[(&'static str, ServiceFactory)]) -> Option<Loaded> {
     let core = CoreConfig::from_env(env, SERVICE_NAME, CRATE_TARGET);
     let raw = env.optional("COMPANIES_HOUSE_SERVICES");
+    let combined = env.bool("COMPANIES_HOUSE_COMBINED", true);
     let selected = match select(raw.as_deref(), registry) {
         Ok(s) => s,
         Err(e) => {
@@ -99,25 +105,44 @@ pub fn load(env: &mut ServiceEnv, registry: &[(&'static str, ServiceFactory)]) -
     Some(Loaded {
         core: core?,
         services,
+        combined,
     })
 }
 
-/// The full HTTP application: health, favicon, OAuth routes, each service at `/<name>` and every
-/// service's tools together at `/mcp`. Each path is its own OAuth protected resource.
+/// The combined endpoint: every service's tools as `<service>_<tool>`.
+fn combined_router(services: &[Arc<dyn Service>], ctx: &ServiceContext) -> axum::Router {
+    let services = services.to_vec();
+    mcp_service(ctx, move || {
+        let handlers = services.iter().map(|s| (s.name(), s.handler())).collect();
+        Ok(Combined::new(combined_info(), handlers))
+    })
+}
+
+/// The full HTTP application: health, favicon, OAuth routes and each service at `/<name>`, every
+/// service its own OAuth protected resource; with `combined`, also every service's tools
+/// together at `/mcp`, its own protected resource.
 pub fn app(
     oauth: OAuthSettings,
     services: &[Arc<dyn Service>],
     ctx: &ServiceContext,
+    combined: bool,
 ) -> axum::Router {
+    assert!(
+        services.iter().all(|s| s.name() != COMBINED),
+        "{COMBINED} is reserved for the combined endpoint"
+    );
+    let combined = combined && !services.is_empty();
     let mut names: Vec<&str> = services.iter().map(|s| s.name()).collect();
+    if combined {
+        names.push(COMBINED);
+    }
     let verifier = verifier(services).expect("load() requires a service that checks credentials");
     let mut routers: Vec<(&'static str, axum::Router)> = services
         .iter()
         .map(|s| (s.name(), s.clone().router(ctx)))
         .collect();
-    if let Some(router) = combined::router(ctx, services, combined_info()) {
-        names.push(COMBINED);
-        routers.push((COMBINED, router));
+    if combined {
+        routers.push((COMBINED, combined_router(services, ctx)));
     }
     let auth = AuthState::new(oauth, &names, verifier);
     build_app(auth, routers).route(
@@ -143,8 +168,11 @@ fn combined_info() -> Implementation {
 pub fn combined_tool_names(services: &[Arc<dyn Service>]) -> Vec<String> {
     services
         .iter()
-        .filter(|s| s.tool_set().is_some())
-        .flat_map(|s| combined::tool_names(s.as_ref()))
+        .flat_map(|s| {
+            s.tool_names()
+                .into_iter()
+                .map(|t| prefixed_name(s.name(), &t))
+        })
         .collect()
 }
 
@@ -220,6 +248,12 @@ mod tests {
         }
         fn router(self: Arc<Self>, _: &ServiceContext) -> axum::Router {
             axum::Router::new()
+        }
+        fn handler(&self) -> mcp_server_core::combined::DynHandler {
+            #[derive(Clone)]
+            struct Nothing;
+            impl rmcp::ServerHandler for Nothing {}
+            mcp_server_core::combined::DynHandler::new(Nothing)
         }
     }
 
@@ -339,6 +373,27 @@ mod tests {
             );
             assert_ne!(*name, COMBINED, "{COMBINED} is the combined endpoint");
         }
+        let e = select(Some(COMBINED), SERVICES).unwrap_err();
+        assert!(
+            e.starts_with("COMPANIES_HOUSE_SERVICES contains an unknown service: mcp"),
+            "{e}"
+        );
+    }
+
+    #[test]
+    fn the_combined_endpoint_is_on_unless_turned_off() {
+        let mut e = with_core(&[]);
+        assert!(load(&mut e, SERVICES).expect("loads").combined);
+        let mut e = with_core(&[("COMPANIES_HOUSE_COMBINED", "false")]);
+        assert!(!load(&mut e, SERVICES).expect("loads").combined);
+        let mut e = with_core(&[("COMPANIES_HOUSE_COMBINED", "maybe")]);
+        assert!(load(&mut e, SERVICES).is_none());
+        assert_eq!(e.errors.len(), 1, "{:?}", e.errors);
+        assert!(
+            e.errors[0].contains("COMPANIES_HOUSE_COMBINED"),
+            "{:?}",
+            e.errors
+        );
     }
 
     #[test]
@@ -352,7 +407,7 @@ mod tests {
         assert_eq!(unique.len(), names.len());
         for n in &names {
             assert!(
-                n.len() <= combined::MAX_TOOL_NAME
+                n.len() <= 64
                     && n.chars()
                         .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-'),
                 "{n}"
