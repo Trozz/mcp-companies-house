@@ -295,8 +295,14 @@ impl Caller {
                 let active = page.get("active_count").and_then(Value::as_u64);
                 let inactive = page.get("inactive_count").and_then(Value::as_u64);
                 let closed = current_only && active == Some(0) && inactive.is_some_and(|n| n > 0);
+                // A filtered list holds only active officers; more rows than that means the
+                // filter was ignored.
+                if filter && active.is_some_and(|a| total > a + inactive.unwrap_or(0)) {
+                    filtered_upstream = false;
+                }
                 first = Some(page);
                 if closed {
+                    total = 0;
                     next = None;
                     break;
                 }
@@ -804,14 +810,29 @@ impl CompaniesServer {
             let mut out = c.psc_page(&number, &q, start).await?;
             if nothing_listed(&out, start) {
                 c.ensure_company(&number).await?;
-                // Explain the absence, unless the statements could not be read.
-                if out.get("statements").is_some()
-                    && let Value::Object(map) = &mut out
-                {
-                    map.insert(
-                        "note".into(),
-                        json!(c.psc_absence_note(&number, false).await),
-                    );
+            }
+            // With the whole list read and nothing current in it, explain the absence: an
+            // exemption or a gap. Not when the statements could not be read.
+            let current = |key: &str| {
+                out.get(key)
+                    .and_then(Value::as_array)
+                    .is_some_and(|items| items.iter().any(|i| i.get("ceased_on").is_none()))
+            };
+            let any = |key: &str| {
+                out.get(key)
+                    .and_then(Value::as_array)
+                    .is_some_and(|items| !items.is_empty())
+            };
+            let whole = start == 0 && out.get("next_start_index").is_none();
+            if whole
+                && out.get("statements").is_some()
+                && !current("items")
+                && !current("statements")
+            {
+                let ceased = any("items") || any("statements");
+                let note = c.psc_absence_note(&number, ceased).await;
+                if let Value::Object(map) = &mut out {
+                    map.insert("note".into(), json!(note));
                 }
             }
             Ok(json_result(&out))

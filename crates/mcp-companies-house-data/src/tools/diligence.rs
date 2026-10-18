@@ -49,6 +49,9 @@ const UNRESOLVED_STATEMENTS: &[&str] = &[
     "failed-to",
     "restrictions-notice",
     "no-response",
+    "unidentified",
+    "not-provided",
+    "awaiting-confirmation",
 ];
 
 /// Company types the Companies Act's director rules apply to, including that at least one
@@ -80,26 +83,37 @@ fn officers_in_charge(company_type: Option<&str>) -> Option<(&'static str, RoleT
         "registered-overseas-entity" => {
             Some(("managing officers", |r| r.contains("managing-officer")))
         }
-        "oversea-company" | "uk-establishment" => Some(("directors or equivalent officers", |r| {
+        "oversea-company" => Some(("directors or equivalent officers", |r| {
             r.contains("director")
                 || r.starts_with("member-of-")
                 || r.starts_with("person-authorised")
         })),
-        "limited-partnership" => Some(("general partners", |r| r.contains("general-partner"))),
         "eeig" => Some(("managers", |r| r.contains("manager-of-an-eeig"))),
         t if UK_COMPANY_TYPES.contains(&t) => Some(("directors", |r| r.contains("director"))),
         _ => None,
     }
 }
 
-/// Whether persons with significant control are reported for a company of this type and number:
-/// overseas companies, their UK establishments and English, Welsh and Northern Irish limited
-/// partnerships do not report them (Scottish limited partnerships, numbered SL, do).
+/// Company types whose officers the register does not list: a limited partnership's partners
+/// and a UK establishment's officers (who are its overseas parent's) have no officer records.
+const NO_OFFICER_RECORDS: &[&str] = &["limited-partnership", "uk-establishment"];
+
+/// Whether the PSC rules cover a company of this type and number, so that a missing PSC record
+/// is worth a flag: UK companies, LLPs, SEs and UK societas, EEIGs, Scottish partnerships and
+/// Scottish limited partnerships (numbered SL), and overseas entities (their beneficial owners).
 fn reports_pscs(company_type: Option<&str>, number: &str) -> bool {
     match company_type {
-        Some("oversea-company" | "uk-establishment") => false,
+        Some(t) if UK_COMPANY_TYPES.contains(&t) => true,
+        Some(
+            "llp"
+            | "european-public-limited-liability-company-se"
+            | "united-kingdom-societas"
+            | "eeig"
+            | "scottish-partnership"
+            | "registered-overseas-entity",
+        ) => true,
         Some("limited-partnership") => number.starts_with("SL"),
-        _ => true,
+        _ => false,
     }
 }
 
@@ -363,8 +377,17 @@ fn charges_checks(f: &mut Findings, page: Option<Value>) {
 
 /// Directors (or the type's equivalent) in post, and how many officers joined or left in the
 /// last year.
-fn officer_checks(f: &mut Findings, page: &Value, company_type: Option<&str>, today: NaiveDate) {
+fn officer_checks(
+    f: &mut Findings,
+    page: &Value,
+    company_type: Option<&str>,
+    psc: Option<&Value>,
+    today: NaiveDate,
+) {
     f.ran("officers");
+    if company_type.is_some_and(|t| NO_OFFICER_RECORDS.contains(&t)) {
+        return;
+    }
     let items = page
         .get("items")
         .and_then(Value::as_array)
@@ -384,10 +407,31 @@ fn officer_checks(f: &mut Findings, page: &Value, company_type: Option<&str>, to
     match officers_in_charge(company_type) {
         Some((what, in_charge)) => {
             let running: Vec<&&Value> = current.iter().filter(|o| in_charge(&role(o))).collect();
-            if running.is_empty() && truncated {
+            // An overseas entity needs managing officers on the register only when it has not
+            // identified all its beneficial owners, or given their information.
+            let unresolved_owners = psc
+                .and_then(|p| p.get("statements"))
+                .and_then(Value::as_array)
+                .is_some_and(|st| {
+                    st.iter().any(|s| {
+                        s.get("ceased_on").is_none()
+                            && text(s, "statement").is_some_and(|c| {
+                                c.contains("unidentified") || c.contains("not-provided")
+                            })
+                    })
+                });
+            let required = company_type != Some("registered-overseas-entity") || unresolved_owners;
+            if running.is_empty() && !required {
+                // Nothing to look into: managing officers are optional here.
+            } else if running.is_empty() && truncated {
                 f.note(
                     "officers",
                     format!("no current {what} are among the first 100 officer records; see list_officers with current_only"),
+                );
+            } else if running.is_empty() && company_type == Some("registered-overseas-entity") {
+                f.flag(
+                    "officers",
+                    "no current managing officers are recorded, though not every beneficial owner is identified",
                 );
             } else if running.is_empty() {
                 f.flag("officers", format!("no current {what} are recorded"));
@@ -468,6 +512,21 @@ fn identity_checks(
     today: NaiveDate,
 ) {
     f.ran("identity_verification");
+    for (half, page, what) in [
+        ("identity_verification_officers", officers, "officers"),
+        (
+            "identity_verification_pscs",
+            pscs,
+            "persons with significant control",
+        ),
+    ] {
+        if page.is_none() {
+            f.not_run.push(json!({
+                "check": half,
+                "reason": format!("the {what} could not be read"),
+            }));
+        }
+    }
     let current = |page: Option<&Value>, ended: &str| -> Vec<Value> {
         page.and_then(|p| p.get("items"))
             .and_then(Value::as_array)
@@ -518,13 +577,25 @@ fn identity_checks(
             ),
         );
     }
-    if !people.is_empty() || !owners.is_empty() {
+    let mut tallies: Vec<String> = Vec::new();
+    if officers.is_some() && !people.is_empty() {
+        tallies.push(format!(
+            "{people_verified} of {} officers in charge who are people",
+            people.len()
+        ));
+    }
+    if pscs.is_some() && !owners.is_empty() {
+        tallies.push(format!(
+            "{owners_verified} of {} individual PSCs",
+            owners.len()
+        ));
+    }
+    if !tallies.is_empty() {
         f.note(
             "identity_verification",
             format!(
-                "identity verification statements on record: {people_verified} of {} officers in charge who are people, {owners_verified} of {} individual PSCs. Companies House is phasing verification in, so none on record is not a failure; the register shows that a statement was filed, not the check itself",
-                people.len(),
-                owners.len()
+                "identity verification statements on record: {}. Companies House is phasing verification in, so none on record is not a failure; the register shows that a statement was filed, not the check itself",
+                tallies.join(", ")
             ),
         );
     }
@@ -619,8 +690,8 @@ async fn ownership_checks(
             f.note(
                 "ownership",
                 format!(
-                    "a {} does not report persons with significant control, so the register shows no owners",
-                    company_type.unwrap_or("company of this type")
+                    "the register shows no owners; a {} is not one of the kinds of company this check expects to report persons with significant control",
+                    company_type.unwrap_or("company of unknown type")
                 ),
             );
             return;
@@ -711,7 +782,7 @@ impl Caller {
         }
         let company_type = profile.get("type").and_then(Value::as_str);
         match &officers {
-            Ok(page) => officer_checks(&mut f, page, company_type, today),
+            Ok(page) => officer_checks(&mut f, page, company_type, psc.as_ref().ok(), today),
             Err(e) => f.failed("officers", e),
         }
         match &psc {
@@ -748,7 +819,7 @@ impl Caller {
 #[tool_router(router = diligence_router, vis = "pub(crate)")]
 impl CompaniesServer {
     #[tool(
-        description = "Screen one company against the public register and return observations for a reviewer to examine: status and status detail, insolvency cases, charges not satisfied, overdue accounts and confirmation statements, registered office disputes or undeliverable addresses, directors in post and recent officer changes, ownership (PSCs, PSC statements and exemptions), company age and recent name changes. Each observation is a flag (look into it) or a note (context). Also lists the checks run and those it cannot run (sanctions, politically exposed persons, credit, identity verification and others). It never concludes that a company is sound. Uses up to 7 Companies House requests.",
+        description = "Screen one company against the public register and return observations for a reviewer to examine: status and status detail, insolvency cases, charges not satisfied, overdue accounts and confirmation statements, registered office disputes or undeliverable addresses, directors in post and recent officer changes, ownership (PSCs, PSC statements and exemptions), company age and recent name changes. Each observation is a flag (look into it) or a note (context). Also tallies the identity verification statements of the directors and individual PSCs in post, flagging any overdue, and lists the checks run and those it cannot run (sanctions, politically exposed persons, credit and others). It never concludes that a company is sound. Uses up to 7 Companies House requests.",
         annotations(read_only_hint = true, idempotent_hint = true, open_world_hint = true)
     )]
     pub async fn due_diligence_check(
@@ -872,7 +943,7 @@ mod tests {
             {"name": "B", "officer_role": "director", "appointed_on": "2010-01-01", "resigned_on": "2026-08-01"},
             {"name": "C", "officer_role": "secretary", "appointed_on": "2010-01-01"},
         ]});
-        officer_checks(&mut f, &page, Some("ltd"), day("2026-10-18"));
+        officer_checks(&mut f, &page, Some("ltd"), None, day("2026-10-18"));
         let text = serde_json::to_string(&f.observations).unwrap();
         assert!(
             text.contains("every current director is a company"),
@@ -888,6 +959,7 @@ mod tests {
             &mut f,
             &json!({"items": [{"name": "C", "officer_role": "secretary"}]}),
             Some("ltd"),
+            None,
             day("2026-10-18"),
         );
         assert_eq!(levels(&f), vec![("officers".into(), "flag".into())]);
@@ -897,6 +969,7 @@ mod tests {
             &mut f,
             &json!({"items": [{"name": "D", "officer_role": "llp-designated-member"}]}),
             Some("llp"),
+            None,
             day("2026-10-18"),
         );
         assert!(f.observations.is_empty(), "{:?}", f.observations);
@@ -908,7 +981,7 @@ mod tests {
         let page = json!({"next_start_index": 100, "items": [
             {"name": "OLD", "officer_role": "director", "resigned_on": "2010-01-01"}
         ]});
-        officer_checks(&mut f, &page, Some("ltd"), day("2026-10-18"));
+        officer_checks(&mut f, &page, Some("ltd"), None, day("2026-10-18"));
         assert!(
             f.observations.iter().all(|o| o["level"] == "note"),
             "{:?}",
@@ -924,13 +997,20 @@ mod tests {
             &mut f,
             &page,
             Some("registered-overseas-entity"),
+            None,
             day("2026-10-18"),
         );
         assert!(f.observations.is_empty(), "{:?}", f.observations);
 
         let mut f = Findings::new();
         let page = json!({"items": [{"name": "C LTD", "officer_role": "corporate-director"}]});
-        officer_checks(&mut f, &page, Some("oversea-company"), day("2026-10-18"));
+        officer_checks(
+            &mut f,
+            &page,
+            Some("oversea-company"),
+            None,
+            day("2026-10-18"),
+        );
         assert!(
             f.observations.is_empty(),
             "the person-director rule is for UK companies: {:?}",
@@ -942,6 +1022,7 @@ mod tests {
             &mut f,
             &json!({"items": []}),
             Some("royal-charter"),
+            None,
             day("2026-10-18"),
         );
         assert_eq!(levels(&f), vec![("officers".into(), "note".into())]);

@@ -762,3 +762,69 @@ async fn no_pscs_are_explained_by_an_exemption_or_called_a_gap() {
     );
     assert!(v.get("note").is_none(), "{v}");
 }
+
+#[tokio::test]
+async fn only_ceased_pscs_still_get_the_exemption_note() {
+    let fake = fake().await;
+    fake.state().resources.insert(
+        "/company/00000006/persons-with-significant-control".into(),
+        json!({"total_results": 1, "active_count": 0, "ceased_count": 1, "items": [
+            {"name": "Old Owner", "kind": "individual-person-with-significant-control",
+             "notified_on": "2016-04-06", "ceased_on": "2019-12-31"}
+        ]}),
+    );
+    let v = json(
+        &server(&fake)
+            .list_persons_with_significant_control(params(json!({"company_number": "6"})), auth())
+            .await
+            .unwrap(),
+    );
+    assert!(
+        v["note"]
+            .as_str()
+            .unwrap()
+            .contains("exempt from the PSC rules"),
+        "{v}"
+    );
+}
+
+#[tokio::test]
+async fn current_only_totals_stay_true() {
+    let fake = fake().await;
+    // A closed company: no total of officers in post beyond zero.
+    fake.state().resources.insert(
+        "/company/SC000003/officers".into(),
+        json!({"total_results": 1, "active_count": 0, "inactive_count": 1,
+               "items": [{"name": "MACLEOD, Ian", "officer_role": "director"}]}),
+    );
+    let v = json(
+        &server(&fake)
+            .list_officers(
+                params(json!({"company_number": "SC000003", "current_only": true})),
+                auth(),
+            )
+            .await
+            .unwrap(),
+    );
+    assert_eq!(v["count"], 0);
+    assert_eq!(v["total"], 0, "{v}");
+
+    // An ignored filter: more rows than active officers, so no upstream total.
+    let items: Vec<Value> = (0..3)
+        .map(|i| json!({"name": format!("D{i}"), "officer_role": "director"}))
+        .collect();
+    fake.inject(Injected::json(
+        200,
+        json!({"total_results": 5, "active_count": 3, "resigned_count": 2, "items": items}),
+    ));
+    let v = json(
+        &server(&fake)
+            .list_officers(
+                params(json!({"company_number": "1", "current_only": true, "limit": 2})),
+                auth(),
+            )
+            .await
+            .unwrap(),
+    );
+    assert!(v.get("total").is_none(), "{v}");
+}

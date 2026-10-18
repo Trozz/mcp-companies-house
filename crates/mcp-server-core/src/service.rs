@@ -233,14 +233,11 @@ impl Table {
     }
 
     /// Whose least recently used session makes room for a new one of `who` in a full table:
-    /// whoever holds the most, or `who` itself when it already holds as many as anyone, so a
-    /// heavy user replaces its own sessions instead of being refused.
+    /// whoever holds clearly more, or else `who` itself when it holds any, so a key that already
+    /// has sessions replaces its own instead of being refused or pushing someone else out.
     fn room_for(&self, who: Who) -> Option<Who> {
-        self.fair_share_room(who).or_else(|| {
-            let mine = self.count(who);
-            let largest = self.largest_other(who).map_or(0, |(_, n)| n);
-            (who.is_some() && mine > 0 && mine >= largest).then_some(who)
-        })
+        self.fair_share_room(who)
+            .or_else(|| (who.is_some() && self.count(who) > 0).then_some(who))
     }
 }
 
@@ -646,6 +643,24 @@ mod tests {
             "a full table makes room from a's own oldest"
         );
         assert_eq!(o.admit("b2", b, None), ok(&["a2"]), "b still takes from a");
+    }
+
+    #[test]
+    fn a_key_with_one_fewer_than_the_largest_replaces_its_own() {
+        let o = owners(3, 10);
+        let (a, b) = (Some([1; 32]), Some([2; 32]));
+        o.admit("a1", a, None);
+        o.admit("a2", a, None);
+        o.admit("b1", b, None);
+        let all = live(&["a1", "a2", "b1"]);
+        assert!(!o.refuse_early(b));
+        assert_eq!(o.admit("b2", b, Some(&all)), ok(&["b1"]));
+        // A newcomer still takes from whoever holds clearly more, then shares are even.
+        assert_eq!(o.admit("c1", Some([3; 32]), None), ok(&["a1"]));
+        assert!(
+            o.refuse_early(Some([4; 32])),
+            "everyone holds one: a newcomer with none is refused"
+        );
     }
 
     #[test]

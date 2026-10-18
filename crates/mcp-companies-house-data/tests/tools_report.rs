@@ -490,7 +490,7 @@ async fn due_diligence_fits_overseas_entities_and_partnerships() {
     );
     assert!(
         found.iter().any(|(c, _, d)| c == "ownership"
-            && d.contains("does not report persons with significant control")),
+            && d.contains("expects to report persons with significant control")),
         "{found:?}"
     );
     assert!(
@@ -500,4 +500,108 @@ async fn due_diligence_fits_overseas_entities_and_partnerships() {
             .any(|r| r.path == "/company/LP000123/exemptions"),
         "no exemptions request for a type without PSCs"
     );
+}
+
+#[tokio::test]
+async fn due_diligence_does_not_flag_registers_without_officers_or_pscs() {
+    let fake = fake().await;
+    {
+        let mut st = fake.state();
+        for (number, kind) in [
+            ("BR000009", "uk-establishment"),
+            ("RC000009", "royal-charter"),
+            ("OE000009", "registered-overseas-entity"),
+        ] {
+            let mut p = st.companies["00000001"].clone();
+            p["company_number"] = json!(number);
+            p["type"] = json!(kind);
+            p["company_status"] = json!(if kind == "uk-establishment" {
+                "open"
+            } else {
+                "registered"
+            });
+            st.companies.insert(number.into(), p);
+        }
+        // The overseas entity identified all its beneficial owners, so needs no managing officer.
+        st.resources.insert(
+            "/company/OE000009/persons-with-significant-control".into(),
+            json!({"total_results": 1, "items": [
+                {"name": "Owner", "kind": "individual-beneficial-owner", "notified_on": "2023-01-01"}
+            ]}),
+        );
+        st.resources.insert(
+            "/company/OE000009/persons-with-significant-control-statements".into(),
+            json!({"total_results": 1, "items": [{"statement": "all-beneficial-owners-identified"}]}),
+        );
+    }
+    let srv = server(&fake);
+    for number in ["BR000009", "RC000009", "OE000009"] {
+        let v = json(
+            &srv.due_diligence_check(params(json!({"company_number": number})), auth())
+                .await
+                .unwrap(),
+        );
+        let flags: Vec<_> = observations(&v)
+            .into_iter()
+            .filter(|(_, level, _)| level == "flag")
+            .collect();
+        assert!(flags.is_empty(), "{number}: {flags:?}");
+    }
+}
+
+#[tokio::test]
+async fn due_diligence_flags_an_overseas_entity_with_unidentified_owners_and_no_managing_officer() {
+    let fake = fake().await;
+    {
+        let mut st = fake.state();
+        let mut p = st.companies["00000001"].clone();
+        p["company_number"] = json!("OE000010");
+        p["type"] = json!("registered-overseas-entity");
+        p["company_status"] = json!("registered");
+        st.companies.insert("OE000010".into(), p);
+        st.resources.insert(
+            "/company/OE000010/persons-with-significant-control-statements".into(),
+            json!({"total_results": 1, "items": [{"statement": "at-least-one-beneficial-owner-unidentified"}]}),
+        );
+    }
+    let v = json(
+        &server(&fake)
+            .due_diligence_check(params(json!({"company_number": "OE000010"})), auth())
+            .await
+            .unwrap(),
+    );
+    let found = observations(&v);
+    for (check, text) in [
+        ("officers", "no current managing officers are recorded"),
+        (
+            "ownership",
+            "PSC statement: at-least-one-beneficial-owner-unidentified",
+        ),
+    ] {
+        assert!(
+            found
+                .iter()
+                .any(|(c, l, d)| c == check && l == "flag" && d.contains(text)),
+            "{check}: {found:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn identity_verification_says_which_half_could_not_be_read() {
+    let fake = fake().await;
+    fake.state()
+        .fail
+        .push("/company/00000001/persons-with-significant-control".to_string());
+    let v = json(
+        &server(&fake)
+            .due_diligence_check(params(json!({"company_number": "1"})), auth())
+            .await
+            .unwrap(),
+    );
+    let not_run = v["checks_not_run"].to_string();
+    assert!(not_run.contains("identity_verification_pscs"), "{not_run}");
+    let text = v["observations"].to_string();
+    assert!(text.contains("0 of 1 officers in charge"), "{text}");
+    assert!(!text.contains("individual PSCs"), "{text}");
 }
