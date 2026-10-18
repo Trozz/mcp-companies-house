@@ -13,7 +13,7 @@ A self-hosted [Model Context Protocol](https://modelcontextprotocol.io) server f
 - Built-in OAuth 2.1 authorization server so each service works as a claude.ai remote connector. No database, no volume.
 - Read only: the public data API cannot change anything at Companies House.
 
-The core (OAuth, TLS, routing, observability) started as a copy of `mcp-server-core` from [mcp-icloud](https://github.com/Trozz/mcp-icloud) and lives in `crates/mcp-server-core`, where it gained per-person sign-in.
+The server is built on [mcp-server-core](https://github.com/Trozz/mcp-server-core-rs), the open-source base for MCP servers it shares with [mcp-icloud](https://github.com/Trozz/mcp-icloud): OAuth, sign-in, TLS, routing and observability live there.
 
 ## How it works
 
@@ -176,7 +176,7 @@ claude mcp add --transport http companies-house https://companies-house.example.
 
 Every secret can also be read from a file by appending `_FILE` to its name, for example `OAUTH_SIGNING_KEY_FILE=/run/secrets/oauth-signing-key`. A directly set value wins over the file.
 
-The server has no Companies House key of its own, and has no admin password or static token.
+The server has no Companies House key of its own, and has no admin password or static token: setting `MCP_AUTH_TOKEN` stops startup, because everyone signs in with their own key.
 
 ### Server
 
@@ -184,6 +184,8 @@ The server has no Companies House key of its own, and has no admin password or s
 |---|---|---|---|
 | `COMPANIES_HOUSE_SERVICES` | no | all (`companies`) | Comma separated services to run. An unknown name or an empty list stops startup |
 | `COMPANIES_HOUSE_COMBINED` | no | `true` | Serve every running service's tools together at `/mcp`. `false` turns `/mcp` off (it then answers 404) |
+| `COMPANIES_HOUSE_READ_ONLY` | no | | Comma separated services, or `all`, whose tools that change anything are hidden and refused. No effect today: every tool only reads |
+| `AUDIT_LOG_PATH` | no | | Append a JSON line for every call of a tool that changes anything. No effect today: every tool only reads |
 | `PUBLIC_URL` | yes | | External base URL, for example `https://companies-house.example.com`. `http` is accepted only for `localhost` |
 | `OAUTH_SIGNING_KEY` | yes | | At least 32 bytes. Signs OAuth tokens and encrypts the keys inside them. Rotating it signs everyone out |
 | `TRUSTED_PROXIES` | no | | Comma separated proxy IPs whose `X-Forwarded-For` is trusted for sign-in rate limiting |
@@ -215,6 +217,8 @@ The server picks its certificate at startup:
 
 The self-signed certificate is fine for local use, Claude Code, or encrypting the hop from a reverse proxy or tunnel that skips verification or pins the fingerprint. **It does not work for claude.ai directly**, which requires a publicly trusted certificate.
 
+With certificate files the server sends `Strict-Transport-Security: max-age=31536000`. With a self-signed certificate or plain HTTP it does not, so a proxy or tunnel in front sets its own policy.
+
 ### A stable local certificate with mkcert
 
 ```bash
@@ -239,9 +243,9 @@ TLS_CERT_PATH=$PWD/cert.pem TLS_KEY_PATH=$PWD/key.pem ./mcp-companies-house
 - **Keys as bearer tokens** are checked with Companies House on first use. The verdict is cached in memory for up to 10 minutes (1 minute for a rejected key) under the key's SHA-256, never the key itself. Every Companies House request still uses the key, so a key revoked at Companies House stops working at once. Only values shaped like a Companies House key (8 to 64 letters, digits, dashes and underscores) are ever sent to Companies House; other tokens are refused locally.
 - **Sessions belong to whoever opened them.** Each MCP session is tied to the key that started it. A request naming someone else's session id is answered as if the session did not exist, so a leaked session id is of no use to another person. One key holds at most 50 sessions on each path (`/companies` and `/mcp` count separately); opening another closes that key's least recently used one. When a path holds 10,000 sessions, ended and idle ones are cleared first, then a new session takes a slot from whoever holds clearly more, so nobody is pushed out by someone holding fewer; a key that already holds sessions replaces its own least recently used one instead. Only a key with no session is refused, and only when every key holds about the same share (503 with `Retry-After`). rmcp's session logging is kept out of the logs.
 - Each service, and `/mcp`, is its own OAuth protected resource (RFC 9728), with metadata at `/.well-known/oauth-protected-resource/<service>`. Access tokens are bound to the path they were issued for (RFC 8707): a `/companies` token is refused on `/mcp` and the other way round. A `/mcp` token reaches every service's tools.
-- **Limits on key checks.** Each attempt counts from the moment its check starts. A client (an IP address, or an IPv6 /64) is refused for the rest of the minute once it has 5 attempts that were rejected or are still being checked, and a wider block (an IPv4 /24 or IPv6 /48) once it has 25, so one allocation cannot spread over thousands of addresses (429 with `Retry-After`). Once 30 keys across all clients have been rejected within a minute, a client with a rejection of its own is refused too; checks still in flight never count toward that ceiling. When so many addresses are failing that new ones cannot be tracked, a new address is judged by its block, and only if the blocks cannot be tracked either is it refused as "busy" (503). A check the client abandons still finishes, so it counts only if the key was rejected. Input that cannot be a key is refused without being checked or counted. Behind a reverse proxy, set `TRUSTED_PROXIES` so the limits use the real client address.
+- **Limits on key checks.** Each attempt counts from the moment its check starts. A client (an IP address, or an IPv6 /64) is refused for the rest of the minute once it has 5 attempts that were rejected or are still being checked, and a wider block (an IPv4 /24 or IPv6 /48) once it has 25, so one allocation cannot spread over thousands of addresses (429 with `Retry-After`). Once 30 keys across all clients have been rejected within a minute, a client with a rejection of its own is refused too; checks still in flight never count toward that ceiling. When so many addresses are failing that new ones cannot be tracked, a new address is judged by its block, and only if the blocks cannot be tracked either is it refused as "busy" (503). A check the client abandons still finishes, so it counts only if the key was rejected. Input that cannot be a key is refused without being checked or counted. A key found valid in the last 10 minutes is let in even from a blocked address: its holder has already shown they have it. Behind a reverse proxy, set `TRUSTED_PROXIES` so the limits use the real client address.
 - **Load on Companies House.** At most 16 key checks run at once, each for at most 15 seconds; a check that finds them all busy waits up to 5 seconds for a free one. Parallel requests with the same new key share one check. When Companies House cannot be reached or the server is busy, the key is not counted as rejected and the client is asked to retry (503 with `Retry-After`, on the sign-in page as well as for bearer keys). These limits keep one server usable for its people; a public server facing a large botnet still needs rate limiting at the network or a reverse proxy.
-- Access tokens last 1 hour, refresh tokens 30 days; a sign-in lasts as long as the client refreshes at least once every 30 days. There is no per-client revocation. To end your own sign-ins, revoke the key at Companies House. To sign every client out, rotate `OAUTH_SIGNING_KEY`. If `OAUTH_SIGNING_KEY` ever leaks, rotate it and ask everyone to replace their Companies House key: anyone holding the old signing key could open the sealed keys in codes and tokens they captured.
+- Access tokens last 1 hour, refresh tokens 30 days, and every sign-in ends 90 days after it was made however often the client refreshes; then the person signs in again. People are named in logs and the audit log as `key:` and a short hash of their key, keyed by `OAUTH_SIGNING_KEY`. There is no per-client revocation. To end your own sign-ins, revoke the key at Companies House. To sign every client out, rotate `OAUTH_SIGNING_KEY`. If `OAUTH_SIGNING_KEY` ever leaks, rotate it and ask everyone to replace their Companies House key: anyone holding the old signing key could open the sealed keys in codes and tokens they captured.
 - Keys are sent only to `COMPANIES_HOUSE_API_URL` and the Document API (`COMPANIES_HOUSE_DOCUMENT_API_URL`); redirects are not followed, except one: the Document API answers a document download with a redirect to its storage, which is fetched without the key, and only over `https`.
 - Company names, addresses and other filed text are written by the public. The server instructions tell the model to treat them as data, not as instructions.
 - The container runs as UID 65532 with nothing else in the image.
@@ -264,26 +268,13 @@ COMPANIES_HOUSE_API_KEY=... cargo test -p mcp-companies-house-data --test live_s
 
 ### Adding a service
 
-Each service is a library crate that implements the `Service` trait from `mcp-server-core::service`:
-
-```rust
-pub trait Service: Send + Sync + 'static {
-    fn name(&self) -> &'static str;            // path, OAuth resource and scope, e.g. "companies"
-    fn tool_names(&self) -> Vec<String>;
-    fn log_caps(&self) -> &'static [&'static str] { &[] }
-    fn router(self: Arc<Self>, ctx: &ServiceContext) -> axum::Router;
-    // How people sign in: checks their credential with the upstream service.
-    fn credential_verifier(&self) -> Option<Arc<dyn CredentialVerifier>> { None }
-    // This service's handler for /mcp, built once per session there.
-    fn handler(&self) -> DynHandler;
-}
-```
+Each service is a library crate that implements the `Service` trait from [mcp-server-core](https://github.com/Trozz/mcp-server-core-rs) (`mcp_server_core::service::Service`): a name (its path, OAuth resource and scope, e.g. `companies`) and its rmcp handler, plus optionally its tool names for the startup log, its own router and how people sign in.
 
 1. Create `crates/mcp-companies-house-<name>` as a library. Read its own variables in `pub fn from_env(env: &mut ServiceEnv) -> Option<Arc<dyn Service>>`, reporting problems through `env.errors`. Never read the server variables.
-2. Build the MCP endpoint in `router()` with `mcp_server_core::service::mcp_service(ctx, move || Ok(MyServer::new(...)))`, and return `DynHandler::new(MyServer::new(...))` from `handler()` so the tools are on `/mcp` too (any rmcp `ServerHandler` fits). The combined endpoint is the same as mcp-icloud's (`mcp_server_core::combined`). Tools read the caller's key from the request: take `Extension(parts): Extension<http::request::Parts>` and get `mcp_server_core::credential::Credential` from `parts.extensions`.
+2. Return `DynHandler::new(MyServer::new(...))` from `handler()` (any rmcp `ServerHandler` fits); the default `router()` serves it at `/<name>` and the combined endpoint serves it at `/mcp`. Mark tools that only read with `read_only_hint = true`. Tools read the caller's key from the request: take `Extension(parts): Extension<http::request::Parts>` and get `mcp_server_core::credential::Credential` from `parts.extensions`.
 3. Add the crate to `crates/mcp-companies-house/Cargo.toml` and one line to `SERVICES` in `crates/mcp-companies-house/src/lib.rs`.
 
-Routing, OAuth metadata, token audiences, `COMPANIES_HOUSE_SERVICES` and the release pipeline pick the new service up without further changes. The server has one sign-in, taken from the first enabled service that defines `credential_verifier`, so a service that needs a different credential (for example a stream key) needs a core change first.
+Routing, OAuth metadata, token audiences, `COMPANIES_HOUSE_SERVICES` and the release pipeline pick the new service up without further changes. The server has one sign-in: exactly one enabled service may define `credential_verifier`, and a second one stops the server at startup, so a service that needs a different credential (for example a stream key) needs a core change first.
 
 ### Planned services
 
@@ -291,7 +282,7 @@ Routing, OAuth metadata, token audiences, `COMPANIES_HOUSE_SERVICES` and the rel
 
 ### The core
 
-`crates/mcp-server-core` was copied from `Trozz/mcp-icloud` at commit `d98557d` and has since gained per-person sign-in (`src/credential.rs`; `OAUTH_ADMIN_PASSWORD` and `MCP_AUTH_TOKEN` removed). Port fixes between the two by hand.
+OAuth, sign-in, TLS, routing, limits and observability come from [mcp-server-core](https://github.com/Trozz/mcp-server-core-rs) on crates.io, required in the workspace `Cargo.toml`. Fix them there, release it, then raise the version here.
 
 ## Releases
 

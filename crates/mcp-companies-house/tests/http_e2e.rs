@@ -1,7 +1,7 @@
 use axum::body::Body;
 use axum::http::{Request, Response, StatusCode};
 use http_body_util::BodyExt;
-use mcp_companies_house::{SERVICES, app, load};
+use mcp_companies_house::server as ch_server;
 use mcp_server_core::credential::Sealer;
 use mcp_server_core::jwt::{Jwt, Payload, TokenKind};
 use mcp_server_core::service::{HttpSettings, ServiceContext, ServiceEnv};
@@ -30,12 +30,15 @@ fn server(extra: &[(&str, &str)]) -> axum::Router {
         vars.insert(k.to_string(), v.to_string());
     }
     let mut env = ServiceEnv::new(Box::new(move |k: &str| vars.get(k).cloned()));
-    let loaded = load(&mut env, SERVICES).unwrap_or_else(|| panic!("{:?}", env.errors));
+    let server = ch_server();
+    let loaded = server
+        .load(&mut env)
+        .unwrap_or_else(|| panic!("{:?}", env.errors));
     let ctx = ServiceContext {
         http: HttpSettings::from_core(&loaded.core),
         shutdown: CancellationToken::new(),
     };
-    app(loaded.core.oauth, &loaded.services, &ctx, loaded.combined)
+    server.router(&loaded, &ctx)
 }
 
 fn rpc(path: &str, body: Value, token: Option<&str>, session: Option<&str>) -> Request<Body> {
@@ -498,7 +501,7 @@ async fn invalid_service_selection_fails_to_load() {
         "COMPANIES_HOUSE_SERVICES" => Some("nope".to_string()),
         _ => None,
     }));
-    assert!(load(&mut env, SERVICES).is_none());
+    assert!(ch_server().load(&mut env).is_none());
     assert!(
         env.errors
             .iter()
@@ -529,11 +532,35 @@ fn token_with(service: &str, key: Option<&str>) -> String {
             scope: Some(service.into()),
             resource: Some(resource.clone()),
             credential: key.map(|k| Sealer::new(SIGNING_KEY.as_bytes()).seal(k).unwrap()),
+            ver: Some(sign_in_version()),
+            auth_time: Some(now()),
             ..Payload::default()
         },
         &resource,
     )
     .unwrap()
+}
+
+/// The sign-in version this server's tokens carry.
+fn sign_in_version() -> String {
+    let mut env = ServiceEnv::new(Box::new(|k: &str| {
+        match k {
+            "PUBLIC_URL" => Some("https://ch.example.com"),
+            "OAUTH_SIGNING_KEY" => Some(SIGNING_KEY),
+            "COMPANIES_HOUSE_API_URL" => Some("http://127.0.0.1:9"),
+            _ => None,
+        }
+        .map(str::to_string)
+    }));
+    let loaded = ch_server().load(&mut env).expect("loads");
+    mcp_server_core::oauth::sign_in_version(SIGNING_KEY.as_bytes(), loaded.verifier.as_ref())
+}
+
+fn now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
 }
 
 #[tokio::test]
