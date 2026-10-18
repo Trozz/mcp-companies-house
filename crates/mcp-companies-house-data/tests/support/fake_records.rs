@@ -306,12 +306,13 @@ pub fn canned(
 }
 
 /// The offset and page size a live `/search/*` endpoint actually serves: pages aligned to
-/// `items_per_page`, the first match skipped when it is 1, and nothing from result 1000 on
-/// (`None`, answered with 416).
+/// `items_per_page` and the first match skipped when it is 1. A request whose `start_index` plus
+/// `items_per_page` passes 1000 is refused (`None`, answered with 416), even when the aligned
+/// page would fit.
 pub fn search_offset(query: &[(String, String)]) -> Option<(usize, usize)> {
     let start = number(query, "start_index", 0);
     let size = number(query, "items_per_page", 20).max(1);
-    if start >= 1000 {
+    if start + size > 1000 {
         return None;
     }
     let served = if size == 1 {

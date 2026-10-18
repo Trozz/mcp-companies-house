@@ -147,8 +147,15 @@ impl Caller {
                 "Companies House search returns only the first {SEARCH_WINDOW} matches, so start_index must be below {SEARCH_WINDOW}; narrow the query instead"
             )));
         }
-        let limit = limit.min(SEARCH_WINDOW - start);
-        let size = limit.max(2);
+        // Pages are aligned to the requested size, so an unaligned start gets the rest of its page.
+        // Companies House refuses a request whose page passes result 1000, so only then is the
+        // page shortened to end there.
+        let mut limit = limit;
+        let mut size = limit.max(2);
+        if start - start % size + size > SEARCH_WINDOW {
+            limit = limit.min(SEARCH_WINDOW - start);
+            size = limit.max(2);
+        }
         let aligned = start - start % size;
         query.push(("items_per_page", size.to_string()));
         query.push(("start_index", aligned.to_string()));

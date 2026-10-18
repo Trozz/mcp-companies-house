@@ -485,18 +485,58 @@ async fn search_stops_at_the_companies_house_window() {
     assert!(v.get("next_start_index").is_none(), "{v}");
     assert!(v["note"].as_str().unwrap().contains("first 1000 matches"));
 
-    // Near the window the page is shortened so the request stays inside it.
-    json(
+    // Near the window pages stay aligned to the limit, and are shortened only when the aligned
+    // page would pass result 1000 (which Companies House refuses).
+    for (start, limit, sent_start, sent_size) in [
+        (990, 20, "980", "20"),
+        (985, 20, "980", "20"),
+        (993, 10, "990", "10"),
+        (901, 100, "900", "100"),
+        (995, 30, "995", "5"),
+        (999, 1, "998", "2"),
+    ] {
+        let v = json(
+            &s.search_companies(
+                params(json!({"query": "acme", "start_index": start, "limit": limit})),
+                auth(),
+            )
+            .await
+            .unwrap(),
+        );
+        let last = fake.requests().pop().unwrap();
+        assert_eq!(
+            (last.param("start_index"), last.param("items_per_page")),
+            (Some(sent_start), Some(sent_size)),
+            "start {start}, limit {limit}: {v}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn pages_near_result_1000_are_full() {
+    let fake = fake().await;
+    let s = server(&fake);
+    let items = |from: usize, n: usize| -> Vec<Value> {
+        (from..from + n)
+            .map(|i| json!({"title": format!("CO {i}"), "company_number": format!("{i:08}")}))
+            .collect()
+    };
+    // Companies House serves the page aligned to the request; the tool returns the rest of it.
+    fake.inject(Injected::json(
+        200,
+        json!({"kind": "search#companies", "total_results": 5000, "start_index": 980, "items_per_page": 20, "items": items(980, 20)}),
+    ));
+    let v = json(
         &s.search_companies(
-            params(json!({"query": "acme", "start_index": 990, "limit": 20})),
+            params(json!({"query": "co", "start_index": 985, "limit": 20})),
             auth(),
         )
         .await
         .unwrap(),
     );
-    let last = fake.requests().pop().unwrap();
-    assert_eq!(last.param("items_per_page"), Some("10"));
-    assert_eq!(last.param("start_index"), Some("990"));
+    assert_eq!(v["start_index"], 985);
+    assert_eq!(v["count"], 15, "{v}");
+    assert_eq!(v["items"][0]["company_number"], "00000985");
 }
 
 #[tokio::test]

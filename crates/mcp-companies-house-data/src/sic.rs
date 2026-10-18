@@ -3,7 +3,7 @@
 //! `data/sic2007.tsv` is Companies House's "SIC 2007 condensed list" (published on gov.uk).
 //! Contains public sector information licensed under the Open Government Licence v3.0.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::LazyLock;
 
 const DATA: &str = include_str!("../data/sic2007.tsv");
@@ -33,6 +33,14 @@ static CODES: LazyLock<Vec<SicCode>> = LazyLock::new(|| {
 static BY_CODE: LazyLock<HashMap<&'static str, &'static SicCode>> =
     LazyLock::new(|| CODES.iter().map(|c| (c.code, c)).collect());
 
+/// Every word of every description, hyphenated words both whole and split.
+static DESCRIPTION_WORDS: LazyLock<HashSet<String>> = LazyLock::new(|| {
+    CODES
+        .iter()
+        .flat_map(|c| words(c.description, true))
+        .collect()
+});
+
 /// Everyday words that do not appear in the official descriptions, mapped to words that do.
 const SYNONYMS: &[(&str, &[&str])] = &[
     ("bakery", &["bread"]),
@@ -58,6 +66,8 @@ const SYNONYMS: &[(&str, &[&str])] = &[
     ("pharmacy", &["pharmaceutical", "chemist"]),
     ("gym", &["fitness"]),
     ("nursery", &["day-care", "pre-primary"]),
+    ("pre-school", &["pre-primary"]),
+    ("preschool", &["pre-primary"]),
     ("landlord", &["letting", "renting"]),
     ("it", &["information", "computer"]),
     ("tech", &["information", "computer", "software"]),
@@ -107,6 +117,33 @@ fn stem(word: &str) -> &str {
     }
 }
 
+/// The words to look for. A hyphenated query word is kept whole when it has a synonym, appears
+/// whole in a description ("day-care") or has a one-letter part ("e-commerce", "t-shirt").
+/// Otherwise it is joined when that starts a description word ("re-insurance" finds
+/// "reinsurance"), or else split ("real-estate" looks for "real" and "estate").
+fn query_words(q: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for w in words(q, false) {
+        let parts: Vec<&str> = w.split('-').collect();
+        let keep_whole = parts.len() == 1
+            || parts.iter().any(|p| p.len() < 2)
+            || SYNONYMS.iter().any(|(k, _)| *k == w)
+            || DESCRIPTION_WORDS.contains(&w);
+        if keep_whole {
+            out.push(w);
+            continue;
+        }
+        let joined = parts.concat();
+        if DESCRIPTION_WORDS.iter().any(|d| d.starts_with(&joined)) {
+            out.push(joined);
+        } else {
+            out.extend(parts.into_iter().map(str::to_string));
+        }
+    }
+    out.retain(|w| !STOP_WORDS.contains(&w.as_str()));
+    out
+}
+
 fn word_matches(query_word: &str, description_words: &[String]) -> bool {
     let short = query_word.len() <= 3;
     let s = stem(query_word);
@@ -131,10 +168,7 @@ pub fn search(query: &str, limit: usize) -> Vec<&'static SicCode> {
             .take(limit)
             .collect();
     }
-    let query_words: Vec<String> = words(q, false)
-        .into_iter()
-        .filter(|w| !STOP_WORDS.contains(&w.as_str()))
-        .collect();
+    let query_words = query_words(q);
     if query_words.is_empty() {
         return Vec::new();
     }
@@ -156,7 +190,15 @@ pub fn search(query: &str, limit: usize) -> Vec<&'static SicCode> {
                 let by_synonym = alternatives
                     .iter()
                     .any(|a| dw.iter().any(|d| d.starts_with(a)));
-                let exact = dw.iter().any(|d| d.starts_with(w.as_str()));
+                // Short words only ever match whole ("tax" is not "taxi").
+                let short = w.len() <= 3;
+                let exact = dw.iter().any(|d| {
+                    if short {
+                        d == w
+                    } else {
+                        d.starts_with(w.as_str())
+                    }
+                });
                 if exact || by_synonym {
                     matched += 1;
                     whole += 1;
@@ -266,17 +308,57 @@ mod tests {
     #[test]
     fn hyphenated_queries_do_not_match_abbreviation_letters() {
         assert_eq!(codes("e-commerce"), vec!["47910"]);
-        // Whole-word matches rank above stem-only ones ("internet" before "intermediate").
-        assert_eq!(codes("internet")[0], "47910");
+        let retail = codes("e-commerce retail");
         assert!(
-            codes("t-shirt")
+            retail
                 .iter()
                 .all(|c| describe(c).is_some_and(|d| !d.ends_with("n.e.c."))),
-            "{:?}",
-            codes("t-shirt")
+            "{retail:?}"
         );
         assert!(codes("day care").contains(&"88910"));
         assert!(codes("day-care").contains(&"88910"));
+    }
+
+    #[test]
+    fn hyphenated_queries_match_words_written_apart_or_joined() {
+        let estate = codes("real-estate");
+        assert!(estate.contains(&"68310"), "{estate:?}");
+        assert_eq!(estate, codes("real estate"));
+        assert_eq!(codes("mail-order")[0], "47910");
+        assert_eq!(codes("taxi-cab")[0], "49320");
+        assert_eq!(codes("dry-cleaning")[0], "96010");
+        assert!(codes("hair-dressing").contains(&"96020"));
+        assert!(codes("re-insurance").contains(&"65201"));
+        assert!(codes("self-storage").contains(&"52103"));
+        assert_eq!(codes("pre-school"), vec!["85100"]);
+    }
+
+    #[test]
+    fn short_words_match_only_whole_words() {
+        assert_eq!(codes("tax"), vec!["69203"]);
+        assert!(
+            !codes("pet").iter().any(|c| c.starts_with("06")),
+            "petroleum"
+        );
+        assert!(
+            !codes("pub").iter().any(|c| c.starts_with("58")),
+            "publishing"
+        );
+        assert_eq!(codes("art")[0], "47781");
+        let repair = search("car repair", 10)
+            .iter()
+            .map(|c| c.code)
+            .collect::<Vec<_>>();
+        assert!(repair.contains(&"45200"), "{repair:?}");
+    }
+
+    #[test]
+    fn whole_word_matches_rank_above_stem_only_ones() {
+        // "internet" before "intermediate"; "clothing" before "clothes".
+        assert_eq!(codes("internet")[0], "47910");
+        let clothing = codes("clothing shop");
+        assert_ne!(clothing[0], "14110", "{clothing:?}");
+        assert_eq!(clothing.last(), Some(&"14110"), "{clothing:?}");
     }
 
     #[test]
