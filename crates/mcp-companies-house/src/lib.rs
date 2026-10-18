@@ -195,10 +195,32 @@ pub fn log_filter(level: &str, caps: &[&str]) -> String {
         })
         .map(String::from)
         .collect();
-    parts.extend(caps.iter().map(|c| format!("{c}=info")));
-    parts.extend(QUIET_LOG_TARGETS.iter().map(|t| format!("{t}=warn")));
+    // Caps only ever lower a target's level: never above what LOG_LEVEL set for everything.
+    let global = level
+        .split(',')
+        .map(str::trim)
+        .rfind(|d| LEVELS.contains(&d.to_ascii_lowercase().as_str()))
+        .map(str::to_ascii_lowercase)
+        .unwrap_or_else(|| "off".into());
+    let cap = |max: &str| -> String {
+        let rank = |l: &str| LEVELS.iter().position(|x| *x == l).unwrap_or(0);
+        if rank(&global) < rank(max) {
+            global.clone()
+        } else {
+            max.to_string()
+        }
+    };
+    parts.extend(caps.iter().map(|c| format!("{c}={}", cap("info"))));
+    parts.extend(
+        QUIET_LOG_TARGETS
+            .iter()
+            .map(|t| format!("{t}={}", cap("warn"))),
+    );
     parts.join(",")
 }
+
+/// Log levels from least to most verbose.
+const LEVELS: &[&str] = &["off", "error", "warn", "info", "debug", "trace"];
 
 #[cfg(test)]
 mod tests {
@@ -401,7 +423,7 @@ mod tests {
         let mut e = with_core(&[]);
         let loaded = load(&mut e, SERVICES).expect("loads");
         let names = combined_tool_names(&loaded.services);
-        assert_eq!(names.len(), 18);
+        assert_eq!(names.len(), 26);
         assert!(names.contains(&"companies_search_companies".to_string()));
         let unique: std::collections::HashSet<_> = names.iter().collect();
         assert_eq!(unique.len(), names.len());
@@ -427,6 +449,19 @@ mod tests {
             log_filter("info,[{x}]=trace,[x]=trace,debug", &["a"]),
             format!("info,debug,a=info,{Q}")
         );
+    }
+
+    #[test]
+    fn caps_never_raise_a_target_above_log_level() {
+        assert_eq!(
+            log_filter("error", &["a"]),
+            "error,a=error,rmcp::transport::streamable_http_server=error,rmcp::transport::worker=error"
+        );
+        assert_eq!(
+            log_filter("off", &[]),
+            "off,rmcp::transport::streamable_http_server=off,rmcp::transport::worker=off"
+        );
+        assert!(log_filter("b=debug", &["a"]).contains("a=off"));
     }
 
     #[test]

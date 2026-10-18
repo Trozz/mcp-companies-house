@@ -180,3 +180,41 @@ async fn sic_lookup_finds_and_describes_codes_without_calling_companies_house() 
     assert!(text.contains("give a query or codes"), "{text}");
     assert!(fake.requests().is_empty());
 }
+
+#[tokio::test]
+async fn search_all_mixes_companies_officers_and_disqualified_officers() {
+    let fake = fake().await;
+    let v = json(
+        &server(&fake)
+            .search_all(params(json!({"query": "o"})), auth())
+            .await
+            .unwrap(),
+    );
+    let kinds: std::collections::BTreeSet<&str> = v["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|i| i["kind"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        kinds,
+        ["company", "disqualified_officer", "officer"]
+            .into_iter()
+            .collect()
+    );
+    let officer = v["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|i| i["kind"] == "officer")
+        .unwrap();
+    assert!(officer["officer_id"].is_string(), "{officer}");
+    let disqualified = v["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|i| i["kind"] == "disqualified_officer")
+        .unwrap();
+    assert!(disqualified["officer_kind"].is_string(), "{disqualified}");
+    assert_eq!(fake.requests()[0].path, "/search");
+}

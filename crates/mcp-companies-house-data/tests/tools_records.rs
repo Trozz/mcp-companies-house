@@ -215,3 +215,147 @@ async fn charges_and_insolvency_of_an_unknown_company_are_not_found() {
         );
     }
 }
+
+#[tokio::test]
+async fn one_filing_is_read_by_transaction_id() {
+    let fake = fake().await;
+    let srv = server(&fake);
+    let v = json(
+        &srv.get_filing(
+            params(json!({"company_number": "1", "transaction_id": "tx4"})),
+            auth(),
+        )
+        .await
+        .unwrap(),
+    );
+    assert_eq!(v["type"], "AA");
+    assert_eq!(v["document_id"], "doc-tx4");
+    assert_eq!(
+        fake.requests()[0].path,
+        "/company/00000001/filing-history/tx4"
+    );
+    let e = error_text(
+        &srv.get_filing(
+            params(json!({"company_number": "1", "transaction_id": "tx-none"})),
+            auth(),
+        )
+        .await
+        .unwrap(),
+    );
+    assert!(e.starts_with("not_found: no filing tx-none"), "{e}");
+    let e = error_text(
+        &srv.get_filing(
+            params(json!({"company_number": "1", "transaction_id": "../x"})),
+            auth(),
+        )
+        .await
+        .unwrap(),
+    );
+    assert!(e.starts_with("validation: "), "{e}");
+}
+
+#[tokio::test]
+async fn registers_say_where_each_is_kept() {
+    let fake = fake().await;
+    let srv = server(&fake);
+    let v = json(
+        &srv.get_company_registers(params(json!({"company_number": "1"})), auth())
+            .await
+            .unwrap(),
+    );
+    assert_eq!(
+        v["registers"][0],
+        json!({
+            "register": "directors", "location": "public-register", "since": "2020-06-30",
+            "history": [
+                {"location": "public-register", "moved_on": "2020-06-30", "transaction_id": "txr2"},
+                {"location": "single-alternative-inspection-location", "moved_on": "2017-01-01", "transaction_id": "txr1"}
+            ]
+        })
+    );
+    assert_eq!(
+        v["registers"][1]["register"],
+        "persons_with_significant_control"
+    );
+
+    // No register record is an answer, not an error; an unknown company is.
+    let v = json(
+        &srv.get_company_registers(params(json!({"company_number": "2"})), auth())
+            .await
+            .unwrap(),
+    );
+    assert_eq!(v["registers"], json!([]));
+    assert!(v["note"].as_str().unwrap().contains("registered office"));
+    let e = error_text(
+        &srv.get_company_registers(params(json!({"company_number": "99999999"})), auth())
+            .await
+            .unwrap(),
+    );
+    assert!(
+        e.starts_with("not_found: no company with number 99999999"),
+        "{e}"
+    );
+}
+
+#[tokio::test]
+async fn exemptions_are_listed_or_reported_as_none() {
+    let fake = fake().await;
+    let srv = server(&fake);
+    let v = json(
+        &srv.get_exemptions(params(json!({"company_number": "6"})), auth())
+            .await
+            .unwrap(),
+    );
+    assert_eq!(
+        v,
+        json!({"exemptions": [{
+            "exemption": "psc-exempt-as-trading-on-regulated-market", "current": true,
+            "periods": [{"exempt_from": "2016-04-06"}]
+        }]})
+    );
+    let v = json(
+        &srv.get_exemptions(params(json!({"company_number": "1"})), auth())
+            .await
+            .unwrap(),
+    );
+    assert_eq!(v["exemptions"], json!([]));
+    let e = error_text(
+        &srv.get_exemptions(params(json!({"company_number": "99999999"})), auth())
+            .await
+            .unwrap(),
+    );
+    assert!(e.starts_with("not_found: "), "{e}");
+}
+
+#[tokio::test]
+async fn uk_establishments_of_an_overseas_company_are_listed() {
+    let fake = fake().await;
+    let srv = server(&fake);
+    let v = json(
+        &srv.get_uk_establishments(params(json!({"company_number": "FC7"})), auth())
+            .await
+            .unwrap(),
+    );
+    assert_eq!(v["total"], 2);
+    assert_eq!(
+        v["items"][0],
+        json!({"company_number": "BR000001", "company_name": "OVERSEAS WIDGETS INC (UK BRANCH)",
+               "company_status": "open", "locality": "London"})
+    );
+    assert_eq!(
+        fake.requests()[0].path,
+        "/company/FC000007/uk-establishments"
+    );
+    let v = json(
+        &srv.get_uk_establishments(params(json!({"company_number": "1"})), auth())
+            .await
+            .unwrap(),
+    );
+    assert_eq!(v, json!({"total": 0, "items": []}));
+    let e = error_text(
+        &srv.get_uk_establishments(params(json!({"company_number": "99999999"})), auth())
+            .await
+            .unwrap(),
+    );
+    assert!(e.starts_with("not_found: "), "{e}");
+}

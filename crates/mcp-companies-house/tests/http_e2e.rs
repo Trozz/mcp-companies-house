@@ -139,7 +139,7 @@ async fn companies_is_served_at_its_path_with_an_oauth_token() {
         .unwrap();
     let list = rpc_message(res).await;
     let tools = list["result"]["tools"].as_array().unwrap();
-    assert_eq!(tools.len(), 18, "{tools:?}");
+    assert_eq!(tools.len(), 26, "{tools:?}");
 }
 
 #[tokio::test]
@@ -248,7 +248,7 @@ async fn mcp_serves_every_tool_with_its_service_prefix() {
         .iter()
         .map(|t| t["name"].as_str().unwrap())
         .collect();
-    assert_eq!(names.len(), 18, "{names:?}");
+    assert_eq!(names.len(), 26, "{names:?}");
     assert!(
         names.iter().all(|n| n.starts_with("companies_")),
         "{names:?}"
@@ -274,6 +274,160 @@ async fn mcp_serves_every_tool_with_its_service_prefix() {
             .contains("10710"),
         "{call}"
     );
+}
+
+/// Opens a session on `path` and returns it.
+async fn open_session(app: &axum::Router, path: &str, token: &str) -> String {
+    let res = app
+        .clone()
+        .oneshot(rpc(path, initialize(), Some(token), None))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let session = res.headers()["mcp-session-id"]
+        .to_str()
+        .unwrap()
+        .to_string();
+    let init = rpc_message(res).await;
+    assert!(
+        init["result"]["capabilities"]["prompts"].is_object(),
+        "{path} advertises prompts: {init}"
+    );
+    let res = app
+        .clone()
+        .oneshot(rpc(
+            path,
+            json!({"jsonrpc": "2.0", "method": "notifications/initialized"}),
+            Some(token),
+            Some(&session),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::ACCEPTED);
+    session
+}
+
+#[tokio::test]
+async fn prompts_are_served_on_the_service_path_and_prefixed_on_mcp() {
+    let app = server(&[]);
+    // /companies: the prompts under their own names, naming the tools as /companies lists them.
+    let token = access_token_for("companies");
+    let session = open_session(&app, "/companies", &token).await;
+    let res = app
+        .clone()
+        .oneshot(rpc(
+            "/companies",
+            json!({"jsonrpc": "2.0", "id": 2, "method": "prompts/list", "params": {}}),
+            Some(&token),
+            Some(&session),
+        ))
+        .await
+        .unwrap();
+    let list = rpc_message(res).await;
+    let names: Vec<&str> = list["result"]["prompts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|p| p["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        names,
+        vec![
+            "overview",
+            "due_diligence",
+            "director_check",
+            "ownership_chain",
+            "read_accounts",
+            "find_companies",
+            "name_check",
+            "watchlist"
+        ]
+    );
+    let res = app
+        .clone()
+        .oneshot(rpc(
+            "/companies",
+            json!({"jsonrpc": "2.0", "id": 3, "method": "prompts/get", "params": {
+                "name": "due_diligence", "arguments": {"company": "00445790"}
+            }}),
+            Some(&token),
+            Some(&session),
+        ))
+        .await
+        .unwrap();
+    let got = rpc_message(res).await;
+    let text = got["result"]["messages"][0]["content"]["text"]
+        .as_str()
+        .unwrap();
+    assert_eq!(got["result"]["messages"][0]["role"], "user");
+    assert!(text.contains("\"00445790\""), "{text}");
+    assert!(text.contains("Call due_diligence_check"), "{text}");
+    assert!(!text.contains("<context>"), "no context was given: {text}");
+
+    // A missing required argument is an error, not a half-filled prompt.
+    let res = app
+        .clone()
+        .oneshot(rpc(
+            "/companies",
+            json!({"jsonrpc": "2.0", "id": 4, "method": "prompts/get", "params": {
+                "name": "due_diligence", "arguments": {}
+            }}),
+            Some(&token),
+            Some(&session),
+        ))
+        .await
+        .unwrap();
+    let err = rpc_message(res).await;
+    assert!(
+        err["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("needs company"),
+        "{err}"
+    );
+
+    // /mcp: the same prompts with the service prefix, and the tools in their text prefixed.
+    let token = access_token_for("mcp");
+    let session = open_session(&app, "/mcp", &token).await;
+    let res = app
+        .clone()
+        .oneshot(rpc(
+            "/mcp",
+            json!({"jsonrpc": "2.0", "id": 2, "method": "prompts/list", "params": {}}),
+            Some(&token),
+            Some(&session),
+        ))
+        .await
+        .unwrap();
+    let list = rpc_message(res).await;
+    let names: Vec<&str> = list["result"]["prompts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|p| p["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(names.len(), 8, "{names:?}");
+    assert!(names.contains(&"companies_due_diligence"), "{names:?}");
+    let res = app
+        .oneshot(rpc(
+            "/mcp",
+            json!({"jsonrpc": "2.0", "id": 3, "method": "prompts/get", "params": {
+                "name": "companies_due_diligence", "arguments": {"company": "00445790"}
+            }}),
+            Some(&token),
+            Some(&session),
+        ))
+        .await
+        .unwrap();
+    let got = rpc_message(res).await;
+    let text = got["result"]["messages"][0]["content"]["text"]
+        .as_str()
+        .unwrap();
+    assert!(
+        text.contains("Call companies_due_diligence_check"),
+        "{text}"
+    );
+    assert!(!text.contains(" due_diligence_check"), "{text}");
 }
 
 #[tokio::test]

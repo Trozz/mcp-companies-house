@@ -149,3 +149,459 @@ async fn report_fails_when_the_company_does_not_exist() {
     );
     assert!(text.starts_with("validation: "), "{text}");
 }
+
+fn observations(v: &serde_json::Value) -> Vec<(String, String, String)> {
+    v["observations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|o| {
+            (
+                o["check"].as_str().unwrap().to_string(),
+                o["level"].as_str().unwrap().to_string(),
+                o["detail"].as_str().unwrap().to_string(),
+            )
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn due_diligence_on_a_quiet_company_observes_nothing_but_never_clears_it() {
+    let fake = fake().await;
+    let v = json(
+        &server(&fake)
+            .due_diligence_check(params(json!({"company_number": "1"})), auth())
+            .await
+            .unwrap(),
+    );
+    assert_eq!(v["company"]["company_name"], "ACME WIDGETS LIMITED");
+    // Nothing to look into; the only observation is the identity verification tally.
+    assert_eq!(
+        observations(&v),
+        vec![(
+            "identity_verification".to_string(),
+            "note".to_string(),
+            "identity verification statements on record: 0 of 1 officers in charge who are people, 0 of 1 individual PSCs. Companies House is phasing verification in, so none on record is not a failure; the register shows that a statement was filed, not the check itself".to_string()
+        )]
+    );
+    let run: Vec<&str> = v["checks_run"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c.as_str().unwrap())
+        .collect();
+    for check in [
+        "company_status",
+        "accounts",
+        "confirmation_statement",
+        "registered_office",
+        "company_age",
+        "insolvency",
+        "charges",
+        "officers",
+        "ownership",
+        "identity_verification",
+    ] {
+        assert!(run.contains(&check), "{check} missing from {run:?}");
+    }
+    let not_run = v["checks_not_run"].to_string();
+    for check in [
+        "sanctions",
+        "politically_exposed_persons",
+        "credit_and_finances",
+    ] {
+        assert!(not_run.contains(check), "{not_run}");
+    }
+    assert!(!not_run.contains("identity_verification"), "{not_run}");
+    assert!(
+        v["disclaimer"]
+            .as_str()
+            .unwrap()
+            .contains("does not mean the company is sound"),
+        "{v}"
+    );
+    assert_eq!(
+        paths(&fake),
+        vec![
+            "/company/00000001",
+            "/company/00000001/officers",
+            "/company/00000001/persons-with-significant-control",
+            "/company/00000001/persons-with-significant-control-statements",
+        ]
+    );
+}
+
+#[tokio::test]
+async fn due_diligence_flags_liquidation_insolvency_and_no_directors() {
+    let fake = fake().await;
+    let v = json(
+        &server(&fake)
+            .due_diligence_check(params(json!({"company_number": "6"})), auth())
+            .await
+            .unwrap(),
+    );
+    let found = observations(&v);
+    let has = |check: &str, level: &str, text: &str| {
+        found
+            .iter()
+            .any(|(c, l, d)| c == check && l == level && d.contains(text))
+    };
+    assert!(
+        has("company_status", "flag", "status is liquidation"),
+        "{found:?}"
+    );
+    assert!(
+        has(
+            "insolvency",
+            "flag",
+            "creditors-voluntary-liquidation (wound-up-on 2025-02-01)"
+        ),
+        "{found:?}"
+    );
+    assert!(
+        has(
+            "charges",
+            "note",
+            "charges not satisfied: 1, held by Big Bank PLC"
+        ),
+        "{found:?}"
+    );
+    assert!(has("officers", "flag", "no current directors"), "{found:?}");
+    assert!(
+        has("ownership", "note", "exempt from the PSC rules"),
+        "{found:?}"
+    );
+}
+
+#[tokio::test]
+async fn due_diligence_flags_a_new_company_with_overdue_filings_and_no_owner() {
+    let fake = fake().await;
+    let created = chrono::Utc::now().date_naive() - chrono::Duration::days(90);
+    {
+        let mut st = fake.state();
+        let mut p = st.companies["00000002"].clone();
+        p["company_number"] = json!("00000009");
+        p["date_of_creation"] = json!(created.to_string());
+        p["accounts"]["next_accounts"]["overdue"] = json!(true);
+        p["confirmation_statement"]["overdue"] = json!(true);
+        p["registered_office_is_in_dispute"] = json!(true);
+        p["company_status_detail"] = json!("active-proposal-to-strike-off");
+        st.companies.insert("00000009".into(), p);
+    }
+    let v = json(
+        &server(&fake)
+            .due_diligence_check(params(json!({"company_number": "9"})), auth())
+            .await
+            .unwrap(),
+    );
+    let flags: Vec<String> = observations(&v)
+        .into_iter()
+        .filter(|(_, l, _)| l == "flag")
+        .map(|(c, _, _)| c)
+        .collect();
+    assert_eq!(
+        flags,
+        vec![
+            "company_status",
+            "accounts",
+            "confirmation_statement",
+            "registered_office",
+            "company_age",
+            "officers",
+            "ownership",
+        ],
+        "{v}"
+    );
+    let text = v["observations"].to_string();
+    assert!(text.contains("active-proposal-to-strike-off"), "{text}");
+    assert!(text.contains("may be a gap"), "{text}");
+}
+
+#[tokio::test]
+async fn due_diligence_reports_checks_it_could_not_read() {
+    let fake = fake().await;
+    fake.state()
+        .fail
+        .push("/company/00000001/officers".to_string());
+    let v = json(
+        &server(&fake)
+            .due_diligence_check(params(json!({"company_number": "1"})), auth())
+            .await
+            .unwrap(),
+    );
+    let run = v["checks_run"].as_array().unwrap();
+    assert!(!run.iter().any(|c| c == "officers"), "{v}");
+    assert!(run.iter().any(|c| c == "ownership"), "{v}");
+    let failed = &v["checks_not_run"][0];
+    assert_eq!(failed["check"], "officers");
+    assert!(
+        failed["reason"]
+            .as_str()
+            .unwrap()
+            .starts_with("could not be read: upstream: "),
+        "{failed}"
+    );
+}
+
+#[tokio::test]
+async fn due_diligence_needs_a_company() {
+    let fake = fake().await;
+    let e = error_text(
+        &server(&fake)
+            .due_diligence_check(params(json!({"company_number": "99999999"})), auth())
+            .await
+            .unwrap(),
+    );
+    assert!(
+        e.starts_with("not_found: no company with number 99999999"),
+        "{e}"
+    );
+}
+
+#[tokio::test]
+async fn due_diligence_flags_an_owner_the_register_marks_as_sanctioned() {
+    let fake = fake().await;
+    fake.state()
+        .resources
+        .get_mut("/company/00000001/persons-with-significant-control")
+        .unwrap()["items"][0]["is_sanctioned"] = json!(true);
+    let v = json(
+        &server(&fake)
+            .due_diligence_check(params(json!({"company_number": "1"})), auth())
+            .await
+            .unwrap(),
+    );
+    let flags: Vec<_> = observations(&v)
+        .into_iter()
+        .filter(|(_, level, _)| level == "flag")
+        .collect();
+    assert_eq!(
+        flags,
+        vec![(
+            "ownership".to_string(),
+            "flag".to_string(),
+            "the register marks these owners as sanctioned: Mrs Jane Anne Smith".to_string()
+        )]
+    );
+}
+
+#[tokio::test]
+async fn due_diligence_says_when_psc_statements_could_not_be_read() {
+    let fake = fake().await;
+    fake.state()
+        .fail
+        .push("/company/00000001/persons-with-significant-control-statements".to_string());
+    let v = json(
+        &server(&fake)
+            .due_diligence_check(params(json!({"company_number": "1"})), auth())
+            .await
+            .unwrap(),
+    );
+    let failed = &v["checks_not_run"][0];
+    assert_eq!(failed["check"], "ownership_statements", "{v}");
+    assert!(
+        failed["reason"].as_str().unwrap().contains("upstream: "),
+        "{failed}"
+    );
+}
+
+#[tokio::test]
+async fn due_diligence_flags_statements_about_unresolved_control() {
+    let fake = fake().await;
+    fake.state().resources.insert(
+        "/company/00000001/persons-with-significant-control-statements".into(),
+        json!({"total_results": 1, "items": [
+            {"statement": "psc-contacted-but-no-response", "notified_on": "2025-01-01"}
+        ]}),
+    );
+    let v = json(
+        &server(&fake)
+            .due_diligence_check(params(json!({"company_number": "1"})), auth())
+            .await
+            .unwrap(),
+    );
+    assert!(
+        observations(&v).contains(&(
+            "ownership".to_string(),
+            "flag".to_string(),
+            "PSC statement: psc-contacted-but-no-response".to_string()
+        )),
+        "{v}"
+    );
+}
+
+#[tokio::test]
+async fn due_diligence_fits_overseas_entities_and_partnerships() {
+    let fake = fake().await;
+    {
+        let mut st = fake.state();
+        let mut oe = st.companies["00000001"].clone();
+        oe["company_number"] = json!("OE000123");
+        oe["type"] = json!("registered-overseas-entity");
+        oe["company_status"] = json!("registered");
+        st.companies.insert("OE000123".into(), oe);
+        st.resources.insert(
+            "/company/OE000123/officers".into(),
+            json!({"total_results": 1, "active_count": 1, "items": [
+                {"name": "OFFICER, Managing", "officer_role": "managing-officer", "appointed_on": "2015-01-01"}
+            ]}),
+        );
+        st.resources.insert(
+            "/company/OE000123/persons-with-significant-control".into(),
+            json!({"total_results": 1, "active_count": 1, "items": [
+                {"name": "Beneficial Owner", "kind": "individual-beneficial-owner", "notified_on": "2023-01-01"}
+            ]}),
+        );
+        let mut lp = st.companies["00000001"].clone();
+        lp["company_number"] = json!("LP000123");
+        lp["type"] = json!("limited-partnership");
+        st.companies.insert("LP000123".into(), lp);
+        st.resources.insert(
+            "/company/LP000123/officers".into(),
+            json!({"total_results": 1, "active_count": 1, "items": [
+                {"name": "PARTNER, General", "officer_role": "general-partner-in-a-limited-partnership", "appointed_on": "2015-01-01"}
+            ]}),
+        );
+    }
+    let srv = server(&fake);
+    let v = json(
+        &srv.due_diligence_check(params(json!({"company_number": "OE000123"})), auth())
+            .await
+            .unwrap(),
+    );
+    let flags: Vec<_> = observations(&v)
+        .into_iter()
+        .filter(|(_, level, _)| level == "flag")
+        .collect();
+    assert!(
+        flags.is_empty(),
+        "a live overseas entity with a managing officer: {flags:?}"
+    );
+
+    let v = json(
+        &srv.due_diligence_check(params(json!({"company_number": "LP000123"})), auth())
+            .await
+            .unwrap(),
+    );
+    let found = observations(&v);
+    assert!(
+        found.iter().all(|(_, level, _)| level != "flag"),
+        "{found:?}"
+    );
+    assert!(
+        found.iter().any(|(c, _, d)| c == "ownership"
+            && d.contains("expects to report persons with significant control")),
+        "{found:?}"
+    );
+    assert!(
+        !fake
+            .requests()
+            .iter()
+            .any(|r| r.path == "/company/LP000123/exemptions"),
+        "no exemptions request for a type without PSCs"
+    );
+}
+
+#[tokio::test]
+async fn due_diligence_does_not_flag_registers_without_officers_or_pscs() {
+    let fake = fake().await;
+    {
+        let mut st = fake.state();
+        for (number, kind) in [
+            ("BR000009", "uk-establishment"),
+            ("RC000009", "royal-charter"),
+            ("OE000009", "registered-overseas-entity"),
+        ] {
+            let mut p = st.companies["00000001"].clone();
+            p["company_number"] = json!(number);
+            p["type"] = json!(kind);
+            p["company_status"] = json!(if kind == "uk-establishment" {
+                "open"
+            } else {
+                "registered"
+            });
+            st.companies.insert(number.into(), p);
+        }
+        // The overseas entity identified all its beneficial owners, so needs no managing officer.
+        st.resources.insert(
+            "/company/OE000009/persons-with-significant-control".into(),
+            json!({"total_results": 1, "items": [
+                {"name": "Owner", "kind": "individual-beneficial-owner", "notified_on": "2023-01-01"}
+            ]}),
+        );
+        st.resources.insert(
+            "/company/OE000009/persons-with-significant-control-statements".into(),
+            json!({"total_results": 1, "items": [{"statement": "all-beneficial-owners-identified"}]}),
+        );
+    }
+    let srv = server(&fake);
+    for number in ["BR000009", "RC000009", "OE000009"] {
+        let v = json(
+            &srv.due_diligence_check(params(json!({"company_number": number})), auth())
+                .await
+                .unwrap(),
+        );
+        let flags: Vec<_> = observations(&v)
+            .into_iter()
+            .filter(|(_, level, _)| level == "flag")
+            .collect();
+        assert!(flags.is_empty(), "{number}: {flags:?}");
+    }
+}
+
+#[tokio::test]
+async fn due_diligence_flags_an_overseas_entity_with_unidentified_owners_and_no_managing_officer() {
+    let fake = fake().await;
+    {
+        let mut st = fake.state();
+        let mut p = st.companies["00000001"].clone();
+        p["company_number"] = json!("OE000010");
+        p["type"] = json!("registered-overseas-entity");
+        p["company_status"] = json!("registered");
+        st.companies.insert("OE000010".into(), p);
+        st.resources.insert(
+            "/company/OE000010/persons-with-significant-control-statements".into(),
+            json!({"total_results": 1, "items": [{"statement": "at-least-one-beneficial-owner-unidentified"}]}),
+        );
+    }
+    let v = json(
+        &server(&fake)
+            .due_diligence_check(params(json!({"company_number": "OE000010"})), auth())
+            .await
+            .unwrap(),
+    );
+    let found = observations(&v);
+    for (check, text) in [
+        ("officers", "no current managing officers are recorded"),
+        (
+            "ownership",
+            "PSC statement: at-least-one-beneficial-owner-unidentified",
+        ),
+    ] {
+        assert!(
+            found
+                .iter()
+                .any(|(c, l, d)| c == check && l == "flag" && d.contains(text)),
+            "{check}: {found:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn identity_verification_says_which_half_could_not_be_read() {
+    let fake = fake().await;
+    fake.state()
+        .fail
+        .push("/company/00000001/persons-with-significant-control".to_string());
+    let v = json(
+        &server(&fake)
+            .due_diligence_check(params(json!({"company_number": "1"})), auth())
+            .await
+            .unwrap(),
+    );
+    let not_run = v["checks_not_run"].to_string();
+    assert!(not_run.contains("identity_verification_pscs"), "{not_run}");
+    let text = v["observations"].to_string();
+    assert!(text.contains("0 of 1 officers in charge"), "{text}");
+    assert!(!text.contains("individual PSCs"), "{text}");
+}

@@ -195,7 +195,7 @@ async fn tools_are_listed_read_only_with_their_schemas() {
     let list = call(&app, &session, 2, "tools/list", json!({})).await;
     let tools = list["result"]["tools"].as_array().unwrap();
     let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
-    assert_eq!(names.len(), 18, "{names:?}");
+    assert_eq!(names.len(), 26, "{names:?}");
     for name in [
         "search_companies",
         "filter_companies",
@@ -207,6 +207,13 @@ async fn tools_are_listed_read_only_with_their_schemas() {
         "get_insolvency",
         "company_report",
         "lookup_sic_codes",
+        "get_company_registers",
+        "get_exemptions",
+        "get_uk_establishments",
+        "get_filing",
+        "download_filing_document",
+        "due_diligence_check",
+        "officer_network",
     ] {
         assert!(names.contains(&name), "{name} missing from {names:?}");
     }
@@ -349,7 +356,7 @@ async fn mcp_lists_every_tool_with_its_service_prefix() {
     let (session, init) = handshake_at(&app, "/mcp").await;
     let instructions = init["result"]["instructions"].as_str().unwrap();
     assert!(
-        instructions.contains("Each tool name starts with its service: companies_."),
+        instructions.contains("Each tool and prompt name starts with its service: companies_."),
         "{instructions}"
     );
     assert!(instructions.contains("\n\ncompanies:\n"), "{instructions}");
@@ -359,7 +366,7 @@ async fn mcp_lists_every_tool_with_its_service_prefix() {
     );
     let list = call_at(&app, "/mcp", &session, 2, "tools/list", json!({})).await;
     let tools = list["result"]["tools"].as_array().unwrap();
-    assert_eq!(tools.len(), 18);
+    assert_eq!(tools.len(), 26);
     for t in tools {
         let name = t["name"].as_str().unwrap();
         assert!(name.starts_with("companies_"), "{name}");

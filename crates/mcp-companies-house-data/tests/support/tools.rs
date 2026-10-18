@@ -14,6 +14,7 @@ use std::time::Duration;
 pub fn settings(fake: &FakeCh) -> ApiSettings {
     let mut s = ApiSettings::new(fake.url.clone());
     s.retry_delay = Duration::ZERO;
+    s.documents = Some(fake.url.join("docapi/").unwrap());
     s
 }
 
