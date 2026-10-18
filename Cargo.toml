@@ -30,6 +30,7 @@ tower = { version = "0.5.3", features = ["util"] }
 http-body-util = "0.1.5"
 rmcp = { version = "=3.5.1", features = ["server", "macros", "transport-streamable-http-server"] }
 chrono = { version = "0.4.45", default-features = false, features = ["std", "clock"] }
+base64 = "0.23.1"
 
 [profile.release]
 lto = true

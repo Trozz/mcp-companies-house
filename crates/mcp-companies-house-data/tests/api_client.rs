@@ -3,7 +3,7 @@ use mcp_companies_house_data::api::{ChClient, MAX_BODY_BYTES};
 use mcp_companies_house_data::error::ChError;
 use serde_json::json;
 use std::time::Duration;
-use support::fake_ch::{AUTH, FakeCh, FakeState, Injected, RATE_LIMIT, now_unix};
+use support::fake_ch::{API_KEY, FakeCh, FakeState, Injected, RATE_LIMIT, auth_header, now_unix};
 use support::tools::{client, settings};
 
 async fn fake() -> FakeCh {
@@ -20,7 +20,19 @@ async fn sends_the_key_as_basic_auth_username_with_a_blank_password() {
     assert_eq!(v["company_name"], "ACME WIDGETS LIMITED");
     let log = fake.requests();
     assert_eq!(log.len(), 1);
-    assert_eq!(log[0].authorization.as_deref(), Some(AUTH));
+    assert_eq!(
+        log[0].authorization.as_deref(),
+        Some(auth_header().as_str())
+    );
+    // The key is the username and the password is blank.
+    let encoded = auth_header().strip_prefix("Basic ").unwrap().to_string();
+    let decoded = {
+        use base64::Engine as _;
+        base64::engine::general_purpose::STANDARD
+            .decode(encoded)
+            .unwrap()
+    };
+    assert_eq!(decoded, format!("{API_KEY}:").into_bytes());
     assert_eq!(log[0].accept.as_deref(), Some("application/json"));
 }
 

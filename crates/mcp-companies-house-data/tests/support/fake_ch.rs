@@ -13,8 +13,16 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use url::Url;
 
 pub const API_KEY: &str = "test-api-key";
-/// `Basic base64("test-api-key:")`: the key as username, blank password.
-pub const AUTH: &str = "Basic dGVzdC1hcGkta2V5Og==";
+
+/// The `Authorization` header Companies House expects: Basic with the key as the username and a
+/// blank password.
+pub fn auth_header() -> String {
+    use base64::Engine as _;
+    format!(
+        "Basic {}",
+        base64::engine::general_purpose::STANDARD.encode(format!("{API_KEY}:"))
+    )
+}
 pub const RATE_LIMIT: u64 = 600;
 
 #[derive(Debug, Clone)]
@@ -524,7 +532,7 @@ async fn handle(
         tokio::time::sleep(delay).await;
     }
     let mut st = state.lock().unwrap();
-    if authorization.as_deref() != Some(AUTH) {
+    if authorization.as_deref() != Some(auth_header().as_str()) {
         return respond(
             401,
             json!({"error": "Invalid Authorization", "type": "ch:service"}).to_string(),
