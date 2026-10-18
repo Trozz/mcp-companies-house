@@ -6,7 +6,10 @@ use super::{
 };
 use crate::error::{self, ChError};
 use crate::view::page;
-use crate::view::records::{charge_detail, charge_item, filing_item, insolvency};
+use crate::view::records::{
+    charge_detail, charge_item, exemptions, filing_item, insolvency, registers,
+    uk_establishment_item,
+};
 use axum::http::request::Parts;
 use rmcp::handler::server::tool::Extension;
 use rmcp::handler::server::wrapper::Parameters;
@@ -23,7 +26,7 @@ const MAX_CATEGORIES: usize = 20;
 pub struct ListFilingHistoryParams {
     /// Company number, e.g. 00445790 or SC123456.
     pub company_number: String,
-    /// Only filings in these categories, e.g. ["accounts"]. Categories include accounts, address, annual-return, capital, change-of-name, incorporation, liquidation, miscellaneous, mortgage (charges), officers and resolution.
+    /// Only filings in these categories, e.g. ["accounts"]. Categories include accounts, address, annual-return, capital, change-of-name, confirmation-statement, incorporation, insolvency, liquidation, miscellaneous, mortgage (charges), officers, persons-with-significant-control and resolution.
     pub categories: Option<Vec<String>>,
     /// Results per page, 1 to 100. Default: 20.
     pub limit: Option<u32>,
@@ -49,6 +52,15 @@ pub struct GetChargeParams {
     pub company_number: String,
     /// charge_id from list_charges.
     pub charge_id: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+pub struct GetFilingParams {
+    /// Company number, e.g. 00445790 or SC123456.
+    pub company_number: String,
+    /// transaction_id from list_filing_history.
+    pub transaction_id: String,
 }
 
 fn categories_arg(categories: Option<&[String]>) -> error::Result<Vec<String>> {
@@ -122,6 +134,18 @@ impl Caller {
         Ok(out)
     }
 
+    /// A company's exemptions, shaped for output; `None` when it has none.
+    pub(crate) async fn exemptions_record(&self, number: &str) -> error::Result<Option<Value>> {
+        Ok(self
+            .get_optional(
+                "company_exemptions",
+                &["company", number, "exemptions"],
+                &[],
+            )
+            .await?
+            .map(|v| exemptions(&v)))
+    }
+
     /// A company's insolvency record, shaped for output; `None` when it has none.
     pub(crate) async fn insolvency_record(&self, number: &str) -> error::Result<Option<Value>> {
         Ok(self
@@ -161,6 +185,127 @@ impl CompaniesServer {
                 q.push(("category", categories.join(",")));
             }
             Ok(json_result(&c.filings_page(&number, &q, start).await?))
+        })
+        .await
+    }
+
+    #[tool(
+        description = "Read one filing from a company's filing history: date, form type, category, description key and values, page count, transaction_id and document_id. This is the filing record, not the document itself: pass document_id to download_filing_document for that. Takes transaction_id from list_filing_history.",
+        annotations(read_only_hint = true, idempotent_hint = true, open_world_hint = true)
+    )]
+    pub async fn get_filing(
+        &self,
+        Parameters(p): Parameters<GetFilingParams>,
+        Extension(parts): Extension<Parts>,
+    ) -> Result<CallToolResult, McpError> {
+        tracing::debug!(args = ?p, "get_filing");
+        run("get_filing", async {
+            let c = self.caller(&parts)?;
+            let number = normalise_company_number(&p.company_number)?;
+            let id = id_arg("transaction_id", &p.transaction_id)?;
+            let found = c
+                .get_optional(
+                    "company_filing",
+                    &["company", &number, "filing-history", &id],
+                    &[],
+                )
+                .await?
+                .ok_or_else(|| {
+                    ChError::NotFound(format!(
+                        "no filing {id} for company {number}; take transaction_id from list_filing_history"
+                    ))
+                })?;
+            Ok(json_result(&filing_item(&found)))
+        })
+        .await
+    }
+
+    #[tool(
+        description = "Say where a company keeps its statutory registers (directors, secretaries, persons with significant control, members, and directors' residential addresses), with the history of each move. location is public-register (the register is held at Companies House), registered-office, single-alternative-inspection-location or unspecified-location. Most companies have told Companies House nothing, which means their registers are kept at their registered office.",
+        annotations(read_only_hint = true, idempotent_hint = true, open_world_hint = true)
+    )]
+    pub async fn get_company_registers(
+        &self,
+        Parameters(p): Parameters<super::CompanyNumberParams>,
+        Extension(parts): Extension<Parts>,
+    ) -> Result<CallToolResult, McpError> {
+        tracing::debug!(args = ?p, "get_company_registers");
+        run("get_company_registers", async {
+            let c = self.caller(&parts)?;
+            let number = normalise_company_number(&p.company_number)?;
+            let found = c
+                .get_optional("company_registers", &["company", &number, "registers"], &[])
+                .await?;
+            let out = match found {
+                Some(v) => registers(&v),
+                None => {
+                    c.ensure_company(&number).await?;
+                    json!({
+                        "registers": [],
+                        "note": "Companies House holds no register information for this company, which usually means it keeps its registers at its registered office",
+                    })
+                }
+            };
+            Ok(json_result(&out))
+        })
+        .await
+    }
+
+    #[tool(
+        description = "List a company's exemptions from disclosure: for example from the persons with significant control rules because its shares trade on a regulated market. Each exemption has the periods it applies for and current (still applies). Most companies have none.",
+        annotations(read_only_hint = true, idempotent_hint = true, open_world_hint = true)
+    )]
+    pub async fn get_exemptions(
+        &self,
+        Parameters(p): Parameters<super::CompanyNumberParams>,
+        Extension(parts): Extension<Parts>,
+    ) -> Result<CallToolResult, McpError> {
+        tracing::debug!(args = ?p, "get_exemptions");
+        run("get_exemptions", async {
+            let c = self.caller(&parts)?;
+            let number = normalise_company_number(&p.company_number)?;
+            let out = match c.exemptions_record(&number).await? {
+                Some(v) => v,
+                None => {
+                    c.ensure_company(&number).await?;
+                    json!({
+                        "exemptions": [],
+                        "note": "Companies House holds no exemptions for this company",
+                    })
+                }
+            };
+            Ok(json_result(&out))
+        })
+        .await
+    }
+
+    #[tool(
+        description = "List the UK establishments (branches) of an overseas company, each with its own company number (BR...), name, status and locality. For overseas companies (numbers starting FC); other companies have none.",
+        annotations(read_only_hint = true, idempotent_hint = true, open_world_hint = true)
+    )]
+    pub async fn get_uk_establishments(
+        &self,
+        Parameters(p): Parameters<super::CompanyNumberParams>,
+        Extension(parts): Extension<Parts>,
+    ) -> Result<CallToolResult, McpError> {
+        tracing::debug!(args = ?p, "get_uk_establishments");
+        run("get_uk_establishments", async {
+            let c = self.caller(&parts)?;
+            let number = normalise_company_number(&p.company_number)?;
+            let found = c
+                .get_optional(
+                    "company_uk_establishments",
+                    &["company", &number, "uk-establishments"],
+                    &[],
+                )
+                .await?
+                .unwrap_or_default();
+            let results: Vec<Value> = items(&found).iter().map(uk_establishment_item).collect();
+            if results.is_empty() {
+                c.ensure_company(&number).await?;
+            }
+            let total = results.len();
+            Ok(json_result(&json!({"total": total, "items": results})))
         })
         .await
     }

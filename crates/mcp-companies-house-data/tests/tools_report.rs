@@ -149,3 +149,224 @@ async fn report_fails_when_the_company_does_not_exist() {
     );
     assert!(text.starts_with("validation: "), "{text}");
 }
+
+fn observations(v: &serde_json::Value) -> Vec<(String, String, String)> {
+    v["observations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|o| {
+            (
+                o["check"].as_str().unwrap().to_string(),
+                o["level"].as_str().unwrap().to_string(),
+                o["detail"].as_str().unwrap().to_string(),
+            )
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn due_diligence_on_a_quiet_company_observes_nothing_but_never_clears_it() {
+    let fake = fake().await;
+    let v = json(
+        &server(&fake)
+            .due_diligence_check(params(json!({"company_number": "1"})), auth())
+            .await
+            .unwrap(),
+    );
+    assert_eq!(v["company"]["company_name"], "ACME WIDGETS LIMITED");
+    assert_eq!(observations(&v), vec![]);
+    let run: Vec<&str> = v["checks_run"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c.as_str().unwrap())
+        .collect();
+    for check in [
+        "company_status",
+        "accounts",
+        "confirmation_statement",
+        "registered_office",
+        "company_age",
+        "insolvency",
+        "charges",
+        "officers",
+        "ownership",
+    ] {
+        assert!(run.contains(&check), "{check} missing from {run:?}");
+    }
+    let not_run = v["checks_not_run"].to_string();
+    for check in [
+        "sanctions",
+        "politically_exposed_persons",
+        "identity_verification",
+    ] {
+        assert!(not_run.contains(check), "{not_run}");
+    }
+    assert!(
+        v["disclaimer"]
+            .as_str()
+            .unwrap()
+            .contains("does not mean the company is sound"),
+        "{v}"
+    );
+    assert_eq!(
+        paths(&fake),
+        vec![
+            "/company/00000001",
+            "/company/00000001/officers",
+            "/company/00000001/persons-with-significant-control",
+            "/company/00000001/persons-with-significant-control-statements",
+        ]
+    );
+}
+
+#[tokio::test]
+async fn due_diligence_flags_liquidation_insolvency_and_no_directors() {
+    let fake = fake().await;
+    let v = json(
+        &server(&fake)
+            .due_diligence_check(params(json!({"company_number": "6"})), auth())
+            .await
+            .unwrap(),
+    );
+    let found = observations(&v);
+    let has = |check: &str, level: &str, text: &str| {
+        found
+            .iter()
+            .any(|(c, l, d)| c == check && l == level && d.contains(text))
+    };
+    assert!(
+        has("company_status", "flag", "status is liquidation"),
+        "{found:?}"
+    );
+    assert!(
+        has(
+            "insolvency",
+            "flag",
+            "creditors-voluntary-liquidation (wound-up-on 2025-02-01)"
+        ),
+        "{found:?}"
+    );
+    assert!(
+        has(
+            "charges",
+            "note",
+            "charges not satisfied: 1, held by Big Bank PLC"
+        ),
+        "{found:?}"
+    );
+    assert!(has("officers", "flag", "no current directors"), "{found:?}");
+    assert!(
+        has("ownership", "note", "exempt from the PSC rules"),
+        "{found:?}"
+    );
+}
+
+#[tokio::test]
+async fn due_diligence_flags_a_new_company_with_overdue_filings_and_no_owner() {
+    let fake = fake().await;
+    let created = chrono::Utc::now().date_naive() - chrono::Duration::days(90);
+    {
+        let mut st = fake.state();
+        let mut p = st.companies["00000002"].clone();
+        p["company_number"] = json!("00000009");
+        p["date_of_creation"] = json!(created.to_string());
+        p["accounts"]["next_accounts"]["overdue"] = json!(true);
+        p["confirmation_statement"]["overdue"] = json!(true);
+        p["registered_office_is_in_dispute"] = json!(true);
+        p["company_status_detail"] = json!("active-proposal-to-strike-off");
+        st.companies.insert("00000009".into(), p);
+    }
+    let v = json(
+        &server(&fake)
+            .due_diligence_check(params(json!({"company_number": "9"})), auth())
+            .await
+            .unwrap(),
+    );
+    let flags: Vec<String> = observations(&v)
+        .into_iter()
+        .filter(|(_, l, _)| l == "flag")
+        .map(|(c, _, _)| c)
+        .collect();
+    assert_eq!(
+        flags,
+        vec![
+            "company_status",
+            "accounts",
+            "confirmation_statement",
+            "registered_office",
+            "company_age",
+            "officers",
+            "ownership",
+        ],
+        "{v}"
+    );
+    let text = v["observations"].to_string();
+    assert!(text.contains("active-proposal-to-strike-off"), "{text}");
+    assert!(text.contains("may be a gap"), "{text}");
+}
+
+#[tokio::test]
+async fn due_diligence_reports_checks_it_could_not_read() {
+    let fake = fake().await;
+    fake.state()
+        .fail
+        .push("/company/00000001/officers".to_string());
+    let v = json(
+        &server(&fake)
+            .due_diligence_check(params(json!({"company_number": "1"})), auth())
+            .await
+            .unwrap(),
+    );
+    let run = v["checks_run"].as_array().unwrap();
+    assert!(!run.iter().any(|c| c == "officers"), "{v}");
+    assert!(run.iter().any(|c| c == "ownership"), "{v}");
+    let failed = &v["checks_not_run"][0];
+    assert_eq!(failed["check"], "officers");
+    assert!(
+        failed["reason"]
+            .as_str()
+            .unwrap()
+            .starts_with("could not be read: upstream: "),
+        "{failed}"
+    );
+}
+
+#[tokio::test]
+async fn due_diligence_needs_a_company() {
+    let fake = fake().await;
+    let e = error_text(
+        &server(&fake)
+            .due_diligence_check(params(json!({"company_number": "99999999"})), auth())
+            .await
+            .unwrap(),
+    );
+    assert!(
+        e.starts_with("not_found: no company with number 99999999"),
+        "{e}"
+    );
+}
+
+#[tokio::test]
+async fn due_diligence_flags_an_owner_the_register_marks_as_sanctioned() {
+    let fake = fake().await;
+    fake.state()
+        .resources
+        .get_mut("/company/00000001/persons-with-significant-control")
+        .unwrap()["items"][0]["is_sanctioned"] = json!(true);
+    let v = json(
+        &server(&fake)
+            .due_diligence_check(params(json!({"company_number": "1"})), auth())
+            .await
+            .unwrap(),
+    );
+    assert_eq!(
+        observations(&v),
+        vec![(
+            "ownership".to_string(),
+            "flag".to_string(),
+            "the register marks these owners as sanctioned: Mrs Jane Anne Smith".to_string()
+        )]
+    );
+}

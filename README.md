@@ -54,11 +54,17 @@ Every Companies House request then uses the caller's own key, so each person has
 |---|---|
 | `get_company` | Profile: status, type, dates, registered office, SIC codes with descriptions (`nature_of_business`), previous names, accounts and confirmation statement due dates (and whether overdue), and `records_available` (for example `officers`, `charges`, `insolvency`) |
 | `company_report` | One call for due diligence: profile, current officers, current persons with significant control and PSC statements, recent filings, charges not yet satisfied and insolvency cases. Up to 7 Companies House requests (charges and insolvency only when the company has them); sections that fail are listed under `unavailable` instead of failing the call |
-| `list_officers` | Directors, secretaries, LLP members and others, current and resigned, with `officer_id` |
-| `list_persons_with_significant_control` | Owners and controllers (and beneficial owners of overseas entities) with natures of control; the first page also has PSC statements |
-| `list_filing_history` | Filings newest first, optionally by `categories` (for example `accounts`, `officers`), with the Companies House description key and `document_id` |
+| `due_diligence_check` | Screens a company and returns observations for a reviewer: each a `flag` (look into it) or a `note` (context). Covers status and status detail, insolvency cases, charges not satisfied, overdue accounts and confirmation statement, registered office disputes and undeliverable addresses, directors in post, officer changes in the last 12 months, ownership (PSCs, PSC statements, exemptions), company age and recent name changes. Also lists `checks_run` and `checks_not_run` (sanctions, politically exposed persons, credit, identity verification, disqualifications, litigation). It never says a company is sound. Up to 7 requests |
+| `list_officers` | Directors, secretaries, LLP members and others, current and resigned, with `officer_id`. `current_only` lists only officers in post: Companies House cannot filter officers, so the server reads up to 500 from `start_index` to fill the page and says how many it read (`officers_read`) |
+| `list_persons_with_significant_control` | Owners and controllers (and beneficial owners of overseas entities) with natures of control; the first page also has PSC statements. When there are neither, `note` says whether the company is exempt or the register has a gap |
+| `list_filing_history` | Filings newest first, optionally by `categories` (for example `accounts`, `officers`), with the Companies House description key, `transaction_id` and `document_id` |
+| `get_filing` | One filing by `transaction_id`: the filing record, not the document |
+| `download_filing_document` | A filed document from the Companies House Document API, by `document_id` (or its `document_metadata` link). `format`: `pdf` (default), `xhtml`, `xml` or `json`; a PDF comes back as an embedded resource, the others as text. The formats and size are checked first, so a format the document is not held in, or a document larger than `max_bytes` (default 1 MiB, at most 10 MiB), is refused before downloading. `metadata_only` gives the pages, formats and sizes. Live API only: the sandbox has no documents |
 | `list_charges`, `get_charge` | Mortgages and other secured lending: status, lender, what is charged, dates; `get_charge` gives the full record |
 | `get_insolvency` | Insolvency cases with their dates and practitioners |
+| `get_company_registers` | Where the statutory registers (directors, secretaries, PSCs, members) are kept: at Companies House (`public-register`), the registered office or an inspection location, with each move. No record usually means the registered office |
+| `get_exemptions` | Exemptions from disclosure, such as from the PSC rules for companies traded on a regulated market, with the periods they apply and whether they still do |
+| `get_uk_establishments` | The UK branches (`BR` numbers) of an overseas (`FC`) company, with status and locality |
 
 ### People
 
@@ -66,11 +72,12 @@ Every Companies House request then uses the caller's own key, so each person has
 |---|---|
 | `search_officers` | Officers by name, with `officer_id` and number of appointments |
 | `get_officer_appointments` | Every appointment of one officer across companies, optionally only current ones |
+| `officer_network` | Every company one officer is or was appointed to, split into `current` and `past` (resigned, or the company dissolved or closed), with each company's status and a count by status. Reads the whole appointment list, up to 1000. Takes `officer_id`, or `officer_name` when it matches exactly one officer: names are not unique, so otherwise it lists the candidates |
 | `search_disqualified_officers`, `get_disqualified_officer` | People and companies disqualified from being directors, and the details of each disqualification |
 
 ### Conventions
 
-- Companies are addressed by company number. Tools ignore spaces, upper-case letters and pad short numbers with zeros (`445790` becomes `00445790`, `SC1234` becomes `SC001234`). Officers, charges and disqualified officers are addressed by the ids the list and search tools return.
+- Companies are addressed by company number. Tools ignore spaces, upper-case letters and pad short numbers with zeros (`445790` becomes `00445790`, `SC1234` becomes `SC001234`). Officers, charges, filings, documents and disqualified officers are addressed by the ids the list and search tools return.
 - Status, type and subtype are the exact Companies House codes (`active`, `liquidation`, `ltd`, `llp`, `community-interest-company`, ...). The tool schema lists every accepted value, so clients cannot send a code the API does not know.
 - Dates are `YYYY-MM-DD`. SIC codes are the 4 or 5 digit SIC 2007 codes, for example `62012`; `lookup_sic_codes` finds them.
 - Officers' and owners' dates of birth are shown as month and year only, as Companies House publishes them.
@@ -178,6 +185,7 @@ The server has no Companies House key of its own, and has no admin password or s
 | Variable | Required | Default | Description |
 |---|---|---|---|
 | `COMPANIES_HOUSE_API_URL` | no | `https://api.company-information.service.gov.uk` | API base URL, and so the environment everyone's keys must belong to. Use `https://api-sandbox.company-information.service.gov.uk` for the sandbox. Must be `https`, except a loopback address for testing |
+| `COMPANIES_HOUSE_DOCUMENT_API_URL` | no | the live Document API with the live API, none otherwise | Where `download_filing_document` fetches filed documents. Companies House has no sandbox Document API, so with the sandbox (or a proxy URL) document downloads are off unless this is set. Same rules as `COMPANIES_HOUSE_API_URL` |
 
 ## TLS
 
@@ -216,7 +224,7 @@ TLS_CERT_PATH=$PWD/cert.pem TLS_KEY_PATH=$PWD/key.pem ./mcp-companies-house
 - **Limits on key checks.** Each attempt counts from the moment its check starts. A client (an IP address, or an IPv6 /64) is refused for the rest of the minute once it has 5 attempts that were rejected or are still being checked, and a wider block (an IPv4 /24 or IPv6 /48) once it has 25, so one allocation cannot spread over thousands of addresses (429 with `Retry-After`). Once 30 keys across all clients have been rejected within a minute, a client with a rejection of its own is refused too; checks still in flight never count toward that ceiling. When so many addresses are failing that new ones cannot be tracked, a new address is judged by its block, and only if the blocks cannot be tracked either is it refused as "busy" (503). A check the client abandons still finishes, so it counts only if the key was rejected. Input that cannot be a key is refused without being checked or counted. Behind a reverse proxy, set `TRUSTED_PROXIES` so the limits use the real client address.
 - **Load on Companies House.** At most 16 key checks run at once, each for at most 15 seconds; a check that finds them all busy waits up to 5 seconds for a free one. Parallel requests with the same new key share one check. When Companies House cannot be reached or the server is busy, the key is not counted as rejected and the client is asked to retry (503 with `Retry-After`, on the sign-in page as well as for bearer keys). These limits keep one server usable for its people; a public server facing a large botnet still needs rate limiting at the network or a reverse proxy.
 - Access tokens last 1 hour, refresh tokens 30 days; a sign-in lasts as long as the client refreshes at least once every 30 days. There is no per-client revocation. To end your own sign-ins, revoke the key at Companies House. To sign every client out, rotate `OAUTH_SIGNING_KEY`. If `OAUTH_SIGNING_KEY` ever leaks, rotate it and ask everyone to replace their Companies House key: anyone holding the old signing key could open the sealed keys in codes and tokens they captured.
-- Keys are sent only to `COMPANIES_HOUSE_API_URL`; redirects are not followed.
+- Keys are sent only to `COMPANIES_HOUSE_API_URL` and the Document API (`COMPANIES_HOUSE_DOCUMENT_API_URL`); redirects are not followed, except one: the Document API answers a document download with a redirect to its storage, which is fetched without the key, and only over `https`.
 - Company names, addresses and other filed text are written by the public. The server instructions tell the model to treat them as data, not as instructions.
 - The container runs as UID 65532 with nothing else in the image.
 

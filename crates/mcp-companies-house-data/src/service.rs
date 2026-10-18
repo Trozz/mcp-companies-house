@@ -34,6 +34,11 @@ impl Service for DataService {
     fn router(self: Arc<Self>, ctx: &ServiceContext) -> axum::Router {
         tracing::info!(
             api = %self.client.base().origin().ascii_serialization(),
+            documents = %self
+                .client
+                .documents()
+                .map(|d| d.origin().ascii_serialization())
+                .unwrap_or_else(|| "none".into()),
             "companies house settings"
         );
         mcp_service(ctx, move || Ok(self.server()))
@@ -51,7 +56,11 @@ impl Service for DataService {
 /// Reads the company data configuration and builds the service. Errors go to `env.errors`.
 pub fn from_env(env: &mut ServiceEnv) -> Option<Arc<dyn Service>> {
     let cfg = DataConfig::from_env(env)?;
-    let client = match ChClient::new(ApiSettings::new(cfg.api_url)) {
+    let mut settings = ApiSettings::new(cfg.api_url);
+    if let Some(documents) = cfg.document_api_url {
+        settings.documents = Some(documents);
+    }
+    let client = match ChClient::new(settings) {
         Ok(c) => Arc::new(c),
         Err(e) => {
             env.errors
@@ -90,17 +99,24 @@ mod tests {
                 "browse_company_names",
                 "check_company_name_availability",
                 "company_report",
+                "download_filing_document",
+                "due_diligence_check",
                 "filter_companies",
                 "get_charge",
                 "get_company",
+                "get_company_registers",
                 "get_disqualified_officer",
+                "get_exemptions",
+                "get_filing",
                 "get_insolvency",
                 "get_officer_appointments",
+                "get_uk_establishments",
                 "list_charges",
                 "list_filing_history",
                 "list_officers",
                 "list_persons_with_significant_control",
                 "lookup_sic_codes",
+                "officer_network",
                 "search_companies",
                 "search_disqualified_officers",
                 "search_dissolved_companies",

@@ -423,7 +423,7 @@ mod tests {
         let mut e = with_core(&[]);
         let loaded = load(&mut e, SERVICES).expect("loads");
         let names = combined_tool_names(&loaded.services);
-        assert_eq!(names.len(), 18);
+        assert_eq!(names.len(), 25);
         assert!(names.contains(&"companies_search_companies".to_string()));
         let unique: std::collections::HashSet<_> = names.iter().collect();
         assert_eq!(unique.len(), names.len());

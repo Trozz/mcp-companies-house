@@ -73,6 +73,14 @@ impl Injected {
     }
 }
 
+/// A filed document on the fake Document API: its formats (content type and bytes).
+#[derive(Debug, Clone)]
+pub struct FakeDocument {
+    pub formats: Vec<(String, Vec<u8>)>,
+    /// Whether the metadata gives each format's size, as the live API does.
+    pub sized: bool,
+}
+
 #[derive(Debug)]
 pub struct FakeState {
     /// Company profiles by company number.
@@ -86,6 +94,11 @@ pub struct FakeState {
     pub rate_reset_unix: u64,
     /// Delay before every response, to exercise timeouts.
     pub delay: Duration,
+    /// Filed documents by document id, served under `/docapi/document/{id}` with their content
+    /// redirected to `/storage/{id}` (which, like the live storage, takes no API key).
+    pub documents: BTreeMap<String, FakeDocument>,
+    /// Paths that always answer 500.
+    pub fail: Vec<String>,
 }
 
 pub fn now_unix() -> u64 {
@@ -244,6 +257,8 @@ impl FakeState {
             rate_remaining: RATE_LIMIT,
             rate_reset_unix: now_unix() + 300,
             delay: Duration::ZERO,
+            documents: super::fake_records::documents(),
+            fail: Vec::new(),
         }
     }
 }
@@ -499,6 +514,59 @@ fn advanced(state: &FakeState, query: &[(String, String)]) -> (u16, Value) {
     )
 }
 
+fn document_metadata(id: &str, doc: &FakeDocument) -> Value {
+    let mut resources = serde_json::Map::new();
+    for (content_type, bytes) in &doc.formats {
+        let mut r = json!({"created_at": "2024-12-20T10:00:00Z"});
+        if doc.sized {
+            r["content_length"] = json!(bytes.len());
+        }
+        resources.insert(content_type.clone(), r);
+    }
+    json!({
+        "company_number": "00000001",
+        "barcode": "XBARCODE",
+        "category": "accounts",
+        "pages": 3,
+        "created_at": "2024-12-20T10:00:00Z",
+        "significant_date": null,
+        "etag": "",
+        "links": {
+            "self": format!("/document/{id}"),
+            "document": format!("/document/{id}/content"),
+        },
+        "resources": resources,
+    })
+}
+
+/// Document storage: no API key (a request carrying one is refused, as presigned storage URLs
+/// refuse a second form of authentication), the format chosen by the redirect's `type`.
+fn storage(st: &FakeState, id: &str, query: &[(String, String)], authorized: bool) -> Response {
+    let plain = |status: u16, body: &str| {
+        Response::builder()
+            .status(status)
+            .header("content-type", "text/plain")
+            .body(Body::from(body.to_string()))
+            .unwrap()
+    };
+    if authorized {
+        return plain(400, "only one authentication mechanism is allowed");
+    }
+    let wanted = param(query, "type").unwrap_or("");
+    match st
+        .documents
+        .get(id)
+        .and_then(|d| d.formats.iter().find(|(t, _)| t == wanted))
+    {
+        Some((content_type, bytes)) => Response::builder()
+            .status(200)
+            .header("content-type", content_type.as_str())
+            .body(Body::from(bytes.clone()))
+            .unwrap(),
+        None => plain(404, "no such object"),
+    }
+}
+
 async fn handle(
     State(state): State<Arc<Mutex<FakeState>>>,
     uri: Uri,
@@ -534,6 +602,9 @@ async fn handle(
         tokio::time::sleep(delay).await;
     }
     let mut st = state.lock().unwrap();
+    if let Some(id) = path.strip_prefix("/storage/") {
+        return storage(&st, id, &query, authorization.is_some());
+    }
     if authorization.as_deref() != Some(auth_header().as_str()) {
         return respond(
             401,
@@ -547,7 +618,47 @@ async fn handle(
     if let Some(inj) = st.inject.pop_front() {
         return respond(inj.status, inj.body, rate, &inj.headers);
     }
+    if st.fail.contains(&path) {
+        return respond(
+            500,
+            json!({"error": "internal error"}).to_string(),
+            rate,
+            &[],
+        );
+    }
     let segments: Vec<&str> = path.trim_start_matches('/').split('/').collect();
+    let accept = headers
+        .get("accept")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    match segments.as_slice() {
+        ["docapi", "document", id] => {
+            let (status, body) = match st.documents.get(*id) {
+                Some(doc) => (200, document_metadata(id, doc)),
+                None => (404, json!({"error": "document not found"})),
+            };
+            return respond(status, body.to_string(), rate, &[]);
+        }
+        ["docapi", "document", id, "content"] => {
+            let Some(doc) = st.documents.get(*id) else {
+                return respond(
+                    404,
+                    json!({"error": "document not found"}).to_string(),
+                    rate,
+                    &[],
+                );
+            };
+            if !doc.formats.iter().any(|(t, _)| t == accept) {
+                return respond(406, String::new(), rate, &[]);
+            }
+            let location = format!(
+                "/storage/{id}?type={}",
+                url::form_urlencoded::byte_serialize(accept.as_bytes()).collect::<String>()
+            );
+            return respond(302, String::new(), rate, &[("location", location)]);
+        }
+        _ => {}
+    }
     let (status, body) = match segments.as_slice() {
         ["search", "companies"] => search(&st, &query),
         ["advanced-search", "companies"] => advanced(&st, &query),

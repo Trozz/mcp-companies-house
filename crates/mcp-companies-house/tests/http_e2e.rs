@@ -139,7 +139,7 @@ async fn companies_is_served_at_its_path_with_an_oauth_token() {
         .unwrap();
     let list = rpc_message(res).await;
     let tools = list["result"]["tools"].as_array().unwrap();
-    assert_eq!(tools.len(), 18, "{tools:?}");
+    assert_eq!(tools.len(), 25, "{tools:?}");
 }
 
 #[tokio::test]
@@ -248,7 +248,7 @@ async fn mcp_serves_every_tool_with_its_service_prefix() {
         .iter()
         .map(|t| t["name"].as_str().unwrap())
         .collect();
-    assert_eq!(names.len(), 18, "{names:?}");
+    assert_eq!(names.len(), 25, "{names:?}");
     assert!(
         names.iter().all(|n| n.starts_with("companies_")),
         "{names:?}"

@@ -168,6 +168,105 @@ async fn company_report_on_a_generated_company() {
 
 #[tokio::test]
 #[ignore = "needs a sandbox COMPANIES_HOUSE_API_KEY and network access"]
+async fn due_diligence_and_records_on_a_generated_company() {
+    let s = server();
+    let (number, auth_code) = create_company().await;
+    println!("created sandbox company {number}");
+    let n = || params(json!({"company_number": number}));
+    let check = s.due_diligence_check(n(), live_auth()).await.unwrap();
+    let registers = s.get_company_registers(n(), live_auth()).await.unwrap();
+    let exemptions = s.get_exemptions(n(), live_auth()).await.unwrap();
+    let branches = s.get_uk_establishments(n(), live_auth()).await.unwrap();
+    let current = s
+        .list_officers(
+            params(json!({"company_number": number, "current_only": true})),
+            live_auth(),
+        )
+        .await
+        .unwrap();
+    let filings = s
+        .list_filing_history(params(json!({"company_number": number})), live_auth())
+        .await
+        .unwrap();
+    // Read what depends on the lists before the company is deleted.
+    let officer_id = (!support::tools::is_error(&current))
+        .then(|| {
+            json(&current)["items"][0]["officer_id"]
+                .as_str()
+                .map(str::to_string)
+        })
+        .flatten();
+    let network = match &officer_id {
+        Some(id) => Some(
+            s.officer_network(params(json!({"officer_id": id})), live_auth())
+                .await
+                .unwrap(),
+        ),
+        None => None,
+    };
+    let transaction = (!support::tools::is_error(&filings))
+        .then(|| {
+            json(&filings)["items"][0]["transaction_id"]
+                .as_str()
+                .map(str::to_string)
+        })
+        .flatten();
+    let filing = match &transaction {
+        Some(tx) => Some(
+            s.get_filing(
+                params(json!({"company_number": number, "transaction_id": tx})),
+                live_auth(),
+            )
+            .await
+            .unwrap(),
+        ),
+        None => None,
+    };
+    let document = s
+        .download_filing_document(params(json!({"document_id": "abc"})), live_auth())
+        .await
+        .unwrap();
+    delete_company(&number, &auth_code).await;
+    println!("deleted sandbox company {number}");
+
+    let v = json(&check);
+    println!("due_diligence_check: {v}");
+    assert_eq!(v["company"]["company_number"], number.as_str());
+    assert!(v["observations"].is_array(), "{v}");
+    assert!(
+        v["checks_run"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|c| c == "company_status"),
+        "{v}"
+    );
+    assert!(v["disclaimer"].is_string(), "{v}");
+    // The sandbox does not serve every record type: print what it answered.
+    for (name, r) in [
+        ("get_company_registers", &registers),
+        ("get_exemptions", &exemptions),
+        ("get_uk_establishments", &branches),
+        ("list_officers current_only", &current),
+    ] {
+        println!("{name}: {}", support::tools::text(r));
+    }
+    if let Some(r) = &network {
+        println!("officer_network: {}", support::tools::text(r));
+        let v = json(r);
+        assert_eq!(v["officer_id"].as_str(), officer_id.as_deref(), "{v}");
+    }
+    if let Some(r) = &filing {
+        println!("get_filing: {}", support::tools::text(r));
+        assert_eq!(json(r)["transaction_id"].as_str(), transaction.as_deref());
+    }
+    // There is no sandbox Document API: the tool says so instead of calling anything.
+    let e = error_text(&document);
+    assert!(e.contains("Document API has no sandbox"), "{e}");
+}
+
+#[tokio::test]
+#[ignore = "needs a sandbox COMPANIES_HOUSE_API_KEY and network access"]
 async fn searches_answer_in_the_expected_shape() {
     let s = server();
     let v = json(

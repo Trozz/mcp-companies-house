@@ -99,9 +99,104 @@ fn charge(id: &str, status: &str, created: &str, satisfied: Option<&str>) -> Val
     c
 }
 
+/// Filed documents on the fake Document API. `doc-tx4` is held as PDF and XHTML; `doc-big` is
+/// larger than the default download limit; `doc-nosize` gives no sizes in its metadata.
+pub fn documents() -> BTreeMap<String, super::fake_ch::FakeDocument> {
+    use super::fake_ch::FakeDocument;
+    let mut d = BTreeMap::new();
+    d.insert(
+        "doc-tx4".to_string(),
+        FakeDocument {
+            formats: vec![
+                (
+                    "application/pdf".into(),
+                    b"%PDF-1.4\n\xff\xfe fake micro-entity accounts\n%%EOF".to_vec(),
+                ),
+                (
+                    "application/xhtml+xml".into(),
+                    b"<html><body>Micro-entity accounts</body></html>".to_vec(),
+                ),
+            ],
+            sized: true,
+        },
+    );
+    d.insert(
+        "doc-big".to_string(),
+        FakeDocument {
+            formats: vec![("application/pdf".into(), vec![b'x'; 2 * 1024 * 1024])],
+            sized: true,
+        },
+    );
+    d.insert(
+        "doc-nosize".to_string(),
+        FakeDocument {
+            formats: vec![("application/pdf".into(), vec![b'y'; 4096])],
+            sized: false,
+        },
+    );
+    d
+}
+
 /// Resources by request path.
 pub fn fixtures() -> BTreeMap<String, Value> {
     let mut r = BTreeMap::new();
+    r.insert(
+        "/company/00000001/filing-history/tx4".into(),
+        filing(
+            "2024-12-20",
+            "AA",
+            "accounts",
+            "accounts-with-accounts-type-micro-entity",
+            json!({"made_up_date": "2024-03-31"}),
+            "tx4",
+        ),
+    );
+    r.insert(
+        "/company/00000001/registers".into(),
+        json!({
+            "kind": "registers", "company_number": "00000001", "etag": "r-etag",
+            "links": {"self": "/company/00000001/registers"},
+            "registers": {
+                "directors": {"register_type": "directors", "items": [
+                    {"moved_on": "2017-01-01", "register_moved_to": "single-alternative-inspection-location",
+                     "links": {"filing": "/company/00000001/filing-history/txr1"}},
+                    {"moved_on": "2020-06-30", "register_moved_to": "public-register",
+                     "links": {"filing": "/company/00000001/filing-history/txr2"}}
+                ]},
+                "persons_with_significant_control": {"register_type": "persons-with-significant-control", "items": [
+                    {"moved_on": "2020-06-30", "register_moved_to": "public-register"}
+                ]}
+            }
+        }),
+    );
+    r.insert(
+        "/company/00000006/exemptions".into(),
+        json!({
+            "kind": "exemptions", "etag": "x-etag",
+            "links": {"self": "/company/00000006/exemptions"},
+            "exemptions": {
+                "psc_exempt_as_trading_on_regulated_market": {
+                    "exemption_type": "psc-exempt-as-trading-on-regulated-market",
+                    "items": [{"exempt_from": "2016-04-06"}]
+                }
+            }
+        }),
+    );
+    r.insert(
+        "/company/FC000007/uk-establishments".into(),
+        json!({
+            "kind": "related-companies", "etag": "u-etag",
+            "links": {"self": "/company/FC000007/uk-establishments"},
+            "items": [
+                {"company_number": "BR000001", "company_name": "OVERSEAS WIDGETS INC (UK BRANCH)",
+                 "company_status": "open", "locality": "London",
+                 "links": {"company": "/company/BR000001"}},
+                {"company_number": "BR000002", "company_name": "OVERSEAS WIDGETS INC (LEEDS)",
+                 "company_status": "closed", "locality": "Leeds",
+                 "links": {"company": "/company/BR000002"}}
+            ]
+        }),
+    );
     r.insert(
         "/company/00000001/officers".into(),
         json!({
