@@ -356,7 +356,7 @@ async fn mcp_lists_every_tool_with_its_service_prefix() {
     let (session, init) = handshake_at(&app, "/mcp").await;
     let instructions = init["result"]["instructions"].as_str().unwrap();
     assert!(
-        instructions.contains("Each tool name starts with its service: companies_."),
+        instructions.contains("Each tool and prompt name starts with its service: companies_."),
         "{instructions}"
     );
     assert!(instructions.contains("\n\ncompanies:\n"), "{instructions}");

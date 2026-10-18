@@ -1,15 +1,18 @@
 //! Several services' MCP handlers served as one MCP server: the combined `/mcp` endpoint.
 //!
 //! Each service's tools appear as `<service>_<tool>`; a call is routed by that prefix to the
-//! service's handler with the original tool name. [`DynHandler`] erases a handler's type so
+//! service's handler with the original tool name. Prompts are combined the same way
+//! (`<service>_<prompt>`), and the tool names inside a prompt's text are given their prefix so
+//! the model calls the tools by the names it sees here. [`DynHandler`] erases a handler's type so
 //! handlers of different services fit in one list. Calls keep their request context, so tools
 //! read the caller's credential from the request extensions exactly as on `/<service>`.
 //!
-//! Kept in step with mcp-icloud's `mcp-server-core::combined`.
+//! Kept in step with mcp-icloud's `mcp-server-core::combined`; prompts are an addition here.
 
 use rmcp::model::{
-    CallToolRequestParams, CallToolResponse, Implementation, ListToolsResult,
-    PaginatedRequestParams, ServerCapabilities, ServerConfig, Tool,
+    CallToolRequestParams, CallToolResponse, ContentBlock, GetPromptRequestParams,
+    GetPromptResponse, Implementation, ListPromptsResult, ListToolsResult, PaginatedRequestParams,
+    Prompt, ServerCapabilities, ServerConfig, Tool,
 };
 use rmcp::service::{RequestContext, RoleServer};
 use rmcp::{ErrorData as McpError, ServerHandler};
@@ -34,6 +37,15 @@ pub trait ToolHandler: Send + Sync + 'static {
         request: CallToolRequestParams,
         context: RequestContext<RoleServer>,
     ) -> BoxFuture<'_, Result<CallToolResponse, McpError>>;
+    fn prompts(
+        &self,
+        context: RequestContext<RoleServer>,
+    ) -> BoxFuture<'_, Result<Vec<Prompt>, McpError>>;
+    fn prompt(
+        &self,
+        request: GetPromptRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> BoxFuture<'_, Result<GetPromptResponse, McpError>>;
 }
 
 impl<S: ServerHandler> ToolHandler for S {
@@ -59,6 +71,22 @@ impl<S: ServerHandler> ToolHandler for S {
         context: RequestContext<RoleServer>,
     ) -> BoxFuture<'_, Result<CallToolResponse, McpError>> {
         Box::pin(self.call_tool(request, context))
+    }
+
+    /// Services list every prompt in one page; one without prompts lists none.
+    fn prompts(
+        &self,
+        context: RequestContext<RoleServer>,
+    ) -> BoxFuture<'_, Result<Vec<Prompt>, McpError>> {
+        Box::pin(async move { Ok(self.list_prompts(None, context).await?.prompts) })
+    }
+
+    fn prompt(
+        &self,
+        request: GetPromptRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> BoxFuture<'_, Result<GetPromptResponse, McpError>> {
+        Box::pin(self.get_prompt(request, context))
     }
 }
 
@@ -95,6 +123,24 @@ impl ServerHandler for DynHandler {
     ) -> Result<CallToolResponse, McpError> {
         self.0.call(request, context).await
     }
+
+    async fn list_prompts(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<ListPromptsResult, McpError> {
+        Ok(ListPromptsResult::with_all_items(
+            self.0.prompts(context).await?,
+        ))
+    }
+
+    async fn get_prompt(
+        &self,
+        request: GetPromptRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<GetPromptResponse, McpError> {
+        self.0.prompt(request, context).await
+    }
 }
 
 /// `<service>_<tool>`.
@@ -105,6 +151,32 @@ pub fn prefixed_name(service: &str, tool: &str) -> String {
 fn prefixed(service: &str, mut tool: Tool) -> Tool {
     tool.name = prefixed_name(service, &tool.name).into();
     tool
+}
+
+/// Gives every whole identifier in `text` that is one of `tools` its service prefix, so a
+/// prompt written for `/<service>` names the tools as `/mcp` lists them. Identifiers are runs of
+/// ASCII letters, digits and `_`, so `get_company` inside `get_company_registers` is left alone.
+fn prefix_tool_names(service: &str, tools: &[String], text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut word = String::new();
+    let flush = |word: &mut String, out: &mut String| {
+        if tools.iter().any(|t| t == word) {
+            out.push_str(&prefixed_name(service, word));
+        } else {
+            out.push_str(word);
+        }
+        word.clear();
+    };
+    for c in text.chars() {
+        if c.is_ascii_alphanumeric() || c == '_' {
+            word.push(c);
+        } else {
+            flush(&mut word, &mut out);
+            out.push(c);
+        }
+    }
+    flush(&mut word, &mut out);
+    out
 }
 
 /// The service a prefixed tool name belongs to, and the tool's own name. Service names never
@@ -119,7 +191,7 @@ fn split<'a>(services: &[&str], name: &'a str) -> Option<(usize, &'a str)> {
 fn instructions(services: &[(&str, Option<String>)]) -> String {
     let prefixes: Vec<String> = services.iter().map(|(s, _)| format!("{s}_")).collect();
     let mut text = format!(
-        "This server combines several services. Each tool name starts with its service: {}. \
+        "This server combines several services. Each tool and prompt name starts with its service: {}. \
          The notes below, tool descriptions and error messages name tools without that prefix.",
         prefixes.join(", ")
     );
@@ -146,7 +218,18 @@ impl Combined {
             .iter()
             .map(|(name, h)| (*name, h.get_info().instructions))
             .collect();
-        let info = ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
+        let has_prompts = services
+            .iter()
+            .any(|(_, h)| h.get_info().capabilities.prompts.is_some());
+        let capabilities = if has_prompts {
+            ServerCapabilities::builder()
+                .enable_tools()
+                .enable_prompts()
+                .build()
+        } else {
+            ServerCapabilities::builder().enable_tools().build()
+        };
+        let info = ServerConfig::new(capabilities)
             .with_server_info(server_info)
             .with_instructions(instructions(&own));
         let (names, handlers) = services.into_iter().unzip();
@@ -194,6 +277,52 @@ impl ServerHandler for Combined {
         request.name = tool.to_string().into();
         self.handlers[index].call_tool(request, context).await
     }
+
+    async fn list_prompts(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<ListPromptsResult, McpError> {
+        let mut prompts = Vec::new();
+        for (service, handler) in self.names.iter().zip(&self.handlers) {
+            let listed = handler.list_prompts(None, context.clone()).await?.prompts;
+            prompts.extend(listed.into_iter().map(|mut p| {
+                p.name = prefixed_name(service, &p.name);
+                p
+            }));
+        }
+        Ok(ListPromptsResult::with_all_items(prompts))
+    }
+
+    async fn get_prompt(
+        &self,
+        mut request: GetPromptRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<GetPromptResponse, McpError> {
+        let Some((index, prompt)) = split(&self.names, &request.name) else {
+            return Err(McpError::invalid_params("prompt not found", None));
+        };
+        request.name = prompt.to_string();
+        let service = self.names[index];
+        let handler = &self.handlers[index];
+        let response = handler.get_prompt(request, context.clone()).await?;
+        let GetPromptResponse::Complete(mut result) = response else {
+            return Ok(response);
+        };
+        let tools: Vec<String> = handler
+            .list_tools(None, context)
+            .await?
+            .tools
+            .into_iter()
+            .map(|t| t.name.to_string())
+            .collect();
+        for message in &mut result.messages {
+            if let ContentBlock::Text(t) = &mut message.content {
+                t.text = prefix_tool_names(service, &tools, &t.text);
+            }
+        }
+        Ok(GetPromptResponse::Complete(result))
+    }
 }
 
 #[cfg(test)]
@@ -229,6 +358,24 @@ mod tests {
     }
 
     #[test]
+    fn tool_names_in_prompt_text_get_their_prefix() {
+        let tools = vec!["get_company".to_string(), "list_officers".to_string()];
+        assert_eq!(
+            prefix_tool_names(
+                "companies",
+                &tools,
+                "Call get_company, then list_officers (not get_company_registers or my_get_company)."
+            ),
+            "Call companies_get_company, then companies_list_officers (not get_company_registers or my_get_company)."
+        );
+        assert_eq!(
+            prefix_tool_names("companies", &tools, "get_company"),
+            "companies_get_company"
+        );
+        assert_eq!(prefix_tool_names("companies", &tools, "£ – ü"), "£ – ü");
+    }
+
+    #[test]
     fn instructions_name_the_prefixes_and_keep_each_services_own() {
         let text = instructions(&[
             ("companies", Some("Find companies.\n".into())),
@@ -237,7 +384,7 @@ mod tests {
         ]);
         assert_eq!(
             text,
-            "This server combines several services. Each tool name starts with its service: \
+            "This server combines several services. Each tool and prompt name starts with its service: \
 companies_, streaming_, filing_. The notes below, tool descriptions and error messages name \
 tools without that prefix.\n\ncompanies:\nFind companies.\n\nfiling:\nFile changes."
         );
