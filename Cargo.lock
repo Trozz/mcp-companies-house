@@ -1369,6 +1369,8 @@ dependencies = [
 [[package]]
 name = "mcp-server-core"
 version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "689c65059bcf91aa34d7f89b57426d44a28f8d63085a5454fa4226c5c35c8794"
 dependencies = [
  "anyhow",
  "axum",

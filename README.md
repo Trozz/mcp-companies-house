@@ -282,7 +282,7 @@ Routing, OAuth metadata, token audiences, `COMPANIES_HOUSE_SERVICES` and the rel
 
 ### The core
 
-OAuth, sign-in, TLS, routing, limits and observability come from [mcp-server-core](https://github.com/Trozz/mcp-server-core-rs), pinned in the workspace `Cargo.toml`. Fix them there and update the pin.
+OAuth, sign-in, TLS, routing, limits and observability come from [mcp-server-core](https://github.com/Trozz/mcp-server-core-rs) on crates.io, required in the workspace `Cargo.toml`. Fix them there, release it, then raise the version here.
 
 ## Releases
 
