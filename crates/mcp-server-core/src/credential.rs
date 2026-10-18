@@ -18,9 +18,9 @@ use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
-use tokio::sync::{OnceCell, Semaphore};
+use tokio::sync::{Semaphore, watch};
 
 /// Longest credential accepted, as a bound on what is sent upstream and sealed.
 pub const MAX_CREDENTIAL_LEN: usize = 256;
@@ -219,63 +219,121 @@ impl CheckCache {
     }
 }
 
-/// Runs upstream credential checks: one check at a time per credential (concurrent requests with
-/// the same one share its verdict), at most `max_running` at once, each bounded by `timeout`.
+/// Runs upstream credential checks: one check at a time per credential, at most `max_running`
+/// at once, each bounded by `timeout`. A check that finds every slot taken waits up to `wait`
+/// for one before giving up as busy.
+///
+/// The first request for a credential [`join`](Self::join)s as the [`Lead`] and runs the check;
+/// requests arriving while it runs follow it and get its verdict. Only a lead ever calls the
+/// upstream service, so the caller decides once, when the request arrives, whether it is the
+/// attempt that counts.
 pub struct CheckRunner {
     permits: Semaphore,
     timeout: Duration,
-    running: Mutex<HashMap<[u8; 32], Arc<OnceCell<CredentialCheck>>>>,
+    wait: Duration,
+    running: Mutex<HashMap<[u8; 32], watch::Receiver<Option<CredentialCheck>>>>,
+}
+
+/// How a request takes part in a credential check.
+pub enum Ticket {
+    /// Run the check ([`CheckRunner::lead`]) or end it ([`CheckRunner::finish`]).
+    Lead(Lead),
+    /// Wait for the lead's verdict ([`CheckRunner::follow`]).
+    Follow(watch::Receiver<Option<CredentialCheck>>),
+}
+
+/// The request responsible for one credential's check.
+pub struct Lead {
+    fingerprint: [u8; 32],
+    tx: watch::Sender<Option<CredentialCheck>>,
 }
 
 impl CheckRunner {
-    pub fn new(max_running: usize, timeout: Duration) -> Self {
+    pub fn new(max_running: usize, timeout: Duration, wait: Duration) -> Self {
         CheckRunner {
             permits: Semaphore::new(max_running),
             timeout,
+            wait,
             running: Mutex::new(HashMap::new()),
         }
     }
 
-    /// Whether a check of this credential is already running, so a new request will share it.
-    pub fn is_running(&self, fingerprint: &[u8; 32]) -> bool {
-        self.running
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .contains_key(fingerprint)
+    /// Joins the check of the credential with this fingerprint: as its lead when none is
+    /// running, otherwise as a follower.
+    pub fn join(&self, fingerprint: [u8; 32]) -> Ticket {
+        let mut running = self.running.lock().unwrap_or_else(|e| e.into_inner());
+        // A lead that went away without finishing leaves a closed channel: start afresh.
+        if let Some(rx) = running.get(&fingerprint)
+            && rx.has_changed().is_ok()
+        {
+            return Ticket::Follow(rx.clone());
+        }
+        let (tx, rx) = watch::channel(None);
+        running.insert(fingerprint, rx);
+        Ticket::Lead(Lead { fingerprint, tx })
     }
 
+    /// Runs the upstream check for `lead` and hands the verdict to its followers.
+    pub async fn lead(
+        &self,
+        lead: Lead,
+        verifier: &dyn CredentialVerifier,
+        credential: &str,
+    ) -> CredentialCheck {
+        let verdict = match tokio::time::timeout(self.wait, self.permits.acquire()).await {
+            Ok(Ok(_permit)) => {
+                match tokio::time::timeout(self.timeout, verifier.check(credential)).await {
+                    Ok(verdict) => verdict,
+                    Err(_) => CredentialCheck::Unavailable("the check timed out".into()),
+                }
+            }
+            _ => {
+                CredentialCheck::Unavailable("the server is checking too many keys at once".into())
+            }
+        };
+        self.finish(lead, verdict.clone());
+        verdict
+    }
+
+    /// Ends `lead` with `verdict` without checking upstream, for example when its client is
+    /// refused for too many attempts. Followers get `verdict`.
+    pub fn finish(&self, lead: Lead, verdict: CredentialCheck) {
+        let mut running = self.running.lock().unwrap_or_else(|e| e.into_inner());
+        if running
+            .get(&lead.fingerprint)
+            .is_some_and(|rx| rx.same_channel(&lead.tx.subscribe()))
+        {
+            running.remove(&lead.fingerprint);
+        }
+        lead.tx.send_replace(Some(verdict));
+    }
+
+    /// The verdict of the check a follower joined.
+    pub async fn follow(mut rx: watch::Receiver<Option<CredentialCheck>>) -> CredentialCheck {
+        match rx.wait_for(Option::is_some).await {
+            Ok(v) => v.clone().unwrap_or_else(|| unreachable!("waited for Some")),
+            Err(_) => CredentialCheck::Unavailable("the check was abandoned".into()),
+        }
+    }
+
+    /// Joins and runs or follows the check of `credential`.
     pub async fn check(
         &self,
         verifier: &dyn CredentialVerifier,
         credential: &str,
     ) -> CredentialCheck {
-        let fp = fingerprint(credential);
-        let cell = self
-            .running
+        match self.join(fingerprint(credential)) {
+            Ticket::Lead(lead) => self.lead(lead, verifier, credential).await,
+            Ticket::Follow(rx) => Self::follow(rx).await,
+        }
+    }
+
+    #[cfg(test)]
+    fn is_running(&self, fingerprint: &[u8; 32]) -> bool {
+        self.running
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .entry(fp)
-            .or_insert_with(|| Arc::new(OnceCell::new()))
-            .clone();
-        let verdict = cell
-            .get_or_init(|| async {
-                let Ok(_permit) = self.permits.try_acquire() else {
-                    return CredentialCheck::Unavailable(
-                        "the server is checking too many keys at once".into(),
-                    );
-                };
-                match tokio::time::timeout(self.timeout, verifier.check(credential)).await {
-                    Ok(verdict) => verdict,
-                    Err(_) => CredentialCheck::Unavailable("the check timed out".into()),
-                }
-            })
-            .await
-            .clone();
-        let mut running = self.running.lock().unwrap_or_else(|e| e.into_inner());
-        if running.get(&fp).is_some_and(|c| Arc::ptr_eq(c, &cell)) {
-            running.remove(&fp);
-        }
-        verdict
+            .contains_key(fingerprint)
     }
 }
 
@@ -455,7 +513,7 @@ mod tests {
 
     #[tokio::test]
     async fn concurrent_checks_of_one_credential_share_one_upstream_call() {
-        let runner = CheckRunner::new(4, Duration::from_secs(5));
+        let runner = CheckRunner::new(4, Duration::from_secs(5), Duration::ZERO);
         let v = slow(50);
         let all = futures_join(&runner, &v, &["good"; 8]).await;
         assert!(all.iter().all(|c| *c == CredentialCheck::Valid));
@@ -465,7 +523,7 @@ mod tests {
 
     #[tokio::test]
     async fn running_checks_are_capped_and_timed_out() {
-        let runner = CheckRunner::new(2, Duration::from_millis(100));
+        let runner = CheckRunner::new(2, Duration::from_millis(100), Duration::ZERO);
         let v = slow(300);
         let all = futures_join(&runner, &v, &["a", "b", "c"]).await;
         assert_eq!(v.checks.load(std::sync::atomic::Ordering::SeqCst), 2);
@@ -473,6 +531,57 @@ mod tests {
             all.iter()
                 .all(|c| matches!(c, CredentialCheck::Unavailable(_))),
             "{all:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn followers_of_a_refused_lead_never_check_upstream() {
+        let runner = CheckRunner::new(4, Duration::from_secs(5), Duration::ZERO);
+        let v = slow(10);
+        let Ticket::Lead(lead) = runner.join(fingerprint("good")) else {
+            panic!("the first request leads");
+        };
+        let Ticket::Follow(rx) = runner.join(fingerprint("good")) else {
+            panic!("the second follows");
+        };
+        runner.finish(lead, CredentialCheck::Unavailable("refused".into()));
+        assert_eq!(
+            CheckRunner::follow(rx).await,
+            CredentialCheck::Unavailable("refused".into())
+        );
+        assert_eq!(v.checks.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert!(matches!(runner.join(fingerprint("good")), Ticket::Lead(_)));
+    }
+
+    #[tokio::test]
+    async fn a_lead_that_disappears_does_not_block_the_credential() {
+        let runner = CheckRunner::new(4, Duration::from_secs(5), Duration::ZERO);
+        let Ticket::Lead(lead) = runner.join(fingerprint("k")) else {
+            panic!();
+        };
+        let Ticket::Follow(rx) = runner.join(fingerprint("k")) else {
+            panic!();
+        };
+        drop(lead);
+        assert!(matches!(
+            CheckRunner::follow(rx).await,
+            CredentialCheck::Unavailable(_)
+        ));
+        assert!(matches!(runner.join(fingerprint("k")), Ticket::Lead(_)));
+    }
+
+    #[tokio::test]
+    async fn a_check_waits_briefly_for_a_free_slot() {
+        let runner = CheckRunner::new(1, Duration::from_secs(5), Duration::from_secs(2));
+        let v = slow(50);
+        let all = futures_join(&runner, &v, &["good", "good-too", "good"]).await;
+        assert_eq!(v.checks.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert_eq!(all[0], CredentialCheck::Valid);
+        assert_eq!(all[2], CredentialCheck::Valid);
+        assert_eq!(
+            all[1],
+            CredentialCheck::Invalid(None),
+            "ran after waiting, not busy"
         );
     }
 

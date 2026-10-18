@@ -31,6 +31,8 @@ const BEARER_CACHE_ENTRIES: usize = 10_000;
 pub const MAX_RUNNING_CHECKS: usize = 16;
 /// Longest an upstream credential check may take before it counts as unavailable.
 pub const CHECK_TIMEOUT: Duration = Duration::from_secs(15);
+/// Longest a check waits for a free slot when [`MAX_RUNNING_CHECKS`] are already running.
+pub const CHECK_SLOT_WAIT: Duration = Duration::from_secs(5);
 
 pub struct AuthState {
     pub settings: OAuthSettings,
@@ -76,7 +78,7 @@ impl AuthState {
                 BEARER_INVALID_FOR,
                 BEARER_CACHE_ENTRIES,
             ),
-            checks: CheckRunner::new(MAX_RUNNING_CHECKS, CHECK_TIMEOUT),
+            checks: CheckRunner::new(MAX_RUNNING_CHECKS, CHECK_TIMEOUT, CHECK_SLOT_WAIT),
             services: services.iter().map(|s| s.to_string()).collect(),
         })
     }

@@ -1,5 +1,5 @@
 use super::AuthState;
-use crate::credential::CredentialCheck;
+use crate::credential::{self, CheckRunner, CredentialCheck, Ticket};
 use crate::jwt::{Payload, TokenKind};
 use crate::pkce;
 use axum::extract::{ConnectInfo, Form, FromRequestParts, Query, State};
@@ -201,7 +201,21 @@ fn with_page_headers(status: StatusCode, html: String) -> Response {
         header::REFERRER_POLICY,
         HeaderValue::from_static("no-referrer"),
     );
+    if status == StatusCode::TOO_MANY_REQUESTS || status == StatusCode::SERVICE_UNAVAILABLE {
+        h.insert(
+            header::RETRY_AFTER,
+            HeaderValue::from_static(super::middleware::RETRY_AFTER_SECS),
+        );
+    }
     res
+}
+
+fn too_many_attempts_page() -> Response {
+    error_page(
+        StatusCode::TOO_MANY_REQUESTS,
+        "Too many attempts from this address: keys were rejected, or several are being checked \
+         at once. Wait a little and try again.",
+    )
 }
 
 fn error_page(status: StatusCode, message: &str) -> Response {
@@ -351,10 +365,7 @@ pub async fn post_authorize(
     let ip = client_ip(peer, &headers, &st.settings.trusted_proxies);
     if st.limiter.is_blocked(ip) {
         metrics::counter!("oauth_requests_total", "endpoint" => "authorize", "outcome" => "rate_limited").increment(1);
-        return error_page(
-            StatusCode::TOO_MANY_REQUESTS,
-            "Too many failed attempts. Wait a minute and try again.",
-        );
+        return too_many_attempts_page();
     }
     let v = match validate(&st, &form.params) {
         Ok(v) => v,
@@ -384,17 +395,17 @@ pub async fn post_authorize(
             Some(&format!("That is not a {label}.")),
         );
     }
-    let Some(reservation) = st.limiter.try_reserve(ip) else {
-        metrics::counter!("oauth_requests_total", "endpoint" => "authorize", "outcome" => "rate_limited").increment(1);
-        return error_page(
-            StatusCode::TOO_MANY_REQUESTS,
-            "Too many failed attempts. Wait a minute and try again.",
-        );
+    let verdict = match st.checks.join(credential::fingerprint(entered)) {
+        Ticket::Follow(rx) => CheckRunner::follow(rx).await,
+        Ticket::Lead(lead) => {
+            let Some(reservation) = st.limiter.try_reserve(ip) else {
+                st.checks.finish(lead, super::middleware::refused());
+                metrics::counter!("oauth_requests_total", "endpoint" => "authorize", "outcome" => "rate_limited").increment(1);
+                return too_many_attempts_page();
+            };
+            super::middleware::settled_check(&st, entered, lead, reservation, None).await
+        }
     };
-    let verdict = st.checks.check(st.verifier.as_ref(), entered).await;
-    if !matches!(verdict, CredentialCheck::Invalid(_)) {
-        st.limiter.refund(reservation);
-    }
     match verdict {
         CredentialCheck::Valid => {}
         CredentialCheck::Invalid(reason) => {
