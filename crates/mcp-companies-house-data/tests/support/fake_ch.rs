@@ -360,7 +360,9 @@ fn search(state: &FakeState, query: &[(String, String)]) -> (u16, Value) {
         })
         .filter(|c| !active_only || c["company_status"] == "active")
         .collect();
-    let (start, size) = paging(query, "items_per_page", 20);
+    let Some((start, size)) = super::fake_records::search_offset(query) else {
+        return (416, Value::Null);
+    };
     let items: Vec<Value> = matches
         .iter()
         .skip(start)
@@ -549,10 +551,8 @@ async fn handle(
     let (status, body) = match segments.as_slice() {
         ["search", "companies"] => search(&st, &query),
         ["advanced-search", "companies"] => advanced(&st, &query),
-        ["search", "officers"] => (200, super::fake_records::officer_search(&query)),
-        ["search", "disqualified-officers"] => {
-            (200, super::fake_records::disqualified_search(&query))
-        }
+        ["search", "officers"] => super::fake_records::officer_search(&query),
+        ["search", "disqualified-officers"] => super::fake_records::disqualified_search(&query),
         ["dissolved-search", "companies"] => super::fake_records::dissolved(&st.companies, &query),
         ["alphabetical-search", "companies"] => {
             super::fake_records::alphabetical(&st.companies, &query)
@@ -569,8 +569,25 @@ async fn handle(
         },
         _ => match super::fake_records::canned(&st.resources, &path, &query) {
             Some(v) => (200, v),
-            None => (404, json!({"error": "Not found"})),
+            // Like the live API: an unknown disqualified officer is 204 No Content, and the
+            // officer list of any company number, even one that does not exist, is a 200.
+            None => match segments.as_slice() {
+                ["disqualified-officers", "natural" | "corporate", _] => (204, Value::Null),
+                ["company", _, "officers"] => (
+                    200,
+                    json!({
+                        "kind": "officer-list", "items": [], "items_per_page": 35, "start_index": 0,
+                        "total_results": 0, "active_count": 0, "resigned_count": 0, "inactive_count": 0
+                    }),
+                ),
+                _ => (404, json!({"error": "Not found"})),
+            },
         },
     };
-    respond(status, body.to_string(), rate, &[]).into_response()
+    let text = if body.is_null() {
+        String::new()
+    } else {
+        body.to_string()
+    };
+    respond(status, text, rate, &[]).into_response()
 }

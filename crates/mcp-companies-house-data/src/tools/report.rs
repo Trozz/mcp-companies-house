@@ -141,7 +141,7 @@ fn section(
 #[tool_router(router = report_router, vis = "pub(crate)")]
 impl CompaniesServer {
     #[tool(
-        description = "One-call overview of a company for due diligence: its profile, current officers, current persons with significant control (and PSC statements), the most recent filings, charges not yet satisfied and any insolvency cases. Uses up to 6 Companies House requests; sections that could not be read are listed under unavailable. Use the list_ and get_ tools for full or older records.",
+        description = "One-call overview of a company for due diligence: its profile, current officers, current persons with significant control (and PSC statements), the most recent filings, charges not yet satisfied and any insolvency cases. Uses up to 7 Companies House requests; sections that could not be read are listed under unavailable. Use the list_ and get_ tools for full or older records.",
         annotations(read_only_hint = true, idempotent_hint = true, open_world_hint = true)
     )]
     pub async fn company_report(

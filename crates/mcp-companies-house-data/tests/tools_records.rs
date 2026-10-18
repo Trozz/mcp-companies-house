@@ -184,3 +184,23 @@ async fn no_insolvency_record_is_an_empty_list() {
     assert_eq!(v["cases"], json!([]));
     assert!(v["note"].as_str().unwrap().contains("no insolvency record"));
 }
+
+#[tokio::test]
+async fn charges_and_insolvency_of_an_unknown_company_are_not_found() {
+    let fake = fake().await;
+    let s = server(&fake);
+    for r in [
+        s.list_charges(params(json!({"company_number": "12345678"})))
+            .await
+            .unwrap(),
+        s.get_insolvency(params(json!({"company_number": "12345678"})))
+            .await
+            .unwrap(),
+    ] {
+        let text = error_text(&r);
+        assert!(
+            text.starts_with("not_found: no company with number 12345678"),
+            "{text}"
+        );
+    }
+}

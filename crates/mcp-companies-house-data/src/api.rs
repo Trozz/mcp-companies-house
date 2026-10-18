@@ -146,7 +146,11 @@ fn map_status(path: &str, status: StatusCode, body: &str, reset_in_secs: Option<
         ))),
         404 => ChError::NotFound(format!("nothing found at {path}")),
         429 => ChError::RateLimited { reset_in_secs },
-        400 | 416 | 422 => ChError::Validation(with_detail(format!(
+        416 => ChError::Validation(
+            "Companies House refused the requested range (HTTP 416); search results stop at the first 1000 matches, so narrow the query"
+                .into(),
+        ),
+        400 | 422 => ChError::Validation(with_detail(format!(
             "Companies House rejected the request (HTTP {})",
             status.as_u16()
         ))),
@@ -430,6 +434,16 @@ mod tests {
         assert_eq!(kind(429), "rate_limited");
         assert_eq!(kind(400), "validation");
         assert_eq!(kind(416), "validation");
+        assert!(
+            map_status(
+                "/search/companies",
+                StatusCode::RANGE_NOT_SATISFIABLE,
+                "",
+                None
+            )
+            .to_string()
+            .contains("first 1000 matches")
+        );
         assert_eq!(kind(302), "upstream");
         assert_eq!(kind(500), "upstream");
         assert_eq!(kind(503), "upstream");

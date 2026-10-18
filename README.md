@@ -46,7 +46,7 @@ MCP clients reach each service over HTTPS at its path (`https://<host>/companies
 | Tool | What it does |
 |---|---|
 | `get_company` | Profile: status, type, dates, registered office, SIC codes with descriptions (`nature_of_business`), previous names, accounts and confirmation statement due dates (and whether overdue), and `records_available` (for example `officers`, `charges`, `insolvency`) |
-| `company_report` | One call for due diligence: profile, current officers, current persons with significant control and PSC statements, recent filings, charges not yet satisfied and insolvency cases. Up to 6 Companies House requests; sections that fail are listed under `unavailable` instead of failing the call |
+| `company_report` | One call for due diligence: profile, current officers, current persons with significant control and PSC statements, recent filings, charges not yet satisfied and insolvency cases. Up to 7 Companies House requests (charges and insolvency only when the company has them); sections that fail are listed under `unavailable` instead of failing the call |
 | `list_officers` | Directors, secretaries, LLP members and others, current and resigned, with `officer_id` |
 | `list_persons_with_significant_control` | Owners and controllers (and beneficial owners of overseas entities) with natures of control; the first page also has PSC statements |
 | `list_filing_history` | Filings newest first, optionally by `categories` (for example `accounts`, `officers`), with the Companies House description key and `document_id` |
@@ -69,6 +69,7 @@ MCP clients reach each service over HTTPS at its path (`https://<host>/companies
 - Officers' and owners' dates of birth are shown as month and year only, as Companies House publishes them.
 - Filing descriptions are Companies House description keys (for example `accounts-with-accounts-type-micro-entity`) with their values, not the wording shown on the Companies House website.
 - List results share one shape: `total`, `start_index`, `count`, `items` and, when more results exist, `next_start_index` to pass as the next `start_index`.
+- `search_companies`, `search_officers` and `search_disqualified_officers` reach only the first 1000 matches (a Companies House limit) and serve pages aligned to `limit`: a `start_index` that is not a multiple of `limit` returns the rest of that page, and `note` says when matches exist beyond the first 1000.
 - Errors are tool results whose text starts with a kind: `validation`, `not_found`, `auth`, `rate_limited`, `upstream` or `internal`.
 
 ### Rate limit
@@ -157,7 +158,7 @@ Every secret can also be read from a file by appending `_FILE` to its name, for 
 | `INSECURE_HTTP` | no | `false` | Serve plain HTTP without TLS |
 | `LOG_LEVEL` | no | `info` | Log filter, for example `info,mcp_companies_house_data::api=debug` |
 | `LOG_FORMAT` | no | `json` | `json` or `pretty` |
-| `DEBUG` | no | off | Debug logging: tool arguments, Companies House paths, statuses and timings. Never logs the API key |
+| `DEBUG` | no | off | Debug logging: tool arguments, error messages, Companies House paths, statuses and timings. Never logs the API key |
 | `DEBUG_UNSAFE_LOG_CONTENT` | no | off | Also logs full tool results and Companies House response bodies. The API key is never logged |
 | `METRICS_ADDR` | no | | Enables a Prometheus listener, for example `0.0.0.0:9090` |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | no | | Enables OpenTelemetry trace export over OTLP/HTTP |
@@ -191,7 +192,7 @@ TLS_CERT_PATH=$PWD/cert.pem TLS_KEY_PATH=$PWD/key.pem ./mcp-companies-house
 ## Observability
 
 - Logs go to stdout as JSON by default. Every tool call is a span and is logged with its outcome and duration; OAuth requests are logged the same way. Companies House requests inside a tool call are logged at debug level.
-- `DEBUG=1` adds tool arguments (search terms included), Companies House paths, statuses and timings. The API key and the `Authorization` header are never logged.
+- Failed tool calls are logged at `warn` with the tool and the error kind only. `DEBUG=1` adds tool arguments (search terms included), error messages, Companies House paths, statuses and timings. The API key and the `Authorization` header are never logged.
 - `DEBUG_UNSAFE_LOG_CONTENT=1` also writes tool results and Companies House response bodies into the logs. The server prints a warning at startup.
 - `METRICS_ADDR` starts a separate Prometheus listener (plain HTTP, keep it on an internal network): `mcp_tool_calls_total`, `mcp_tool_duration_seconds`, `companies_house_requests_total`, `companies_house_request_duration_seconds`, `companies_house_ratelimit_remaining`, `companies_house_rate_limited_total`, `oauth_requests_total`, `oauth_login_failures_total`, `http_requests_total`.
 - `OTEL_EXPORTER_OTLP_ENDPOINT` (with the standard `OTEL_EXPORTER_OTLP_HEADERS`) exports traces over OTLP/HTTP. Nothing is exported unless it is set.

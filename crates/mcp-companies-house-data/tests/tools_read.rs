@@ -378,3 +378,92 @@ async fn a_used_up_rate_limit_stops_calls_until_the_reset() {
     assert!(text.starts_with("rate_limited: "), "{text}");
     assert_eq!(fake.requests().len(), 1);
 }
+
+#[tokio::test]
+async fn search_with_limit_one_returns_the_best_match_first() {
+    let fake = fake().await;
+    let s = server(&fake);
+    let v = json(
+        &s.search_companies(params(json!({"query": "acme", "limit": 1})))
+            .await
+            .unwrap(),
+    );
+    assert_eq!(numbers(&v), vec!["00000001"]);
+    assert_eq!(v["start_index"], 0);
+    assert_eq!(v["next_start_index"], 1);
+    assert_eq!(fake.requests()[0].param("items_per_page"), Some("2"));
+    let v = json(
+        &s.search_companies(params(
+            json!({"query": "acme", "limit": 1, "start_index": 1}),
+        ))
+        .await
+        .unwrap(),
+    );
+    assert_eq!(numbers(&v), vec!["00000002"]);
+    assert_eq!(v["next_start_index"], 2);
+}
+
+#[tokio::test]
+async fn an_unaligned_start_returns_the_rest_of_its_page() {
+    let fake = fake().await;
+    // Companies House serves pages aligned to items_per_page: asking for 2 from index 1 reads
+    // the page [0, 2) and returns its second item, labelled with the real offset.
+    let v = json(
+        &server(&fake)
+            .search_companies(params(
+                json!({"query": "acme", "limit": 2, "start_index": 1}),
+            ))
+            .await
+            .unwrap(),
+    );
+    assert_eq!(numbers(&v), vec!["00000002"]);
+    assert_eq!(v["start_index"], 1);
+    assert_eq!(v["next_start_index"], 2);
+    let log = fake.requests();
+    assert_eq!(log[0].param("start_index"), Some("0"));
+    assert_eq!(log[0].param("items_per_page"), Some("2"));
+}
+
+#[tokio::test]
+async fn search_stops_at_the_companies_house_window() {
+    let fake = fake().await;
+    let s = server(&fake);
+    let text = error_text(
+        &s.search_companies(params(json!({"query": "acme", "start_index": 1000})))
+            .await
+            .unwrap(),
+    );
+    assert!(text.starts_with("validation: "), "{text}");
+    assert!(text.contains("first 1000 matches"), "{text}");
+    assert!(fake.requests().is_empty());
+
+    // A page ending at result 1000 offers no next page, and says why.
+    let items: Vec<Value> = (0..20)
+        .map(|i| json!({"title": format!("CO {i}"), "company_number": format!("{i:08}")}))
+        .collect();
+    fake.inject(Injected::json(
+        200,
+        json!({"kind": "search#companies", "total_results": 5000, "start_index": 980, "items_per_page": 20, "items": items}),
+    ));
+    let v = json(
+        &s.search_companies(params(json!({"query": "co", "start_index": 980})))
+            .await
+            .unwrap(),
+    );
+    assert_eq!(v["count"], 20);
+    assert_eq!(v["total"], 5000);
+    assert!(v.get("next_start_index").is_none(), "{v}");
+    assert!(v["note"].as_str().unwrap().contains("first 1000 matches"));
+
+    // Near the window the page is shortened so the request stays inside it.
+    json(
+        &s.search_companies(params(
+            json!({"query": "acme", "start_index": 990, "limit": 20}),
+        ))
+        .await
+        .unwrap(),
+    );
+    let last = fake.requests().pop().unwrap();
+    assert_eq!(last.param("items_per_page"), Some("10"));
+    assert_eq!(last.param("start_index"), Some("990"));
+}

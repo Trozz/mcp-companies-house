@@ -305,17 +305,38 @@ pub fn canned(
     Some(v)
 }
 
-fn search_page(all: Vec<Value>, query: &[(String, String)], kind: &str) -> Value {
+/// The offset and page size a live `/search/*` endpoint actually serves: pages aligned to
+/// `items_per_page`, the first match skipped when it is 1, and nothing from result 1000 on
+/// (`None`, answered with 416).
+pub fn search_offset(query: &[(String, String)]) -> Option<(usize, usize)> {
     let start = number(query, "start_index", 0);
-    let size = number(query, "items_per_page", 20);
+    let size = number(query, "items_per_page", 20).max(1);
+    if start >= 1000 {
+        return None;
+    }
+    let served = if size == 1 {
+        start.max(1)
+    } else {
+        start - start % size
+    };
+    Some((served, size))
+}
+
+fn search_page(all: Vec<Value>, query: &[(String, String)], kind: &str) -> (u16, Value) {
+    let Some((start, size)) = search_offset(query) else {
+        return (416, Value::Null);
+    };
     let total = all.len();
-    json!({
-        "kind": kind,
-        "items": all.into_iter().skip(start).take(size).collect::<Vec<_>>(),
-        "items_per_page": size,
-        "start_index": start,
-        "total_results": total,
-    })
+    (
+        200,
+        json!({
+            "kind": kind,
+            "items": all.into_iter().skip(start).take(size).collect::<Vec<_>>(),
+            "items_per_page": size,
+            "start_index": start,
+            "total_results": total,
+        }),
+    )
 }
 
 fn matches(title: &str, query: &[(String, String)]) -> bool {
@@ -323,7 +344,7 @@ fn matches(title: &str, query: &[(String, String)]) -> bool {
     title.to_lowercase().contains(&q)
 }
 
-pub fn officer_search(query: &[(String, String)]) -> Value {
+pub fn officer_search(query: &[(String, String)]) -> (u16, Value) {
     let all: Vec<Value> = [
         json!({
             "title": "Jane Anne SMITH", "kind": "searchresults#officer", "appointment_count": 3,
@@ -343,7 +364,7 @@ pub fn officer_search(query: &[(String, String)]) -> Value {
     search_page(all, query, "search#officers")
 }
 
-pub fn disqualified_search(query: &[(String, String)]) -> Value {
+pub fn disqualified_search(query: &[(String, String)]) -> (u16, Value) {
     let all: Vec<Value> = [
         json!({
             "title": "John BLOGGS", "kind": "searchresults#disqualified-officer",

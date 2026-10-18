@@ -76,10 +76,85 @@ async fn list_officers_for_an_unknown_company_is_not_found() {
             .await
             .unwrap(),
     );
+    // The officers endpoint answers 200 with an empty list even for a number that does not
+    // exist, so the tool checks the profile before saying "no officers".
     assert!(
-        text.starts_with("not_found: no officers for company 12345678"),
+        text.starts_with("not_found: no company with number 12345678"),
         "{text}"
     );
+    let paths: Vec<String> = fake.requests().into_iter().map(|r| r.path).collect();
+    assert_eq!(
+        paths,
+        vec!["/company/12345678/officers", "/company/12345678"]
+    );
+}
+
+#[tokio::test]
+async fn a_company_without_officers_lists_none() {
+    let fake = fake().await;
+    let v = json(
+        &server(&fake)
+            .list_officers(params(json!({"company_number": "5"})))
+            .await
+            .unwrap(),
+    );
+    assert_eq!(v["total"], 0);
+    assert_eq!(v["items"], json!([]));
+}
+
+#[tokio::test]
+async fn psc_for_an_unknown_company_is_not_found() {
+    let fake = fake().await;
+    let text = error_text(
+        &server(&fake)
+            .list_persons_with_significant_control(params(json!({"company_number": "12345678"})))
+            .await
+            .unwrap(),
+    );
+    assert!(
+        text.starts_with("not_found: no company with number 12345678"),
+        "{text}"
+    );
+}
+
+#[tokio::test]
+async fn unknown_disqualified_officers_are_not_found_although_the_api_answers_204() {
+    let fake = fake().await;
+    let text = error_text(
+        &server(&fake)
+            .get_disqualified_officer(params(
+                json!({"officer_id": "nobody", "officer_kind": "natural"}),
+            ))
+            .await
+            .unwrap(),
+    );
+    assert!(text.starts_with("not_found: "), "{text}");
+}
+
+#[tokio::test]
+async fn officer_search_pages_are_aligned() {
+    let fake = fake().await;
+    let s = server(&fake);
+    // limit 1 is requested as a page of two, so the best match is not skipped.
+    let v = json(
+        &s.search_officers(params(json!({"query": "m", "limit": 1})))
+            .await
+            .unwrap(),
+    );
+    assert_eq!(v["items"][0]["officer_id"], "off-jane");
+    assert_eq!(v["start_index"], 0);
+    assert_eq!(v["next_start_index"], 1);
+    let log = fake.requests();
+    assert_eq!(log[0].param("items_per_page"), Some("2"));
+    assert_eq!(log[0].param("start_index"), Some("0"));
+    let v = json(
+        &s.search_officers(params(json!({"query": "m", "limit": 1, "start_index": 1})))
+            .await
+            .unwrap(),
+    );
+    assert_eq!(v["items"][0]["officer_id"], "off-tom");
+    assert_eq!(v["start_index"], 1);
+    assert!(v.get("next_start_index").is_none(), "{v}");
 }
 
 #[tokio::test]

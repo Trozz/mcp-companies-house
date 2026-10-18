@@ -2,8 +2,8 @@
 //! disqualified officers.
 
 use super::{
-    CompaniesServer, count, id_arg, items, json_result, limit_arg, normalise_company_number,
-    required_text, run,
+    CompaniesServer, Query, count, id_arg, items, json_result, limit_arg, normalise_company_number,
+    nothing_listed, required_text, run,
 };
 use crate::error::{self, ChError};
 use crate::view::people::{
@@ -106,9 +106,6 @@ pub struct GetDisqualifiedOfficerParams {
     pub officer_kind: Option<DisqualifiedKind>,
 }
 
-/// Query parameters of a Companies House request.
-type Query = Vec<(&'static str, String)>;
-
 /// The start index and paging parameters of a list request.
 fn paging(limit: Option<u32>, start: Option<u32>) -> error::Result<(u32, Query)> {
     let limit = limit_arg(limit)?;
@@ -142,12 +139,19 @@ impl CompaniesServer {
         query: &[(&str, String)],
         start: u32,
     ) -> error::Result<Value> {
+        // An unknown company gets an empty list (or a 404); callers that need to tell "no
+        // officers" from "no such company" check with ensure_company.
         let found = self
-            .get_company_resource("company_officers", number, "officers", &["officers"], query)
-            .await?;
+            .get_optional("company_officers", &["company", number, "officers"], query)
+            .await?
+            .unwrap_or_default();
         let results = items(&found).iter().map(officer_item).collect();
         Ok(with_counts(
-            page(count(&found, &["total_results"]), start, results),
+            page(
+                Some(count(&found, &["total_results"]).unwrap_or(0)),
+                start,
+                results,
+            ),
             &found,
             &["active_count", "resigned_count", "inactive_count"],
         ))
@@ -236,7 +240,11 @@ impl CompaniesServer {
                 };
                 q.push(("order_by", o.to_string()));
             }
-            Ok(json_result(&self.officers_page(&number, &q, start).await?))
+            let out = self.officers_page(&number, &q, start).await?;
+            if nothing_listed(&out, start) {
+                self.ensure_company(&number).await?;
+            }
+            Ok(json_result(&out))
         })
         .await
     }
@@ -294,18 +302,18 @@ impl CompaniesServer {
         tracing::debug!(args = ?p, "search_officers");
         run("search_officers", async {
             let query = required_text("query", &p.query)?;
-            let (start, mut q) = paging(p.limit, p.start_index)?;
-            q.insert(0, ("q", query));
-            let found = self
-                .get_optional("search_officers", &["search", "officers"], &q)
-                .await?
-                .unwrap_or_default();
-            let results = items(&found).iter().map(officer_search_item).collect();
-            Ok(json_result(&page(
-                Some(count(&found, &["total_results"]).unwrap_or(0)),
-                start,
-                results,
-            )))
+            let limit = limit_arg(p.limit)?;
+            let out = self
+                .search_page(
+                    "search_officers",
+                    &["search", "officers"],
+                    vec![("q", query)],
+                    limit,
+                    p.start_index.unwrap_or(0),
+                    officer_search_item,
+                )
+                .await?;
+            Ok(json_result(&out))
         })
         .await
     }
@@ -322,7 +330,11 @@ impl CompaniesServer {
         run("list_persons_with_significant_control", async {
             let number = normalise_company_number(&p.company_number)?;
             let (start, q) = paging(p.limit, p.start_index)?;
-            Ok(json_result(&self.psc_page(&number, &q, start).await?))
+            let out = self.psc_page(&number, &q, start).await?;
+            if nothing_listed(&out, start) {
+                self.ensure_company(&number).await?;
+            }
+            Ok(json_result(&out))
         })
         .await
     }
@@ -338,22 +350,18 @@ impl CompaniesServer {
         tracing::debug!(args = ?p, "search_disqualified_officers");
         run("search_disqualified_officers", async {
             let query = required_text("query", &p.query)?;
-            let (start, mut q) = paging(p.limit, p.start_index)?;
-            q.insert(0, ("q", query));
-            let found = self
-                .get_optional(
+            let limit = limit_arg(p.limit)?;
+            let out = self
+                .search_page(
                     "search_disqualified",
                     &["search", "disqualified-officers"],
-                    &q,
+                    vec![("q", query)],
+                    limit,
+                    p.start_index.unwrap_or(0),
+                    disqualified_search_item,
                 )
-                .await?
-                .unwrap_or_default();
-            let results = items(&found).iter().map(disqualified_search_item).collect();
-            Ok(json_result(&page(
-                Some(count(&found, &["total_results"]).unwrap_or(0)),
-                start,
-                results,
-            )))
+                .await?;
+            Ok(json_result(&out))
         })
         .await
     }

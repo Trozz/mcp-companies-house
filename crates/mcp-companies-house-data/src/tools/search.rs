@@ -2,8 +2,8 @@
 //! availability, company profiles and SIC codes.
 
 use super::{
-    CompaniesServer, count, date_range, items, json_result, limit_arg, normalise_company_number,
-    required_text, run, text_arg,
+    CompaniesServer, Query, count, date_range, items, json_result, limit_arg,
+    normalise_company_number, required_text, run, text_arg,
 };
 use crate::codes::{self, CompanyStatus, CompanySubtype, CompanyType};
 use crate::error::{self, ChError};
@@ -271,21 +271,21 @@ impl CompaniesServer {
             let query = required_text("query", &p.query)?;
             let limit = limit_arg(p.limit)?;
             let start = p.start_index.unwrap_or(0);
-            let mut q = vec![
-                ("q", query),
-                ("items_per_page", limit.to_string()),
-                ("start_index", start.to_string()),
-            ];
+            let mut q: Query = vec![("q", query)];
             if p.active_only == Some(true) {
                 q.push(("restrictions", "active-companies".to_string()));
             }
-            let found = self
-                .get_optional("search_companies", &["search", "companies"], &q)
-                .await?
-                .unwrap_or_default();
-            let total = count(&found, &["total_results"]).unwrap_or(0);
-            let results = items(&found).iter().map(search_item).collect();
-            Ok(json_result(&page(Some(total), start, results)))
+            let out = self
+                .search_page(
+                    "search_companies",
+                    &["search", "companies"],
+                    q,
+                    limit,
+                    start,
+                    search_item,
+                )
+                .await?;
+            Ok(json_result(&out))
         })
         .await
     }

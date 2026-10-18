@@ -61,6 +61,9 @@ const SYNONYMS: &[(&str, &[&str])] = &[
     ("landlord", &["letting", "renting"]),
     ("it", &["information", "computer"]),
     ("tech", &["information", "computer", "software"]),
+    ("e-commerce", &["internet"]),
+    ("ecommerce", &["internet"]),
+    ("online", &["internet"]),
 ];
 
 const STOP_WORDS: &[&str] = &[
@@ -76,18 +79,20 @@ pub fn describe(code: &str) -> Option<&'static str> {
     BY_CODE.get(code).map(|c| c.description)
 }
 
-fn words(text: &str) -> Vec<String> {
+/// Lower-case words of `text`, hyphenated words kept whole. With `split_hyphens`, the parts of a
+/// hyphenated word are added too (for descriptions, so "day care" finds "day-care"). Single
+/// letters are dropped: they come from abbreviations such as "n.e.c." and match nothing useful.
+fn words(text: &str, split_hyphens: bool) -> Vec<String> {
     text.split(|c: char| !c.is_ascii_alphanumeric() && c != '-')
         .flat_map(|w| {
             let w = w.trim_matches('-').to_ascii_lowercase();
-            // Keep hyphenated words whole and also split, so "day-care" matches "day care".
             let mut out = vec![w.clone()];
-            if w.contains('-') {
+            if split_hyphens && w.contains('-') {
                 out.extend(w.split('-').map(str::to_string));
             }
             out
         })
-        .filter(|w| !w.is_empty())
+        .filter(|w| w.len() > 1)
         .collect()
 }
 
@@ -126,7 +131,7 @@ pub fn search(query: &str, limit: usize) -> Vec<&'static SicCode> {
             .take(limit)
             .collect();
     }
-    let query_words: Vec<String> = words(q)
+    let query_words: Vec<String> = words(q, false)
         .into_iter()
         .filter(|w| !STOP_WORDS.contains(&w.as_str()))
         .collect();
@@ -134,37 +139,48 @@ pub fn search(query: &str, limit: usize) -> Vec<&'static SicCode> {
         return Vec::new();
     }
     let phrase = q.to_ascii_lowercase();
-    let mut scored: Vec<(usize, bool, &'static SicCode)> = CODES
+    // (words matched, words matched whole, has the whole phrase, code)
+    let mut scored: Vec<(usize, usize, bool, &'static SicCode)> = CODES
         .iter()
         .filter_map(|c| {
-            let dw = words(c.description);
-            let matched = query_words
-                .iter()
-                .filter(|w| {
-                    let alternatives = SYNONYMS
-                        .iter()
-                        .find(|(k, _)| *k == w.as_str())
-                        .map(|(_, v)| *v)
-                        .unwrap_or_default();
-                    word_matches(w, &dw) || alternatives.iter().any(|a| word_matches(a, &dw))
-                })
-                .count();
+            let dw = words(c.description, true);
+            let mut matched = 0;
+            let mut whole = 0;
+            for w in &query_words {
+                // Synonym targets are official words: they must start a description word.
+                let alternatives = SYNONYMS
+                    .iter()
+                    .find(|(k, _)| *k == w.as_str())
+                    .map(|(_, v)| *v)
+                    .unwrap_or_default();
+                let by_synonym = alternatives
+                    .iter()
+                    .any(|a| dw.iter().any(|d| d.starts_with(a)));
+                let exact = dw.iter().any(|d| d.starts_with(w.as_str()));
+                if exact || by_synonym {
+                    matched += 1;
+                    whole += 1;
+                } else if word_matches(w, &dw) {
+                    matched += 1;
+                }
+            }
             (matched > 0).then(|| {
                 let has_phrase = c.description.to_ascii_lowercase().contains(&phrase);
-                (matched, has_phrase, c)
+                (matched, whole, has_phrase, c)
             })
         })
         .collect();
-    let best = scored.iter().map(|(m, _, _)| *m).max().unwrap_or(0);
+    let best = scored.iter().map(|s| s.0).max().unwrap_or(0);
     if best == query_words.len() {
-        scored.retain(|(m, _, _)| *m == best);
+        scored.retain(|s| s.0 == best);
     }
     scored.sort_by(|a, b| {
         b.0.cmp(&a.0)
             .then(b.1.cmp(&a.1))
-            .then(a.2.code.cmp(b.2.code))
+            .then(b.2.cmp(&a.2))
+            .then(a.3.code.cmp(b.3.code))
     });
-    scored.into_iter().take(limit).map(|(_, _, c)| c).collect()
+    scored.into_iter().take(limit).map(|s| s.3).collect()
 }
 
 #[cfg(test)]
@@ -245,6 +261,22 @@ mod tests {
     fn partial_matches_are_a_fallback() {
         let c = codes("software zebra");
         assert!(c.contains(&"62012"), "{c:?}");
+    }
+
+    #[test]
+    fn hyphenated_queries_do_not_match_abbreviation_letters() {
+        assert_eq!(codes("e-commerce"), vec!["47910"]);
+        // Whole-word matches rank above stem-only ones ("internet" before "intermediate").
+        assert_eq!(codes("internet")[0], "47910");
+        assert!(
+            codes("t-shirt")
+                .iter()
+                .all(|c| describe(c).is_some_and(|d| !d.ends_with("n.e.c."))),
+            "{:?}",
+            codes("t-shirt")
+        );
+        assert!(codes("day care").contains(&"88910"));
+        assert!(codes("day-care").contains(&"88910"));
     }
 
     #[test]

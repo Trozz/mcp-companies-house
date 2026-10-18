@@ -1,5 +1,6 @@
 use crate::api::ChClient;
 use crate::error::{self, ChError};
+use crate::view::page;
 use chrono::NaiveDate;
 use mcp_server_core::observability::content_logging_enabled;
 use rmcp::handler::server::router::tool::ToolRouter;
@@ -30,6 +31,11 @@ pub use search::{
 pub const DEFAULT_LIMIT: u32 = 20;
 pub const MAX_LIMIT: u32 = 100;
 pub const MAX_TEXT_CHARS: usize = 200;
+/// The `/search/*` endpoints serve only the first this many results of a query (HTTP 416 past it).
+pub const SEARCH_WINDOW: u32 = 1000;
+
+/// Query parameters of a Companies House request.
+pub(crate) type Query = Vec<(&'static str, String)>;
 
 const INSTRUCTIONS: &str = "Tools for the UK Companies House register (public data). \
 Companies are identified by company number: 8 characters such as 00445790 or SC123456; use search_companies to find a number from a name. \
@@ -69,7 +75,8 @@ impl CompaniesServer {
         names
     }
 
-    /// GET a resource; a 404 is `None`.
+    /// GET a resource; a 404, or a 2xx with an empty body (some endpoints answer an unknown id
+    /// with 204 No Content), is `None`.
     pub(crate) async fn get_optional(
         &self,
         endpoint: &'static str,
@@ -77,10 +84,90 @@ impl CompaniesServer {
         query: &[(&str, String)],
     ) -> error::Result<Option<Value>> {
         match self.client.get(endpoint, segments, query).await {
+            Ok(Value::Null) => Ok(None),
             Ok(v) => Ok(Some(v)),
             Err(ChError::NotFound(_)) => Ok(None),
             Err(e) => Err(e),
         }
+    }
+
+    /// Fails with `not_found` unless the company exists. List endpoints answer an unknown company
+    /// with an empty list (or a 404 that also means "none"), so an empty result is checked here.
+    pub(crate) async fn ensure_company(&self, number: &str) -> error::Result<()> {
+        match self
+            .get_optional("company_profile", &["company", number], &[])
+            .await?
+        {
+            Some(_) => Ok(()),
+            None => Err(ChError::NotFound(format!(
+                "no company with number {number}; find the number with search_companies"
+            ))),
+        }
+    }
+
+    /// One page of a `/search/*` endpoint. These endpoints serve pages aligned to
+    /// `items_per_page` (and skip the first match when it is 1) and stop at result
+    /// [`SEARCH_WINDOW`], so the request is aligned, a single result is read from a page of two,
+    /// and the reply is labelled with the offsets Companies House actually served.
+    pub(crate) async fn search_page(
+        &self,
+        endpoint: &'static str,
+        segments: &[&str],
+        mut query: Query,
+        limit: u32,
+        start: u32,
+        shape: fn(&Value) -> Value,
+    ) -> error::Result<Value> {
+        if start >= SEARCH_WINDOW {
+            return Err(ChError::invalid(format!(
+                "Companies House search returns only the first {SEARCH_WINDOW} matches, so start_index must be below {SEARCH_WINDOW}; narrow the query instead"
+            )));
+        }
+        let limit = limit.min(SEARCH_WINDOW - start);
+        let size = limit.max(2);
+        let aligned = start - start % size;
+        query.push(("items_per_page", size.to_string()));
+        query.push(("start_index", aligned.to_string()));
+        let found = self
+            .get_optional(endpoint, segments, &query)
+            .await?
+            .unwrap_or_default();
+        let served = found
+            .get("start_index")
+            .and_then(Value::as_u64)
+            .and_then(|s| u32::try_from(s).ok())
+            .unwrap_or(aligned);
+        let (label, skip) = if start >= served {
+            (start, (start - served) as usize)
+        } else {
+            (served, 0)
+        };
+        let results: Vec<Value> = items(&found)
+            .iter()
+            .skip(skip)
+            .take(limit as usize)
+            .map(shape)
+            .collect();
+        let total = count(&found, &["total_results"]).unwrap_or(0);
+        let mut out = page(Some(total), label, results);
+        if let Value::Object(map) = &mut out {
+            let past_window = map
+                .get("next_start_index")
+                .and_then(Value::as_u64)
+                .is_some_and(|n| n >= u64::from(SEARCH_WINDOW));
+            if past_window {
+                map.remove("next_start_index");
+            }
+            if total > u64::from(SEARCH_WINDOW) {
+                map.insert(
+                    "note".into(),
+                    Value::from(format!(
+                        "Companies House search serves only the first {SEARCH_WINDOW} matches; narrow the query to reach the rest"
+                    )),
+                );
+            }
+        }
+        Ok(out)
     }
 
     /// GET a resource of one company; a 404 names the company and suggests how to find it.
@@ -151,7 +238,9 @@ pub(crate) async fn run(
             Ok(r)
         }
         Err(e) => {
-            tracing::warn!(tool, kind = e.kind(), error = %e, "tool failed");
+            // The message can carry Companies House paths and argument values: debug only.
+            tracing::warn!(tool, kind = e.kind(), "tool failed");
+            tracing::debug!(tool, kind = e.kind(), error = %e, "tool error detail");
             Ok(CallToolResult::error(vec![ContentBlock::text(format!(
                 "{}: {e}",
                 e.kind()
@@ -264,6 +353,16 @@ pub(crate) fn items(v: &Value) -> &[Value] {
         .and_then(Value::as_array)
         .map(Vec::as_slice)
         .unwrap_or_default()
+}
+
+/// Whether a shaped page holds nothing at all: the first page, no items and no statements.
+pub(crate) fn nothing_listed(page: &Value, start: u32) -> bool {
+    let empty = |k: &str| {
+        page.get(k)
+            .and_then(Value::as_array)
+            .is_none_or(Vec::is_empty)
+    };
+    start == 0 && empty("items") && empty("statements")
 }
 
 /// The first number among `keys` in a list response.

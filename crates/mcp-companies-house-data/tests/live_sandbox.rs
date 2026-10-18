@@ -87,9 +87,10 @@ async fn delete_company(number: &str, auth_code: &str) {
 #[tokio::test]
 #[ignore = "needs a sandbox COMPANIES_HOUSE_API_KEY and network access"]
 async fn get_company_round_trip_with_a_generated_company() {
+    // server() checks the URL is the sandbox: do that before creating anything.
+    let s = server();
     let (number, auth_code) = create_company().await;
     println!("created sandbox company {number}");
-    let s = server();
     let found = s
         .get_company(params(json!({"company_number": number})))
         .await
@@ -121,9 +122,10 @@ async fn get_company_round_trip_with_a_generated_company() {
 #[tokio::test]
 #[ignore = "needs a sandbox COMPANIES_HOUSE_API_KEY and network access"]
 async fn company_report_on_a_generated_company() {
+    // server() checks the URL is the sandbox: do that before creating anything.
+    let s = server();
     let (number, auth_code) = create_company().await;
     println!("created sandbox company {number}");
-    let s = server();
     let report = s
         .company_report(params(json!({"company_number": number})))
         .await

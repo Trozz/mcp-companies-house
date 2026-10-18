@@ -1,7 +1,8 @@
 //! Records about a company: filing history, charges (secured lending) and insolvency.
 
 use super::{
-    CompaniesServer, count, id_arg, items, json_result, limit_arg, normalise_company_number, run,
+    CompaniesServer, count, id_arg, items, json_result, limit_arg, normalise_company_number,
+    nothing_listed, run,
 };
 use crate::error::{self, ChError};
 use crate::view::page;
@@ -177,7 +178,11 @@ impl CompaniesServer {
                 ("items_per_page", limit.to_string()),
                 ("start_index", start.to_string()),
             ];
-            Ok(json_result(&self.charges_page(&number, &q, start).await?))
+            let out = self.charges_page(&number, &q, start).await?;
+            if nothing_listed(&out, start) {
+                self.ensure_company(&number).await?;
+            }
+            Ok(json_result(&out))
         })
         .await
     }
@@ -220,10 +225,13 @@ impl CompaniesServer {
             let number = normalise_company_number(&p.company_number)?;
             let out = match self.insolvency_record(&number).await? {
                 Some(v) => v,
-                None => json!({
+                None => {
+                    self.ensure_company(&number).await?;
+                    json!({
                     "cases": [],
-                    "note": "Companies House holds no insolvency record for this company number",
-                }),
+                        "note": "Companies House holds no insolvency record for this company",
+                    })
+                }
             };
             Ok(json_result(&out))
         })
