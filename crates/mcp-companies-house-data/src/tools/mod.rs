@@ -43,7 +43,7 @@ pub const SEARCH_WINDOW: u32 = 1000;
 pub(crate) type Query = Vec<(&'static str, String)>;
 
 const INSTRUCTIONS: &str = "Tools for the UK Companies House register (public data). \
-Companies are identified by company number: 8 characters such as 00445790 or SC123456; use search_companies to find a number from a name. \
+Companies are identified by company number: 8 characters such as 00445790 or SC123456; use search_companies to find a number from a name, or search_all to search companies, officers and disqualified officers at once. \
 filter_companies takes the status, type and subtype codes listed in its schema, SIC 2007 codes (find them with lookup_sic_codes) and dates as YYYY-MM-DD. \
 company_report gives an overview of one company in a single call and due_diligence_check screens it for things a reviewer should look into; the list_ and get_ tools give the full records. \
 Officers are identified by officer_id (from list_officers or search_officers), charges by charge_id (from list_charges), filings by transaction_id and their documents by document_id (both from list_filing_history), disqualified officers by officer_id from search_disqualified_officers. \

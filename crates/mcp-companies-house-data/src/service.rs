@@ -117,6 +117,7 @@ mod tests {
                 "list_persons_with_significant_control",
                 "lookup_sic_codes",
                 "officer_network",
+                "search_all",
                 "search_companies",
                 "search_disqualified_officers",
                 "search_dissolved_companies",

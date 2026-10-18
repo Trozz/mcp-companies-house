@@ -175,7 +175,15 @@ async fn due_diligence_on_a_quiet_company_observes_nothing_but_never_clears_it()
             .unwrap(),
     );
     assert_eq!(v["company"]["company_name"], "ACME WIDGETS LIMITED");
-    assert_eq!(observations(&v), vec![]);
+    // Nothing to look into; the only observation is the identity verification tally.
+    assert_eq!(
+        observations(&v),
+        vec![(
+            "identity_verification".to_string(),
+            "note".to_string(),
+            "identity verification statements on record: 0 of 1 officers in charge who are people, 0 of 1 individual PSCs. Companies House is phasing verification in, so none on record is not a failure; the register shows that a statement was filed, not the check itself".to_string()
+        )]
+    );
     let run: Vec<&str> = v["checks_run"]
         .as_array()
         .unwrap()
@@ -192,6 +200,7 @@ async fn due_diligence_on_a_quiet_company_observes_nothing_but_never_clears_it()
         "charges",
         "officers",
         "ownership",
+        "identity_verification",
     ] {
         assert!(run.contains(&check), "{check} missing from {run:?}");
     }
@@ -199,10 +208,11 @@ async fn due_diligence_on_a_quiet_company_observes_nothing_but_never_clears_it()
     for check in [
         "sanctions",
         "politically_exposed_persons",
-        "identity_verification",
+        "credit_and_finances",
     ] {
         assert!(not_run.contains(check), "{not_run}");
     }
+    assert!(!not_run.contains("identity_verification"), "{not_run}");
     assert!(
         v["disclaimer"]
             .as_str()
@@ -361,12 +371,133 @@ async fn due_diligence_flags_an_owner_the_register_marks_as_sanctioned() {
             .await
             .unwrap(),
     );
+    let flags: Vec<_> = observations(&v)
+        .into_iter()
+        .filter(|(_, level, _)| level == "flag")
+        .collect();
     assert_eq!(
-        observations(&v),
+        flags,
         vec![(
             "ownership".to_string(),
             "flag".to_string(),
             "the register marks these owners as sanctioned: Mrs Jane Anne Smith".to_string()
         )]
+    );
+}
+
+#[tokio::test]
+async fn due_diligence_says_when_psc_statements_could_not_be_read() {
+    let fake = fake().await;
+    fake.state()
+        .fail
+        .push("/company/00000001/persons-with-significant-control-statements".to_string());
+    let v = json(
+        &server(&fake)
+            .due_diligence_check(params(json!({"company_number": "1"})), auth())
+            .await
+            .unwrap(),
+    );
+    let failed = &v["checks_not_run"][0];
+    assert_eq!(failed["check"], "ownership_statements", "{v}");
+    assert!(
+        failed["reason"].as_str().unwrap().contains("upstream: "),
+        "{failed}"
+    );
+}
+
+#[tokio::test]
+async fn due_diligence_flags_statements_about_unresolved_control() {
+    let fake = fake().await;
+    fake.state().resources.insert(
+        "/company/00000001/persons-with-significant-control-statements".into(),
+        json!({"total_results": 1, "items": [
+            {"statement": "psc-contacted-but-no-response", "notified_on": "2025-01-01"}
+        ]}),
+    );
+    let v = json(
+        &server(&fake)
+            .due_diligence_check(params(json!({"company_number": "1"})), auth())
+            .await
+            .unwrap(),
+    );
+    assert!(
+        observations(&v).contains(&(
+            "ownership".to_string(),
+            "flag".to_string(),
+            "PSC statement: psc-contacted-but-no-response".to_string()
+        )),
+        "{v}"
+    );
+}
+
+#[tokio::test]
+async fn due_diligence_fits_overseas_entities_and_partnerships() {
+    let fake = fake().await;
+    {
+        let mut st = fake.state();
+        let mut oe = st.companies["00000001"].clone();
+        oe["company_number"] = json!("OE000123");
+        oe["type"] = json!("registered-overseas-entity");
+        oe["company_status"] = json!("registered");
+        st.companies.insert("OE000123".into(), oe);
+        st.resources.insert(
+            "/company/OE000123/officers".into(),
+            json!({"total_results": 1, "active_count": 1, "items": [
+                {"name": "OFFICER, Managing", "officer_role": "managing-officer", "appointed_on": "2015-01-01"}
+            ]}),
+        );
+        st.resources.insert(
+            "/company/OE000123/persons-with-significant-control".into(),
+            json!({"total_results": 1, "active_count": 1, "items": [
+                {"name": "Beneficial Owner", "kind": "individual-beneficial-owner", "notified_on": "2023-01-01"}
+            ]}),
+        );
+        let mut lp = st.companies["00000001"].clone();
+        lp["company_number"] = json!("LP000123");
+        lp["type"] = json!("limited-partnership");
+        st.companies.insert("LP000123".into(), lp);
+        st.resources.insert(
+            "/company/LP000123/officers".into(),
+            json!({"total_results": 1, "active_count": 1, "items": [
+                {"name": "PARTNER, General", "officer_role": "general-partner-in-a-limited-partnership", "appointed_on": "2015-01-01"}
+            ]}),
+        );
+    }
+    let srv = server(&fake);
+    let v = json(
+        &srv.due_diligence_check(params(json!({"company_number": "OE000123"})), auth())
+            .await
+            .unwrap(),
+    );
+    let flags: Vec<_> = observations(&v)
+        .into_iter()
+        .filter(|(_, level, _)| level == "flag")
+        .collect();
+    assert!(
+        flags.is_empty(),
+        "a live overseas entity with a managing officer: {flags:?}"
+    );
+
+    let v = json(
+        &srv.due_diligence_check(params(json!({"company_number": "LP000123"})), auth())
+            .await
+            .unwrap(),
+    );
+    let found = observations(&v);
+    assert!(
+        found.iter().all(|(_, level, _)| level != "flag"),
+        "{found:?}"
+    );
+    assert!(
+        found.iter().any(|(c, _, d)| c == "ownership"
+            && d.contains("does not report persons with significant control")),
+        "{found:?}"
+    );
+    assert!(
+        !fake
+            .requests()
+            .iter()
+            .any(|r| r.path == "/company/LP000123/exemptions"),
+        "no exemptions request for a type without PSCs"
     );
 }

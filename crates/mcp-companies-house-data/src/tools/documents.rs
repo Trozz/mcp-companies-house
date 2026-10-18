@@ -167,9 +167,18 @@ impl CompaniesServer {
                     held_formats(&metadata)
                 )));
             }
+            // Held until the result is built, so the bytes and their encoding count against the
+            // server's budget.
+            let _permit = c.client.reserve_document(max_bytes)?;
             let doc = c
                 .client
-                .document_content(&c.key, &id, content_type, max_bytes)
+                .document_content(
+                    &c.key,
+                    &id,
+                    content_type,
+                    max_bytes,
+                    size.map(|n| n as usize),
+                )
                 .await?;
             let uri = c.client.document_url(&id, true)?.to_string();
             let mut about = metadata;

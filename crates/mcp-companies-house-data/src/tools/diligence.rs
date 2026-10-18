@@ -32,10 +32,6 @@ const NOT_RUN: &[(&str, &str)] = &[
         "the register holds filed accounts but no credit data; read the accounts with download_filing_document or ask a credit reference agency",
     ),
     (
-        "identity_verification",
-        "Companies House is still introducing identity verification for directors and PSCs, and the public register does not say who has been verified",
-    ),
-    (
         "director_disqualifications",
         "disqualifications are not linked to officer ids; search each officer's name with search_disqualified_officers",
     ),
@@ -52,7 +48,60 @@ const UNRESOLVED_STATEMENTS: &[&str] = &[
     "not-yet-completed",
     "failed-to",
     "restrictions-notice",
+    "no-response",
 ];
+
+/// Company types the Companies Act's director rules apply to, including that at least one
+/// director is a person.
+const UK_COMPANY_TYPES: &[&str] = &[
+    "ltd",
+    "plc",
+    "private-unlimited",
+    "private-unlimited-nsc",
+    "private-limited-guarant-nsc",
+    "private-limited-guarant-nsc-limited-exemption",
+    "private-limited-shares-section-30-exemption",
+    "old-public-company",
+];
+
+/// Statuses of a company, entity or branch that is still live.
+const LIVE_STATUSES: &[&str] = &["active", "registered", "open"];
+
+/// Whether an officer role is one of the roles that run a company.
+type RoleTest = fn(&str) -> bool;
+
+/// The officers who run a company of `company_type` and how to name them; `None` for a type
+/// outside the known ones, where the check only notes what it finds.
+fn officers_in_charge(company_type: Option<&str>) -> Option<(&'static str, RoleTest)> {
+    match company_type? {
+        "llp" => Some(("members", |r| {
+            r.starts_with("llp-") || r.starts_with("corporate-llp-")
+        })),
+        "registered-overseas-entity" => {
+            Some(("managing officers", |r| r.contains("managing-officer")))
+        }
+        "oversea-company" | "uk-establishment" => Some(("directors or equivalent officers", |r| {
+            r.contains("director")
+                || r.starts_with("member-of-")
+                || r.starts_with("person-authorised")
+        })),
+        "limited-partnership" => Some(("general partners", |r| r.contains("general-partner"))),
+        "eeig" => Some(("managers", |r| r.contains("manager-of-an-eeig"))),
+        t if UK_COMPANY_TYPES.contains(&t) => Some(("directors", |r| r.contains("director"))),
+        _ => None,
+    }
+}
+
+/// Whether persons with significant control are reported for a company of this type and number:
+/// overseas companies, their UK establishments and English, Welsh and Northern Irish limited
+/// partnerships do not report them (Scottish limited partnerships, numbered SL, do).
+fn reports_pscs(company_type: Option<&str>, number: &str) -> bool {
+    match company_type {
+        Some("oversea-company" | "uk-establishment") => false,
+        Some("limited-partnership") => number.starts_with("SL"),
+        _ => true,
+    }
+}
 
 /// What a check found. `flag`: something a reviewer should look into; `note`: context.
 struct Findings {
@@ -130,7 +179,7 @@ fn months_between(from: NaiveDate, to: NaiveDate) -> i64 {
 fn profile_checks(f: &mut Findings, profile: &Value, today: NaiveDate) {
     f.ran("company_status");
     let status = text(profile, "company_status").unwrap_or("unknown");
-    if status != "active" {
+    if !LIVE_STATUSES.contains(&status) {
         f.flag(
             "company_status",
             format!("the company's status is {status}"),
@@ -264,7 +313,7 @@ fn insolvency_checks(f: &mut Findings, record: Option<Value>) {
 fn charges_checks(f: &mut Findings, page: Option<Value>) {
     f.ran("charges");
     let Some(page) = page else { return };
-    let open: Vec<&Value> = page
+    let listed: Vec<&Value> = page
         .get("items")
         .and_then(Value::as_array)
         .map(|items| {
@@ -279,10 +328,16 @@ fn charges_checks(f: &mut Findings, page: Option<Value>) {
                 .collect()
         })
         .unwrap_or_default();
-    if open.is_empty() {
+    // The totals cover every charge, the page only the first 100.
+    let num = |k: &str| page.get(k).and_then(Value::as_u64);
+    let open = match (num("total"), num("satisfied_count")) {
+        (Some(total), Some(satisfied)) => total.saturating_sub(satisfied) as usize,
+        _ => listed.len(),
+    };
+    if open == 0 {
         return;
     }
-    let mut lenders: Vec<&str> = open
+    let mut lenders: Vec<&str> = listed
         .iter()
         .filter_map(|c| c.get("persons_entitled").and_then(Value::as_array))
         .flatten()
@@ -290,26 +345,24 @@ fn charges_checks(f: &mut Findings, page: Option<Value>) {
         .collect();
     lenders.sort_unstable();
     lenders.dedup();
-    let more = if page.get("next_start_index").is_some() {
-        " (among the first 100 charges)"
-    } else {
-        ""
-    };
     let held_by = if lenders.is_empty() {
         String::new()
+    } else if page.get("next_start_index").is_some() {
+        format!(
+            ", held by {} among the first 100 charges",
+            lenders.join(", ")
+        )
     } else {
         format!(", held by {}", lenders.join(", "))
     };
     f.note(
         "charges",
-        format!(
-            "charges not satisfied: {}{more}{held_by}; see list_charges",
-            open.len()
-        ),
+        format!("charges not satisfied: {open}{held_by}; see list_charges"),
     );
 }
 
-/// Directors in post, and how many officers joined or left in the last year.
+/// Directors (or the type's equivalent) in post, and how many officers joined or left in the
+/// last year.
 fn officer_checks(f: &mut Findings, page: &Value, company_type: Option<&str>, today: NaiveDate) {
     f.ran("officers");
     let items = page
@@ -327,23 +380,37 @@ fn officer_checks(f: &mut Findings, page: &Value, company_type: Option<&str>, to
             .unwrap_or("")
             .to_string()
     };
-    let llp = company_type == Some("llp");
-    let (what, is_director): (&str, fn(&str) -> bool) = if llp {
-        ("members", |r| {
-            r.starts_with("llp-") || r.starts_with("corporate-llp-")
-        })
-    } else {
-        ("directors", |r| r.contains("director"))
-    };
-    let directors: Vec<&&Value> = current.iter().filter(|o| is_director(&role(o))).collect();
     let truncated = page.get("next_start_index").is_some();
-    if directors.is_empty() && !truncated {
-        f.flag("officers", format!("no current {what} are recorded"));
-    } else if !llp && directors.iter().all(|o| role(o).starts_with("corporate-")) {
-        f.flag(
-            "officers",
-            "every current director is a company; a UK company must have at least one director who is a person",
-        );
+    match officers_in_charge(company_type) {
+        Some((what, in_charge)) => {
+            let running: Vec<&&Value> = current.iter().filter(|o| in_charge(&role(o))).collect();
+            if running.is_empty() && truncated {
+                f.note(
+                    "officers",
+                    format!("no current {what} are among the first 100 officer records; see list_officers with current_only"),
+                );
+            } else if running.is_empty() {
+                f.flag("officers", format!("no current {what} are recorded"));
+            } else if company_type.is_some_and(|t| UK_COMPANY_TYPES.contains(&t))
+                && running.iter().all(|o| role(o).starts_with("corporate-"))
+            {
+                f.flag(
+                    "officers",
+                    "every current director is a company; a UK company must have at least one director who is a person",
+                );
+            }
+        }
+        None => {
+            if current.is_empty() && !truncated {
+                f.note(
+                    "officers",
+                    format!(
+                        "no current officers are recorded; whether a {} must have any was not checked",
+                        company_type.unwrap_or("company of this type")
+                    ),
+                );
+            }
+        }
     }
     let year_ago = today.checked_sub_months(Months::new(12)).unwrap_or(today);
     let within = |o: &Value, key: &str| date(o, key).is_some_and(|d| d >= year_ago);
@@ -365,9 +432,123 @@ fn officer_checks(f: &mut Findings, page: &Value, company_type: Option<&str>, to
     }
 }
 
+/// Where someone's identity verification statement stands, from `identity_verification`.
+#[derive(Debug, PartialEq, Eq)]
+enum Verification {
+    /// A statement is on record for this role.
+    OnRecord,
+    /// None on record and the due date has passed.
+    Overdue(String),
+    /// None on record (yet).
+    NotOnRecord,
+}
+
+fn verification(person: &Value, today: NaiveDate) -> Verification {
+    let iv = person.get("identity_verification").unwrap_or(&Value::Null);
+    let start = date(iv, "appointment_verification_start_on");
+    let end = date(iv, "appointment_verification_end_on");
+    let due = date(iv, "appointment_verification_statement_due_on");
+    if start.is_some_and(|s| s <= today) && end.is_none_or(|e| e > today) {
+        return Verification::OnRecord;
+    }
+    match due {
+        Some(d) if d < today => Verification::Overdue(d.to_string()),
+        _ => Verification::NotOnRecord,
+    }
+}
+
+/// Identity verification statements of the people in post: directors (or the type's
+/// equivalent) who are people, and individual PSCs. Companies House is phasing verification in,
+/// so "none on record" is a note; a statement past its due date is a flag.
+fn identity_checks(
+    f: &mut Findings,
+    officers: Option<&Value>,
+    pscs: Option<&Value>,
+    company_type: Option<&str>,
+    today: NaiveDate,
+) {
+    f.ran("identity_verification");
+    let current = |page: Option<&Value>, ended: &str| -> Vec<Value> {
+        page.and_then(|p| p.get("items"))
+            .and_then(Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter(|i| i.get(ended).is_none())
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let in_charge = officers_in_charge(company_type).map(|(_, f)| f);
+    let people: Vec<Value> = current(officers, "resigned_on")
+        .into_iter()
+        .filter(|o| {
+            let role = o.get("officer_role").and_then(Value::as_str).unwrap_or("");
+            !role.starts_with("corporate-") && in_charge.is_some_and(|f| f(role))
+        })
+        .collect();
+    let owners: Vec<Value> = current(pscs, "ceased_on")
+        .into_iter()
+        .filter(|p| text(p, "kind") == Some("individual"))
+        .collect();
+    let mut overdue: Vec<String> = Vec::new();
+    let mut tally = |group: &[Value]| {
+        let mut on_record = 0;
+        for person in group {
+            match verification(person, today) {
+                Verification::OnRecord => on_record += 1,
+                Verification::Overdue(due) => overdue.push(format!(
+                    "{} (due {due})",
+                    text(person, "name").unwrap_or("unnamed")
+                )),
+                Verification::NotOnRecord => {}
+            }
+        }
+        on_record
+    };
+    let people_verified = tally(&people);
+    let owners_verified = tally(&owners);
+    if !overdue.is_empty() {
+        f.flag(
+            "identity_verification",
+            format!(
+                "identity verification statements are overdue for: {}",
+                overdue.join(", ")
+            ),
+        );
+    }
+    if !people.is_empty() || !owners.is_empty() {
+        f.note(
+            "identity_verification",
+            format!(
+                "identity verification statements on record: {people_verified} of {} officers in charge who are people, {owners_verified} of {} individual PSCs. Companies House is phasing verification in, so none on record is not a failure; the register shows that a statement was filed, not the check itself",
+                people.len(),
+                owners.len()
+            ),
+        );
+    }
+}
+
 /// Who controls the company: PSCs, PSC statements, and, when there are neither, exemptions.
-async fn ownership_checks(f: &mut Findings, c: &Caller, number: &str, page: &Value) {
+async fn ownership_checks(
+    f: &mut Findings,
+    c: &Caller,
+    number: &str,
+    company_type: Option<&str>,
+    page: &Value,
+) {
     f.ran("ownership");
+    if page.get("statements").is_none() {
+        let why = page
+            .get("statements_unavailable")
+            .and_then(Value::as_str)
+            .unwrap_or("not read");
+        f.not_run.push(json!({
+            "check": "ownership_statements",
+            "reason": format!("the PSC statements could not be read: {why}"),
+        }));
+    }
     let current = |key: &str| -> Vec<Value> {
         page.get(key)
             .and_then(Value::as_array)
@@ -432,13 +613,23 @@ async fn ownership_checks(f: &mut Findings, c: &Caller, number: &str, page: &Val
     }
     if pscs.is_empty() && statements.is_empty() && page.get("next_start_index").is_none() {
         if !statements_read {
-            f.not_run.push(json!({
-                "check": "ownership_statements",
-                "reason": "the PSC statements could not be read",
-            }));
             return;
         }
-        let note = c.psc_absence_note(number).await;
+        if !reports_pscs(company_type, number) {
+            f.note(
+                "ownership",
+                format!(
+                    "a {} does not report persons with significant control, so the register shows no owners",
+                    company_type.unwrap_or("company of this type")
+                ),
+            );
+            return;
+        }
+        let ceased = page
+            .get("items")
+            .and_then(Value::as_array)
+            .is_some_and(|i| !i.is_empty());
+        let note = c.psc_absence_note(number, ceased).await;
         if note.contains("exempt from the PSC rules") {
             f.note("ownership", note);
         } else {
@@ -518,18 +709,24 @@ impl Caller {
             Ok(page) => charges_checks(&mut f, page),
             Err(e) => f.failed("charges", &e),
         }
-        match officers {
-            Ok(page) => officer_checks(
+        let company_type = profile.get("type").and_then(Value::as_str);
+        match &officers {
+            Ok(page) => officer_checks(&mut f, page, company_type, today),
+            Err(e) => f.failed("officers", e),
+        }
+        match &psc {
+            Ok(page) => ownership_checks(&mut f, self, number, company_type, page).await,
+            Err(e) => f.failed("ownership", e),
+        }
+        match (&officers, &psc) {
+            (Err(e), Err(_)) => f.failed("identity_verification", e),
+            _ => identity_checks(
                 &mut f,
-                &page,
-                profile.get("type").and_then(Value::as_str),
+                officers.as_ref().ok(),
+                psc.as_ref().ok(),
+                company_type,
                 today,
             ),
-            Err(e) => f.failed("officers", &e),
-        }
-        match psc {
-            Ok(page) => ownership_checks(&mut f, self, number, &page).await,
-            Err(e) => f.failed("ownership", &e),
         }
         let mut not_run = f.not_run;
         not_run.extend(
@@ -703,6 +900,155 @@ mod tests {
             day("2026-10-18"),
         );
         assert!(f.observations.is_empty(), "{:?}", f.observations);
+    }
+
+    #[test]
+    fn a_long_officer_list_without_a_director_on_its_first_page_is_only_noted() {
+        let mut f = Findings::new();
+        let page = json!({"next_start_index": 100, "items": [
+            {"name": "OLD", "officer_role": "director", "resigned_on": "2010-01-01"}
+        ]});
+        officer_checks(&mut f, &page, Some("ltd"), day("2026-10-18"));
+        assert!(
+            f.observations.iter().all(|o| o["level"] == "note"),
+            "{:?}",
+            f.observations
+        );
+    }
+
+    #[test]
+    fn officers_are_judged_by_the_company_type() {
+        let mut f = Findings::new();
+        let page = json!({"items": [{"name": "M", "officer_role": "managing-officer"}]});
+        officer_checks(
+            &mut f,
+            &page,
+            Some("registered-overseas-entity"),
+            day("2026-10-18"),
+        );
+        assert!(f.observations.is_empty(), "{:?}", f.observations);
+
+        let mut f = Findings::new();
+        let page = json!({"items": [{"name": "C LTD", "officer_role": "corporate-director"}]});
+        officer_checks(&mut f, &page, Some("oversea-company"), day("2026-10-18"));
+        assert!(
+            f.observations.is_empty(),
+            "the person-director rule is for UK companies: {:?}",
+            f.observations
+        );
+
+        let mut f = Findings::new();
+        officer_checks(
+            &mut f,
+            &json!({"items": []}),
+            Some("royal-charter"),
+            day("2026-10-18"),
+        );
+        assert_eq!(levels(&f), vec![("officers".into(), "note".into())]);
+    }
+
+    #[test]
+    fn live_statuses_of_entities_and_branches_are_not_flagged() {
+        for status in ["active", "registered", "open"] {
+            let mut f = Findings::new();
+            profile_checks(
+                &mut f,
+                &json!({"company_status": status, "date_of_creation": "2015-03-01"}),
+                day("2026-10-18"),
+            );
+            assert!(f.observations.is_empty(), "{status}: {:?}", f.observations);
+        }
+    }
+
+    #[test]
+    fn open_charges_count_every_charge_not_just_the_first_page() {
+        let mut f = Findings::new();
+        charges_checks(
+            &mut f,
+            Some(
+                json!({"total": 150, "satisfied_count": 100, "next_start_index": 100,
+                        "items": [{"status": "fully-satisfied", "persons_entitled": ["Old Bank"]}]}),
+            ),
+        );
+        assert_eq!(
+            f.observations,
+            vec![json!({"check": "charges", "level": "note",
+                        "detail": "charges not satisfied: 50; see list_charges"})]
+        );
+    }
+
+    #[test]
+    fn verification_reads_the_statement_dates() {
+        let today = day("2026-10-18");
+        let with = |iv: Value| json!({"identity_verification": iv});
+        assert_eq!(
+            verification(
+                &with(json!({"appointment_verification_start_on": "2025-11-18"})),
+                today
+            ),
+            Verification::OnRecord
+        );
+        assert_eq!(
+            verification(
+                &with(json!({"appointment_verification_start_on": "2025-11-18",
+                             "appointment_verification_end_on": "9999-12-31"})),
+                today
+            ),
+            Verification::OnRecord
+        );
+        assert_eq!(
+            verification(
+                &with(json!({"appointment_verification_statement_due_on": "2026-01-01"})),
+                today
+            ),
+            Verification::Overdue("2026-01-01".into())
+        );
+        assert_eq!(
+            verification(
+                &with(json!({"appointment_verification_statement_due_on": "2027-01-01"})),
+                today
+            ),
+            Verification::NotOnRecord
+        );
+        assert_eq!(verification(&json!({}), today), Verification::NotOnRecord);
+    }
+
+    #[test]
+    fn identity_checks_count_people_in_charge_and_flag_overdue_statements() {
+        let mut f = Findings::new();
+        let officers = json!({"items": [
+            {"name": "A", "officer_role": "director",
+             "identity_verification": {"appointment_verification_start_on": "2025-11-18"}},
+            {"name": "B", "officer_role": "director",
+             "identity_verification": {"appointment_verification_statement_due_on": "2026-02-01"}},
+            {"name": "C LTD", "officer_role": "corporate-director"},
+            {"name": "D", "officer_role": "secretary"},
+            {"name": "E", "officer_role": "director", "resigned_on": "2020-01-01"},
+        ]});
+        let pscs = json!({"items": [
+            {"name": "P", "kind": "individual"},
+            {"name": "Q LTD", "kind": "corporate-entity"},
+        ]});
+        identity_checks(
+            &mut f,
+            Some(&officers),
+            Some(&pscs),
+            Some("ltd"),
+            day("2026-10-18"),
+        );
+        assert_eq!(
+            levels(&f),
+            vec![
+                ("identity_verification".into(), "flag".into()),
+                ("identity_verification".into(), "note".into())
+            ]
+        );
+        let text = serde_json::to_string(&f.observations).unwrap();
+        assert!(text.contains("overdue for: B (due 2026-02-01)"), "{text}");
+        assert!(
+            text.contains("1 of 2 officers in charge who are people, 0 of 1 individual PSCs"),
+            "{text}"
+        );
     }
 
     #[test]

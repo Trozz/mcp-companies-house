@@ -258,8 +258,62 @@ impl Caller {
     }
 }
 
+/// One result of `/search`, which mixes companies, officers and disqualified officers: shaped
+/// as the per-kind searches shape it, with `kind` saying which it is.
+fn any_search_item(item: &Value) -> Value {
+    let kind = item.get("kind").and_then(Value::as_str).unwrap_or("");
+    let (label, mut shaped) = match kind {
+        "searchresults#company" => ("company", search_item(item)),
+        "searchresults#officer" => ("officer", crate::view::people::officer_search_item(item)),
+        "searchresults#disqualified-officer" => (
+            "disqualified_officer",
+            crate::view::people::disqualified_search_item(item),
+        ),
+        other => (
+            other.strip_prefix("searchresults#").unwrap_or("other"),
+            crate::view::object(vec![
+                ("name", item.get("title").cloned()),
+                ("description", item.get("description").cloned()),
+            ]),
+        ),
+    };
+    if let Value::Object(map) = &mut shaped {
+        map.insert("kind".into(), json!(label));
+    }
+    shaped
+}
+
 #[tool_router(router = search_router, vis = "pub(crate)")]
 impl CompaniesServer {
+    #[tool(
+        description = "Search the whole register at once: companies, officers and disqualified officers matching a name, best match first, each with kind (company, officer or disqualified_officer) and the id the other tools take (company_number, officer_id, or officer_id and officer_kind). The kinds share one list, so search_companies, search_officers or search_disqualified_officers give more results of one kind.",
+        annotations(read_only_hint = true, idempotent_hint = true, open_world_hint = true)
+    )]
+    pub async fn search_all(
+        &self,
+        Parameters(p): Parameters<crate::tools::people::SearchPeopleParams>,
+        Extension(parts): Extension<Parts>,
+    ) -> Result<CallToolResult, McpError> {
+        tracing::debug!(args = ?p, "search_all");
+        run("search_all", async {
+            let c = self.caller(&parts)?;
+            let query = required_text("query", &p.query)?;
+            let limit = limit_arg(p.limit)?;
+            let out = c
+                .search_page(
+                    "search_all",
+                    &["search"],
+                    vec![("q", query)],
+                    limit,
+                    p.start_index.unwrap_or(0),
+                    any_search_item,
+                )
+                .await?;
+            Ok(json_result(&out))
+        })
+        .await
+    }
+
     #[tool(
         description = "Search the Companies House register by company name or number, best match first. Returns company number, name, status, type, incorporation date and registered office address for each match. Use get_company for the full record, and filter_companies to filter by status, type, SIC code, location or dates.",
         annotations(read_only_hint = true, idempotent_hint = true, open_world_hint = true)

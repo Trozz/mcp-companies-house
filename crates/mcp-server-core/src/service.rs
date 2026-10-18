@@ -130,8 +130,10 @@ const SESSION_HEADER: &str = "mcp-session-id";
 /// Bounds on the session-owner table of one mount.
 #[derive(Debug, Clone, Copy)]
 struct SessionLimits {
-    /// Sessions remembered at once. When full, entries of sessions rmcp has ended are dropped;
-    /// if none has ended, new sessions are refused rather than pushing out someone else's.
+    /// Sessions remembered at once. When full, idle entries and those of sessions rmcp has ended
+    /// are swept first; then the owner holding the most (more than the newcomer's count plus
+    /// one) gives up its least recently used session, or a newcomer holding at least as many as
+    /// anyone else gives up its own. Only when shares are about even are new sessions refused.
     total: usize,
     /// Sessions one credential may hold; opening another closes its own least recently used one.
     per_owner: usize,
@@ -229,6 +231,17 @@ impl Table {
             .filter(|(_, n)| *n > mine + 1)
             .map(|(owner, _)| owner)
     }
+
+    /// Whose least recently used session makes room for a new one of `who` in a full table:
+    /// whoever holds the most, or `who` itself when it already holds as many as anyone, so a
+    /// heavy user replaces its own sessions instead of being refused.
+    fn room_for(&self, who: Who) -> Option<Who> {
+        self.fair_share_room(who).or_else(|| {
+            let mine = self.count(who);
+            let largest = self.largest_other(who).map_or(0, |(_, n)| n);
+            (who.is_some() && mine > 0 && mine >= largest).then_some(who)
+        })
+    }
 }
 
 /// Whether a request may use the session it names.
@@ -301,7 +314,7 @@ impl SessionOwners {
         table.sessions.len() >= self.limits.total
             && !self.sweep_due(&table)
             && !(who.is_some() && table.count(who) >= self.limits.per_owner)
-            && table.fair_share_room(who).is_none()
+            && table.room_for(who).is_none()
     }
 
     /// Records a new session `id` opened by `who`. `live` is the set of sessions rmcp still
@@ -336,7 +349,7 @@ impl SessionOwners {
         if table.sessions.len() >= limits.total {
             // Take a slot from whoever holds the most, never from someone with fewer than
             // the newcomer would have.
-            let Some(owner) = table.fair_share_room(who) else {
+            let Some(owner) = table.room_for(who) else {
                 return Admission {
                     admitted: false,
                     dropped,
@@ -615,6 +628,24 @@ mod tests {
         assert!(o.refuse_early(c));
         assert!(!o.refuse_early(a));
         assert_eq!(o.admit("a2", a, None), ok(&["a1"]));
+    }
+
+    #[test]
+    fn the_largest_holder_below_its_cap_replaces_its_own_sessions() {
+        let o = owners(4, 10);
+        let (a, b) = (Some([1; 32]), Some([2; 32]));
+        for id in ["a1", "a2", "a3"] {
+            assert_eq!(o.admit(id, a, None), ok(&[]));
+        }
+        assert_eq!(o.admit("b1", b, None), ok(&[]));
+        let all = live(&["a1", "a2", "a3", "b1"]);
+        assert!(!o.refuse_early(a), "a holds the most, so it is not refused");
+        assert_eq!(
+            o.admit("a4", a, Some(&all)),
+            ok(&["a1"]),
+            "a full table makes room from a's own oldest"
+        );
+        assert_eq!(o.admit("b2", b, None), ok(&["a2"]), "b still takes from a");
     }
 
     #[test]

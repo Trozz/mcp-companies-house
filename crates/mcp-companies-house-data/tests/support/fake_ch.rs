@@ -418,6 +418,37 @@ fn search(state: &FakeState, query: &[(String, String)]) -> (u16, Value) {
     )
 }
 
+/// `/search`: companies, officers and disqualified officers in one list, paged like the other
+/// searches.
+fn search_everything(state: &FakeState, query: &[(String, String)]) -> (u16, Value) {
+    let mut all_of: Vec<(String, String)> =
+        query.iter().filter(|(k, _)| k == "q").cloned().collect();
+    all_of.push(("items_per_page".into(), "100".into()));
+    all_of.push(("start_index".into(), "0".into()));
+    let mut all: Vec<Value> = Vec::new();
+    for (_, found) in [
+        search(state, &all_of),
+        super::fake_records::officer_search(&all_of),
+        super::fake_records::disqualified_search(&all_of),
+    ] {
+        all.extend(found["items"].as_array().cloned().unwrap_or_default());
+    }
+    let Some((start, size)) = super::fake_records::search_offset(query) else {
+        return (416, Value::Null);
+    };
+    let total = all.len();
+    (
+        200,
+        json!({
+            "kind": "search#all",
+            "items": all.into_iter().skip(start).take(size).collect::<Vec<_>>(),
+            "items_per_page": size,
+            "start_index": start,
+            "total_results": total,
+        }),
+    )
+}
+
 fn advanced(state: &FakeState, query: &[(String, String)]) -> (u16, Value) {
     let includes = param(query, "company_name_includes").map(str::to_lowercase);
     let excludes = param(query, "company_name_excludes").map(str::to_lowercase);
@@ -660,6 +691,7 @@ async fn handle(
         _ => {}
     }
     let (status, body) = match segments.as_slice() {
+        ["search"] => search_everything(&st, &query),
         ["search", "companies"] => search(&st, &query),
         ["advanced-search", "companies"] => advanced(&st, &query),
         ["search", "officers"] => super::fake_records::officer_search(&query),

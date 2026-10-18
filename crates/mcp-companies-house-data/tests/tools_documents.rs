@@ -259,3 +259,54 @@ fn only_the_live_api_gets_the_live_document_api_by_default() {
     );
     assert!(sandbox.documents.is_none());
 }
+
+#[tokio::test]
+async fn downloads_are_refused_while_the_servers_document_budget_is_spent() {
+    let fake = fake().await;
+    let client = support::tools::client(&fake);
+    let srv = CompaniesServer::new(client.clone());
+    let held = client
+        .reserve_document(mcp_companies_house_data::api::DOCUMENT_BUDGET_BYTES)
+        .unwrap();
+    let e = error_text(
+        &srv.download_filing_document(params(json!({"document_id": "doc-tx4"})), auth())
+            .await
+            .unwrap(),
+    );
+    assert!(
+        e.starts_with("rate_limited: the server is downloading too many documents"),
+        "{e}"
+    );
+    drop(held);
+    let r = srv
+        .download_filing_document(params(json!({"document_id": "doc-tx4"})), auth())
+        .await
+        .unwrap();
+    assert_eq!(json(&r)["format"], "pdf");
+}
+
+#[tokio::test]
+async fn a_failed_content_request_is_sent_once_more() {
+    let fake = fake().await;
+    // The metadata answers normally, the content request fails once, then succeeds.
+    fake.inject(Injected::json(
+        200,
+        json!({"resources": {"application/pdf": {"content_length": 10}}}),
+    ));
+    fake.inject(Injected::status(503));
+    let r = server(&fake)
+        .download_filing_document(params(json!({"document_id": "doc-tx4"})), auth())
+        .await
+        .unwrap();
+    assert_eq!(json(&r)["format"], "pdf");
+    let paths: Vec<String> = fake.requests().into_iter().map(|r| r.path).collect();
+    assert_eq!(
+        paths,
+        vec![
+            "/docapi/document/doc-tx4",
+            "/docapi/document/doc-tx4/content",
+            "/docapi/document/doc-tx4/content",
+            "/storage/doc-tx4"
+        ]
+    );
+}

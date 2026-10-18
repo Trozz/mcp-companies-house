@@ -43,6 +43,29 @@ pub enum OfficerOrder {
     Surname,
 }
 
+/// The kind of officer `list_officers` can be limited to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+#[serde(rename_all = "snake_case")]
+pub enum OfficerKind {
+    /// Directors, corporate directors and nominee directors.
+    Directors,
+    /// Secretaries and corporate secretaries.
+    Secretaries,
+    /// LLP members and designated members, people or corporate.
+    LlpMembers,
+}
+
+impl OfficerKind {
+    fn matches(self, role: &str) -> bool {
+        match self {
+            OfficerKind::Directors => role.contains("director"),
+            OfficerKind::Secretaries => role.contains("secretary"),
+            OfficerKind::LlpMembers => role.contains("llp-") && role.contains("member"),
+        }
+    }
+}
+
 #[derive(Debug, Deserialize, JsonSchema)]
 #[schemars(crate = "rmcp::schemars")]
 pub struct ListOfficersParams {
@@ -50,8 +73,10 @@ pub struct ListOfficersParams {
     pub company_number: String,
     /// Sort order. Default: Companies House's own order.
     pub order_by: Option<OfficerOrder>,
-    /// true: only officers still in post. Companies House cannot filter officers, so the list is read from start_index (up to 500 officers) until the page is full; officers_read says how many were read and next_start_index continues from there. Default: false (current and resigned).
+    /// true: only officers still in post (not resigned). A dissolved or closed company has none. Default: false (current and resigned).
     pub current_only: Option<bool>,
+    /// Only this kind of officer: directors, secretaries or llp_members. Companies House cannot filter by kind, so the list is read from start_index (up to 500 officers) until the page is full; officers_read says how many were read and next_start_index continues from there.
+    pub role: Option<OfficerKind>,
     /// Results per page, 1 to 100. Default: 20.
     pub limit: Option<u32>,
     /// Index of the first result, from 0. Pass next_start_index from the previous page. Default: 0.
@@ -154,20 +179,24 @@ fn with_counts(mut page: Value, source: &Value, keys: &[&str]) -> Value {
     page
 }
 
-/// A name for comparison: lower case, without titles or commas, words sorted, so that
-/// "SMITH, Jane Anne" and "Mrs Jane Anne Smith" compare equal.
+/// A name for comparison: forenames then surname, lower case, without titles or full stops, so
+/// that "SMITH, Jane Anne" and "Mrs Jane Anne Smith" compare equal but "James THOMAS" and
+/// "Thomas JAMES" do not.
 fn name_key(name: &str) -> Vec<String> {
     const TITLES: &[&str] = &[
         "mr", "mrs", "ms", "miss", "mx", "dr", "sir", "dame", "lord", "lady", "prof",
     ];
-    let mut words: Vec<String> = name
-        .replace([',', '.'], " ")
+    // Companies House writes officer names as "SURNAME, Forenames".
+    let ordered = match name.split_once(',') {
+        Some((surname, forenames)) => format!("{forenames} {surname}"),
+        None => name.to_string(),
+    };
+    ordered
+        .replace(['.', ','], " ")
         .split_whitespace()
         .map(str::to_lowercase)
         .filter(|w| !TITLES.contains(&w.as_str()))
-        .collect();
-    words.sort();
-    words
+        .collect()
 }
 
 /// One search result on a line, for listing candidates in a message.
@@ -202,19 +231,37 @@ fn is_current(appointment: &Value) -> bool {
 }
 
 impl Caller {
-    /// Officers still in post, from position `start` of the company's officer list: pages are
-    /// read until `limit` are found, the list ends or [`MAX_OFFICER_READS`] pages were read.
-    pub(crate) async fn current_officers_page(
+    /// The officers in post (`current_only`) and/or of one kind (`role`), from position `start`
+    /// of the company's officer list. Companies House filters officers in post itself
+    /// (`filter=active`, not in its published specification) but not by kind, so pages are read
+    /// until `limit` are found, the list ends or [`MAX_OFFICER_READS`] pages were read; every
+    /// row is also checked here, in case the filter is ignored.
+    pub(crate) async fn filtered_officers_page(
         &self,
         number: &str,
         order_by: Option<&'static str>,
+        current_only: bool,
+        role: Option<OfficerKind>,
         limit: u32,
         start: u32,
     ) -> error::Result<Value> {
+        let wanted = |item: &Value| {
+            let role_ok = role.is_none_or(|r| {
+                r.matches(
+                    item.get("officer_role")
+                        .and_then(Value::as_str)
+                        .unwrap_or(""),
+                )
+            });
+            role_ok && (!current_only || item.get("resigned_on").is_none())
+        };
         let mut found: Vec<Value> = Vec::new();
         let mut first: Option<Value> = None;
         let mut position = start;
         let mut next: Option<u32> = None;
+        let mut filter = current_only;
+        let mut filtered_upstream = current_only;
+        let mut total: u64 = 0;
         'read: for _ in 0..MAX_OFFICER_READS {
             let mut q: Query = vec![
                 ("items_per_page", READ_PAGE.to_string()),
@@ -223,21 +270,46 @@ impl Caller {
             if let Some(o) = order_by {
                 q.push(("order_by", o.to_string()));
             }
-            let page = self
+            if filter {
+                q.push(("filter", "active".to_string()));
+            }
+            let page = match self
                 .get_optional("company_officers", &["company", number, "officers"], &q)
-                .await?
-                .unwrap_or_default();
-            let total = count(&page, &["total_results"]).unwrap_or(0);
+                .await
+            {
+                // An environment without the filter refuses it: read the whole list instead.
+                Err(ChError::Validation(_)) if filter && first.is_none() => {
+                    filter = false;
+                    filtered_upstream = false;
+                    q.retain(|(k, _)| *k != "filter");
+                    self.get_optional("company_officers", &["company", number, "officers"], &q)
+                        .await?
+                        .unwrap_or_default()
+                }
+                other => other?.unwrap_or_default(),
+            };
+            total = count(&page, &["total_results"]).unwrap_or(0);
             let listed = items(&page).to_vec();
             if first.is_none() {
+                // A closed company's officers are inactive, not in post, though none resigned.
+                let active = page.get("active_count").and_then(Value::as_u64);
+                let inactive = page.get("inactive_count").and_then(Value::as_u64);
+                let closed = current_only && active == Some(0) && inactive.is_some_and(|n| n > 0);
                 first = Some(page);
+                if closed {
+                    next = None;
+                    break;
+                }
             }
             if listed.is_empty() {
                 next = None;
                 break;
             }
+            if listed.iter().any(|i| i.get("resigned_on").is_some()) {
+                filtered_upstream = false;
+            }
             for (i, item) in listed.iter().enumerate() {
-                if item.get("resigned_on").is_none() {
+                if wanted(item) {
                     found.push(officer_item(item));
                     if found.len() == limit as usize {
                         let after = position + i as u32 + 1;
@@ -255,6 +327,10 @@ impl Caller {
         }
         let first = first.unwrap_or_default();
         let mut out = Map::new();
+        // With only the upstream filter applied, the list read is exactly the result.
+        if filtered_upstream && role.is_none() {
+            out.insert("total".into(), json!(total));
+        }
         for key in ["active_count", "resigned_count", "inactive_count"] {
             if let Some(n) = first.get(key).filter(|n| n.is_u64()) {
                 out.insert(key.to_string(), n.clone());
@@ -263,6 +339,17 @@ impl Caller {
         out.insert("start_index".into(), json!(start));
         out.insert("count".into(), json!(found.len()));
         out.insert("officers_read".into(), json!(position - start));
+        let inactive = first.get("inactive_count").and_then(Value::as_u64);
+        if current_only
+            && found.is_empty()
+            && first.get("active_count").and_then(Value::as_u64) == Some(0)
+            && inactive.is_some_and(|n| n > 0)
+        {
+            out.insert(
+                "note".into(),
+                json!("the company is closed, so none of its officers is in post; list them without current_only"),
+            );
+        }
         if let Some(n) = next {
             out.insert("next_start_index".into(), json!(n));
             if found.len() < limit as usize {
@@ -339,7 +426,9 @@ impl Caller {
 
     /// Why a company lists no persons with significant control and no PSC statements: an
     /// exemption, or a gap.
-    pub(crate) async fn psc_absence_note(&self, number: &str) -> String {
+    /// `ceased`: the company lists former PSCs, so the wording speaks of current ones.
+    pub(crate) async fn psc_absence_note(&self, number: &str, ceased: bool) -> String {
+        let qualifier = if ceased { "current " } else { "" };
         match self.exemptions_record(number).await {
             Ok(found) => {
                 let current: Vec<String> = found
@@ -355,7 +444,9 @@ impl Caller {
                     })
                     .unwrap_or_default();
                 if current.is_empty() {
-                    "Companies House records no person with significant control, no PSC statement and no PSC exemption for this company. A UK company or LLP should have filed one of these, so this may be a gap in the register; some kinds of company, such as overseas companies, do not report PSCs".to_string()
+                    format!(
+                        "Companies House records no {qualifier}person with significant control, no current PSC statement and no PSC exemption for this company. A UK company or LLP should have filed one of these, so this may be a gap in the register; some kinds of company, such as overseas companies, do not report PSCs"
+                    )
                 } else {
                     format!(
                         "no persons with significant control are listed because the company is exempt from the PSC rules: {}",
@@ -364,7 +455,7 @@ impl Caller {
                 }
             }
             Err(e) => format!(
-                "Companies House lists no person with significant control and no PSC statement; whether the company is exempt could not be checked ({}: {e})",
+                "Companies House lists no {qualifier}person with significant control and no current PSC statement; whether the company is exempt could not be checked ({}: {e})",
                 e.kind()
             ),
         }
@@ -440,6 +531,17 @@ impl Caller {
                         let found = found.unwrap_or_default();
                         let statements: Vec<Value> =
                             items(&found).iter().map(psc_statement_item).collect();
+                        let total = count(&found, &["total_results"]);
+                        if let Some(total) = total.filter(|t| *t > statements.len() as u64) {
+                            map.insert("statements_total".into(), json!(total));
+                            map.insert(
+                                "statements_note".into(),
+                                json!(format!(
+                                    "only the newest {} of {total} PSC statements are listed",
+                                    statements.len()
+                                )),
+                            );
+                        }
                         map.insert("statements".into(), Value::Array(statements));
                     }
                     Err(e) => {
@@ -459,7 +561,7 @@ impl Caller {
 #[tool_router(router = people_router, vis = "pub(crate)")]
 impl CompaniesServer {
     #[tool(
-        description = "List a company's officers (directors, secretaries, LLP members and others), current and resigned: role, appointment and resignation dates, occupation, nationality, country of residence, month and year of birth, correspondence address, and officer_id for get_officer_appointments. active_count and resigned_count give the totals. current_only lists only officers still in post.",
+        description = "List a company's officers (directors, secretaries, LLP members and others), current and resigned: role, appointment and resignation dates, occupation, nationality, country of residence, month and year of birth, correspondence address, and officer_id for get_officer_appointments. active_count and resigned_count give the totals. current_only lists only officers in post, role only directors, secretaries or LLP members.",
         annotations(read_only_hint = true, idempotent_hint = true, open_world_hint = true)
     )]
     pub async fn list_officers(
@@ -477,9 +579,17 @@ impl CompaniesServer {
                 OfficerOrder::ResignedOn => "resigned_on",
                 OfficerOrder::Surname => "surname",
             });
-            let out = if p.current_only == Some(true) {
-                c.current_officers_page(&number, order, limit_arg(p.limit)?, start)
-                    .await?
+            let current_only = p.current_only == Some(true);
+            let out = if current_only || p.role.is_some() {
+                c.filtered_officers_page(
+                    &number,
+                    order,
+                    current_only,
+                    p.role,
+                    limit_arg(p.limit)?,
+                    start,
+                )
+                .await?
             } else {
                 if let Some(o) = order {
                     q.push(("order_by", o.to_string()));
@@ -698,7 +808,10 @@ impl CompaniesServer {
                 if out.get("statements").is_some()
                     && let Value::Object(map) = &mut out
                 {
-                    map.insert("note".into(), json!(c.psc_absence_note(&number).await));
+                    map.insert(
+                        "note".into(),
+                        json!(c.psc_absence_note(&number, false).await),
+                    );
                 }
             }
             Ok(json_result(&out))
@@ -804,6 +917,8 @@ mod tests {
         );
         assert_eq!(name_key("Dr. Jane  SMITH"), name_key("jane smith"));
         assert_ne!(name_key("Jane Smith"), name_key("Jane Anne Smith"));
+        assert_ne!(name_key("Thomas JAMES"), name_key("James THOMAS"));
+        assert_eq!(name_key("JAMES, Thomas"), name_key("Thomas James"));
     }
 
     #[test]
