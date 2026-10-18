@@ -115,7 +115,7 @@ async fn correct_credential_redirects_with_code_and_state() {
     let app = app(st.clone());
     let html = login_page(&app, &client_id(&st)).await;
     let res = send(&app, post(&form_fields(&html, KEY))).await;
-    assert_eq!(res.status(), StatusCode::FOUND);
+    assert_eq!(res.status(), StatusCode::SEE_OTHER);
     assert_eq!(res.headers()["cache-control"], "no-store");
     let loc = url::Url::parse(res.headers()["location"].to_str().unwrap()).unwrap();
     assert_eq!(loc.host_str(), Some("app.example.com"));
@@ -159,6 +159,12 @@ async fn implausible_credentials_are_rejected_without_asking_upstream() {
         assert_eq!(res.status(), StatusCode::UNAUTHORIZED, "{bad:?}");
     }
     assert_eq!(v.checks(), 0);
+    // None of that counts as a failed attempt, so the person can still sign in.
+    for _ in 0..10 {
+        send(&app, post(&form_fields(&html, "x y"))).await;
+    }
+    let res = send(&app, post(&form_fields(&html, KEY))).await;
+    assert_eq!(res.status(), StatusCode::SEE_OTHER);
 }
 
 #[tokio::test]
@@ -177,7 +183,7 @@ async fn an_unavailable_check_is_503_and_not_a_failed_attempt() {
     }
     // Six unavailable checks did not use up the five allowed failures.
     let res = send(&app, post(&form_fields(&html, KEY))).await;
-    assert_eq!(res.status(), StatusCode::FOUND);
+    assert_eq!(res.status(), StatusCode::SEE_OTHER);
 }
 
 #[tokio::test]
@@ -294,7 +300,7 @@ async fn forwarded_for_is_honoured_from_trusted_proxy() {
         "203.0.113.9, 198.51.100.2, 10.0.0.1",
     )
     .await;
-    assert_eq!(status, StatusCode::FOUND);
+    assert_eq!(status, StatusCode::SEE_OTHER);
     let status = fail_five_times_then_try(st, "198.51.100.3", "198.51.100.3").await;
     assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
 }
@@ -374,7 +380,7 @@ async fn granted_scope_is_the_resource_service() {
         }
     }
     let res = send(&app, post(&fields)).await;
-    assert_eq!(res.status(), StatusCode::FOUND);
+    assert_eq!(res.status(), StatusCode::SEE_OTHER);
     let loc = url::Url::parse(res.headers()["location"].to_str().unwrap()).unwrap();
     let q: std::collections::HashMap<_, _> = loc.query_pairs().into_owned().collect();
     let code = st.jwt.verify(&q["code"], TokenKind::Code).unwrap();
@@ -393,7 +399,7 @@ async fn empty_state_is_omitted_from_redirect() {
         query(&client_id(&st), "https://app.example.com/cb").replace("state=st%3Cate%3E", "state=");
     let html = body_text(send(&app, get(&format!("/authorize?{q}"))).await).await;
     let res = send(&app, post(&form_fields(&html, KEY))).await;
-    assert_eq!(res.status(), StatusCode::FOUND);
+    assert_eq!(res.status(), StatusCode::SEE_OTHER);
     let loc = url::Url::parse(res.headers()["location"].to_str().unwrap()).unwrap();
     assert!(loc.query_pairs().any(|(k, _)| k == "code"));
     assert!(!loc.query_pairs().any(|(k, _)| k == "state"), "{loc}");

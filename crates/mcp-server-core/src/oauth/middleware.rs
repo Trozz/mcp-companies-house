@@ -1,6 +1,7 @@
 use super::AuthState;
 use super::authorize::client_ip;
 use crate::credential::{self, Credential, CredentialCheck};
+use crate::guards::Reservation;
 use crate::jwt::TokenKind;
 use axum::extract::{ConnectInfo, Request, State};
 use axum::http::{HeaderValue, StatusCode, header};
@@ -35,6 +36,15 @@ fn unavailable(st: &AuthState, why: &str) -> Response {
     res
 }
 
+/// The token of an `Authorization: Bearer <token>` value. The scheme is case-insensitive.
+fn bearer_token(value: &str) -> Option<&str> {
+    let (scheme, rest) = value.trim().split_once(|c: char| c.is_ascii_whitespace())?;
+    scheme
+        .eq_ignore_ascii_case("bearer")
+        .then(|| rest.trim())
+        .filter(|t| !t.is_empty())
+}
+
 /// An OAuth token from this server is a JWT; a credential sent directly is not.
 fn looks_like_jwt(token: &str) -> bool {
     token.split('.').count() == 3
@@ -53,8 +63,8 @@ pub async fn require_bearer(
         .headers()
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer "))
-        .map(|t| t.trim().to_owned());
+        .and_then(bearer_token)
+        .map(str::to_owned);
     let Some(token) = token.filter(|t| !t.is_empty()) else {
         return unauthorized(&st, &service, false);
     };
@@ -79,7 +89,7 @@ pub async fn require_bearer(
         return next.run(req).await;
     }
 
-    if !credential::plausible(&token) {
+    if !st.verifier.plausible(&token) {
         return unauthorized(&st, &service, true);
     }
     let fingerprint = credential::fingerprint(&token);
@@ -92,32 +102,47 @@ pub async fn require_bearer(
                 .get::<ConnectInfo<SocketAddr>>()
                 .map(|c| c.0.ip());
             let ip = client_ip(peer, req.headers(), &st.settings.trusted_proxies);
-            if st.limiter.is_blocked(ip) {
-                metrics::counter!("bearer_credential_checks_total", "outcome" => "rate_limited")
-                    .increment(1);
-                return (
-                    StatusCode::TOO_MANY_REQUESTS,
-                    "Too many rejected credentials. Wait a minute and try again.",
-                )
-                    .into_response();
-            }
-            match st.verifier.check(&token).await {
+            // A request joining a check that is already running shares its verdict and is not
+            // counted again; any other attempt counts before it goes upstream, so concurrent
+            // attempts cannot get past the limit.
+            let reservation: Option<Reservation> = if st.checks.is_running(&fingerprint) {
+                None
+            } else {
+                match st.limiter.try_reserve(ip) {
+                    Some(r) => Some(r),
+                    None => {
+                        metrics::counter!("bearer_credential_checks_total", "outcome" => "rate_limited")
+                            .increment(1);
+                        return (
+                            StatusCode::TOO_MANY_REQUESTS,
+                            "Too many rejected credentials. Wait a minute and try again.",
+                        )
+                            .into_response();
+                    }
+                }
+            };
+            match st.checks.check(st.verifier.as_ref(), &token).await {
                 CredentialCheck::Valid => {
                     metrics::counter!("bearer_credential_checks_total", "outcome" => "valid")
                         .increment(1);
+                    if let Some(r) = reservation {
+                        st.limiter.refund(r);
+                    }
                     st.bearer_checks.put(fingerprint, true);
                 }
                 CredentialCheck::Invalid(_) => {
                     metrics::counter!("bearer_credential_checks_total", "outcome" => "invalid")
                         .increment(1);
                     st.bearer_checks.put(fingerprint, false);
-                    st.limiter.record_failure(ip);
                     tracing::warn!(%ip, "bearer credential rejected");
                     return unauthorized(&st, &service, true);
                 }
                 CredentialCheck::Unavailable(why) => {
                     metrics::counter!("bearer_credential_checks_total", "outcome" => "unavailable")
                         .increment(1);
+                    if let Some(r) = reservation {
+                        st.limiter.refund(r);
+                    }
                     tracing::warn!(reason = %why, "bearer credential could not be checked");
                     return unavailable(&st, &why);
                 }
@@ -126,4 +151,19 @@ pub async fn require_bearer(
     }
     req.extensions_mut().insert(Credential::new(token));
     next.run(req).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::bearer_token;
+
+    #[test]
+    fn the_bearer_scheme_is_case_insensitive() {
+        for v in ["Bearer abc", "bearer abc", "BEARER  abc ", "Bearer\tabc"] {
+            assert_eq!(bearer_token(v), Some("abc"), "{v:?}");
+        }
+        for v in ["Basic abc", "Bearer", "Bearer   ", "Bearerabc", ""] {
+            assert_eq!(bearer_token(v), None, "{v:?}");
+        }
+    }
 }

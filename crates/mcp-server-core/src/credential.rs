@@ -18,8 +18,9 @@ use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+use tokio::sync::{OnceCell, Semaphore};
 
 /// Longest credential accepted, as a bound on what is sent upstream and sealed.
 pub const MAX_CREDENTIAL_LEN: usize = 256;
@@ -74,6 +75,12 @@ pub trait CredentialVerifier: Send + Sync + 'static {
     fn label(&self) -> &'static str;
     /// One sentence of help under the field, plain text: what it is and where to get one.
     fn help(&self) -> &'static str;
+    /// Whether `credential` has the shape of one, checked before anything is sent upstream.
+    /// Defaults to [`plausible`]; narrow it when the upstream service's credentials have a known
+    /// form, so other tokens are refused locally instead of being forwarded.
+    fn plausible(&self, credential: &str) -> bool {
+        plausible(credential)
+    }
     /// Checks `credential` with the upstream service.
     fn check<'a>(&'a self, credential: &'a str) -> CheckFuture<'a>;
 }
@@ -189,13 +196,86 @@ impl CheckCache {
             self.invalid_for
         };
         let mut entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
-        if entries.len() >= self.max_entries {
+        if entries.len() >= self.max_entries && !entries.contains_key(&fingerprint) {
             entries.retain(|_, (expires, _)| *expires > now);
+            // Rejected keys go first, so a burst of junk never pushes out keys that work.
             if entries.len() >= self.max_entries {
-                entries.clear();
+                entries.retain(|_, (_, valid)| *valid);
+            }
+            if entries.len() >= self.max_entries {
+                if !valid {
+                    return;
+                }
+                if let Some(oldest) = entries
+                    .iter()
+                    .min_by_key(|(_, (expires, _))| *expires)
+                    .map(|(k, _)| *k)
+                {
+                    entries.remove(&oldest);
+                }
             }
         }
         entries.insert(fingerprint, (now + ttl, valid));
+    }
+}
+
+/// Runs upstream credential checks: one check at a time per credential (concurrent requests with
+/// the same one share its verdict), at most `max_running` at once, each bounded by `timeout`.
+pub struct CheckRunner {
+    permits: Semaphore,
+    timeout: Duration,
+    running: Mutex<HashMap<[u8; 32], Arc<OnceCell<CredentialCheck>>>>,
+}
+
+impl CheckRunner {
+    pub fn new(max_running: usize, timeout: Duration) -> Self {
+        CheckRunner {
+            permits: Semaphore::new(max_running),
+            timeout,
+            running: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Whether a check of this credential is already running, so a new request will share it.
+    pub fn is_running(&self, fingerprint: &[u8; 32]) -> bool {
+        self.running
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains_key(fingerprint)
+    }
+
+    pub async fn check(
+        &self,
+        verifier: &dyn CredentialVerifier,
+        credential: &str,
+    ) -> CredentialCheck {
+        let fp = fingerprint(credential);
+        let cell = self
+            .running
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entry(fp)
+            .or_insert_with(|| Arc::new(OnceCell::new()))
+            .clone();
+        let verdict = cell
+            .get_or_init(|| async {
+                let Ok(_permit) = self.permits.try_acquire() else {
+                    return CredentialCheck::Unavailable(
+                        "the server is checking too many keys at once".into(),
+                    );
+                };
+                match tokio::time::timeout(self.timeout, verifier.check(credential)).await {
+                    Ok(verdict) => verdict,
+                    Err(_) => CredentialCheck::Unavailable("the check timed out".into()),
+                }
+            })
+            .await
+            .clone();
+        let mut running = self.running.lock().unwrap_or_else(|e| e.into_inner());
+        if running.get(&fp).is_some_and(|c| Arc::ptr_eq(c, &cell)) {
+            running.remove(&fp);
+        }
+        verdict
     }
 }
 
@@ -310,6 +390,123 @@ mod tests {
         ] {
             assert!(!plausible(bad), "{bad:?}");
         }
+    }
+
+    #[test]
+    fn a_full_cache_drops_rejected_keys_before_working_ones() {
+        let c = CheckCache::new(Duration::from_secs(600), Duration::from_secs(60), 3);
+        c.put([1; 32], true);
+        c.put([2; 32], false);
+        c.put([3; 32], false);
+        c.put([4; 32], false);
+        assert_eq!(
+            c.get(&[1; 32]),
+            Some(true),
+            "junk never pushes out a working key"
+        );
+        c.put([5; 32], true);
+        c.put([6; 32], true);
+        c.put([7; 32], true);
+        assert!(c.entries.lock().unwrap().len() <= 3);
+        assert_eq!(c.get(&[7; 32]), Some(true));
+        c.put([8; 32], false);
+        assert_eq!(
+            c.get(&[8; 32]),
+            None,
+            "a full cache of working keys keeps them"
+        );
+        assert_eq!(c.get(&[7; 32]), Some(true));
+    }
+
+    struct Slow {
+        checks: std::sync::atomic::AtomicUsize,
+        delay: Duration,
+    }
+
+    impl CredentialVerifier for Slow {
+        fn label(&self) -> &'static str {
+            "key"
+        }
+        fn help(&self) -> &'static str {
+            ""
+        }
+        fn check<'a>(&'a self, credential: &'a str) -> CheckFuture<'a> {
+            self.checks
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let ok = credential == "good";
+            let delay = self.delay;
+            Box::pin(async move {
+                tokio::time::sleep(delay).await;
+                if ok {
+                    CredentialCheck::Valid
+                } else {
+                    CredentialCheck::Invalid(None)
+                }
+            })
+        }
+    }
+
+    fn slow(ms: u64) -> Slow {
+        Slow {
+            checks: Default::default(),
+            delay: Duration::from_millis(ms),
+        }
+    }
+
+    #[tokio::test]
+    async fn concurrent_checks_of_one_credential_share_one_upstream_call() {
+        let runner = CheckRunner::new(4, Duration::from_secs(5));
+        let v = slow(50);
+        let all = futures_join(&runner, &v, &["good"; 8]).await;
+        assert!(all.iter().all(|c| *c == CredentialCheck::Valid));
+        assert_eq!(v.checks.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(!runner.is_running(&fingerprint("good")));
+    }
+
+    #[tokio::test]
+    async fn running_checks_are_capped_and_timed_out() {
+        let runner = CheckRunner::new(2, Duration::from_millis(100));
+        let v = slow(300);
+        let all = futures_join(&runner, &v, &["a", "b", "c"]).await;
+        assert_eq!(v.checks.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert!(
+            all.iter()
+                .all(|c| matches!(c, CredentialCheck::Unavailable(_))),
+            "{all:?}"
+        );
+    }
+
+    async fn futures_join(runner: &CheckRunner, v: &Slow, creds: &[&str]) -> Vec<CredentialCheck> {
+        let futs = creds.iter().map(|c| runner.check(v, c));
+        let mut out = Vec::new();
+        let handles: Vec<_> = futs.collect();
+        for verdict in join_all(handles).await {
+            out.push(verdict);
+        }
+        out
+    }
+
+    async fn join_all<F: Future>(futs: Vec<F>) -> Vec<F::Output> {
+        let mut pinned: Vec<Pin<Box<F>>> = futs.into_iter().map(Box::pin).collect();
+        let mut done: Vec<Option<F::Output>> = (0..pinned.len()).map(|_| None).collect();
+        std::future::poll_fn(|cx| {
+            let mut pending = false;
+            for (i, f) in pinned.iter_mut().enumerate() {
+                if done[i].is_none() {
+                    match f.as_mut().poll(cx) {
+                        std::task::Poll::Ready(v) => done[i] = Some(v),
+                        std::task::Poll::Pending => pending = true,
+                    }
+                }
+            }
+            if pending {
+                std::task::Poll::Pending
+            } else {
+                std::task::Poll::Ready(())
+            }
+        })
+        .await;
+        done.into_iter().map(|d| d.unwrap()).collect()
     }
 
     #[test]

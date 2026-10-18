@@ -2,7 +2,7 @@
 use axum::body::Body;
 use axum::http::{Request, Response};
 use http_body_util::BodyExt;
-use mcp_server_core::credential::TestVerifier;
+use mcp_server_core::credential::{CredentialVerifier, TestVerifier};
 use mcp_server_core::oauth::{AuthState, OAuthSettings, oauth_router};
 use std::net::IpAddr;
 use std::sync::Arc;
@@ -42,8 +42,13 @@ pub fn state_with_verifier(verifier: Arc<TestVerifier>) -> Arc<AuthState> {
     state_with(verifier, Vec::new(), &["mail"])
 }
 
+/// The given services, checking credentials with any verifier.
+pub fn state_for(verifier: Arc<dyn CredentialVerifier>, services: &[&str]) -> Arc<AuthState> {
+    state_with(verifier, Vec::new(), services)
+}
+
 fn state_with(
-    verifier: Arc<TestVerifier>,
+    verifier: Arc<dyn CredentialVerifier>,
     trusted_proxies: Vec<IpAddr>,
     services: &[&str],
 ) -> Arc<AuthState> {

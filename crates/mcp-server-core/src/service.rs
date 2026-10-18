@@ -1,13 +1,24 @@
 use crate::config::{CoreConfig, EnvReader};
+use crate::credential::Credential;
 use crate::server::BODY_LIMIT;
+use axum::extract::{Request, State};
+use axum::http::{Method, StatusCode};
+use axum::middleware::Next;
+use axum::response::{IntoResponse, Response};
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
 use rmcp::ServerHandler;
 use rmcp::model::Icon;
 use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
 use rmcp::transport::streamable_http_server::{StreamableHttpServerConfig, StreamableHttpService};
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
+
+/// Tracing targets kept at warn whatever `LOG_LEVEL` says: rmcp's session manager logs every
+/// MCP session id at info, and session ids should stay out of logs and traces.
+pub const QUIET_LOG_TARGETS: &[&str] = &["rmcp::transport::streamable_http_server::session"];
 
 /// The environment reader every service factory receives.
 pub type ServiceEnv = EnvReader<Box<dyn Fn(&str) -> Option<String>>>;
@@ -106,7 +117,113 @@ where
         .with_cancellation_token(ctx.shutdown.clone());
     let service =
         StreamableHttpService::new(factory, Arc::new(LocalSessionManager::default()), config);
-    axum::Router::new().fallback_service(service)
+    let owners = Arc::new(SessionOwners::default());
+    axum::Router::new()
+        .fallback_service(service)
+        .layer(axum::middleware::from_fn_with_state(owners, bind_sessions))
+}
+
+const SESSION_HEADER: &str = "mcp-session-id";
+/// A session not used for this long is forgotten here; rmcp ends idle sessions sooner.
+const SESSION_IDLE: Duration = Duration::from_secs(3600);
+const MAX_SESSIONS: usize = 10_000;
+
+/// Which credential opened each MCP session on one mount, by fingerprint. A session id is only
+/// usable with the credential that opened it, so on a server shared by many people one person
+/// cannot read or end another's session even if they learn its id.
+#[derive(Default)]
+struct SessionOwners {
+    sessions: Mutex<HashMap<String, Owner>>,
+}
+
+/// The fingerprint of the credential that opened a session (none without a guard), and when the
+/// session was last used.
+type Owner = (Option<[u8; 32]>, Instant);
+
+impl SessionOwners {
+    /// Whether `who` opened session `id`; refreshes its last use when it did.
+    fn owned_by(&self, id: &str, who: Option<[u8; 32]>) -> bool {
+        let now = Instant::now();
+        let mut sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
+        match sessions.get_mut(id) {
+            Some((owner, used)) if now.duration_since(*used) < SESSION_IDLE => {
+                if *owner == who {
+                    *used = now;
+                    true
+                } else {
+                    false
+                }
+            }
+            Some(_) => {
+                sessions.remove(id);
+                false
+            }
+            None => false,
+        }
+    }
+
+    fn insert(&self, id: String, who: Option<[u8; 32]>) {
+        let now = Instant::now();
+        let mut sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
+        if sessions.len() >= MAX_SESSIONS {
+            sessions.retain(|_, (_, used)| now.duration_since(*used) < SESSION_IDLE);
+        }
+        if sessions.len() >= MAX_SESSIONS
+            && let Some(oldest) = sessions
+                .iter()
+                .min_by_key(|(_, (_, used))| *used)
+                .map(|(k, _)| k.clone())
+        {
+            sessions.remove(&oldest);
+        }
+        sessions.insert(id, (who, now));
+    }
+
+    fn remove(&self, id: &str) {
+        self.sessions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(id);
+    }
+}
+
+/// Records the credential that opens a session, and answers 404 (as for an unknown session, so
+/// clients start a new one) when a request names a session opened with another credential.
+async fn bind_sessions(
+    State(owners): State<Arc<SessionOwners>>,
+    req: Request,
+    next: Next,
+) -> Response {
+    let who = req
+        .extensions()
+        .get::<Credential>()
+        .map(Credential::fingerprint);
+    let session = req
+        .headers()
+        .get(SESSION_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned);
+    let delete = req.method() == Method::DELETE;
+    if let Some(id) = &session
+        && !owners.owned_by(id, who)
+    {
+        return (StatusCode::NOT_FOUND, "Session not found").into_response();
+    }
+    let res = next.run(req).await;
+    match session {
+        None => {
+            if let Some(id) = res
+                .headers()
+                .get(SESSION_HEADER)
+                .and_then(|v| v.to_str().ok())
+            {
+                owners.insert(id.to_owned(), who);
+            }
+        }
+        Some(id) if delete && res.status().is_success() => owners.remove(&id),
+        Some(_) => {}
+    }
+    res
 }
 
 /// A service's `serverInfo` icons as data URIs: the 128x128 PNG first, then the SVG.

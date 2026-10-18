@@ -4,6 +4,9 @@ use jsonwebtoken::{
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
+/// Seconds a token is still accepted after its `exp`, for clock skew.
+pub const LEEWAY_SECS: u64 = 5;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum TokenKind {
@@ -123,7 +126,7 @@ impl Jwt {
         let mut v = Validation::new(Algorithm::HS256);
         v.set_audience(&[audience]);
         v.set_issuer(&[&self.issuer]);
-        v.leeway = 5;
+        v.leeway = LEEWAY_SECS;
         if typ == TokenKind::Client {
             v.validate_exp = false;
             v.set_required_spec_claims(&["iss", "aud", "sub"]);

@@ -151,14 +151,24 @@ pub fn combined_tool_names(services: &[Arc<dyn Service>]) -> Vec<String> {
 /// Drops any user directive for a capped target and caps it at info, for dependencies that log
 /// secrets at trace. Directives with a `[` are dropped too: span-scoped ones could re-enable a
 /// capped target.
+/// The rmcp session targets in [`QUIET_LOG_TARGETS`] are always kept at warn.
 pub fn log_filter(level: &str, caps: &[&str]) -> String {
+    use mcp_server_core::service::QUIET_LOG_TARGETS;
     let mut parts: Vec<String> = level
         .split(',')
         .map(str::trim)
-        .filter(|d| !d.is_empty() && !d.contains('[') && !caps.iter().any(|c| d.starts_with(c)))
+        .filter(|d| {
+            !d.is_empty()
+                && !d.contains('[')
+                && !caps
+                    .iter()
+                    .chain(QUIET_LOG_TARGETS)
+                    .any(|c| d.starts_with(c))
+        })
         .map(String::from)
         .collect();
     parts.extend(caps.iter().map(|c| format!("{c}=info")));
+    parts.extend(QUIET_LOG_TARGETS.iter().map(|t| format!("{t}=warn")));
     parts.join(",")
 }
 
@@ -352,15 +362,39 @@ mod tests {
 
     #[test]
     fn log_filter_caps_every_listed_target() {
+        const Q: &str = "rmcp::transport::streamable_http_server::session=warn";
         assert_eq!(
             log_filter("trace,a=trace,b::x=debug", &["a", "b"]),
-            "trace,a=info,b=info"
+            format!("trace,a=info,b=info,{Q}")
         );
-        assert_eq!(log_filter("warn", &[]), "warn");
+        assert_eq!(log_filter("warn", &[]), format!("warn,{Q}"));
         assert_eq!(
             log_filter("info,[{x}]=trace,[x]=trace,debug", &["a"]),
-            "info,debug,a=info"
+            format!("info,debug,a=info,{Q}")
         );
+    }
+
+    #[test]
+    fn session_ids_stay_out_of_logs_whatever_the_level() {
+        use tracing::Level;
+        use tracing_subscriber::layer::SubscriberExt;
+        let filter = log_filter(
+            "trace,rmcp=trace,rmcp::transport::streamable_http_server::session::local=trace",
+            &[],
+        );
+        let subscriber =
+            tracing_subscriber::registry().with(tracing_subscriber::EnvFilter::new(filter));
+        tracing::subscriber::with_default(subscriber, || {
+            assert!(!tracing::enabled!(
+                target: "rmcp::transport::streamable_http_server::session::local",
+                Level::INFO
+            ));
+            assert!(tracing::enabled!(
+                target: "rmcp::transport::streamable_http_server::session::local",
+                Level::WARN
+            ));
+            assert!(tracing::enabled!(target: "rmcp::handler", Level::TRACE));
+        });
     }
 
     #[test]

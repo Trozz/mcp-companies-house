@@ -6,7 +6,7 @@ pub mod token;
 
 pub use middleware::require_bearer;
 
-use crate::credential::{CheckCache, CredentialVerifier, Sealer};
+use crate::credential::{CheckCache, CheckRunner, CredentialVerifier, Sealer};
 use crate::guards::{LoginLimiter, ReplayGuard};
 use crate::jwt::Jwt;
 use axum::Router;
@@ -27,6 +27,10 @@ pub const BEARER_VALID_FOR: Duration = Duration::from_secs(600);
 /// How long a rejected bearer credential is remembered.
 pub const BEARER_INVALID_FOR: Duration = Duration::from_secs(60);
 const BEARER_CACHE_ENTRIES: usize = 10_000;
+/// Upstream credential checks allowed to run at once, across sign-ins and bearer credentials.
+pub const MAX_RUNNING_CHECKS: usize = 16;
+/// Longest an upstream credential check may take before it counts as unavailable.
+pub const CHECK_TIMEOUT: Duration = Duration::from_secs(15);
 
 pub struct AuthState {
     pub settings: OAuthSettings,
@@ -39,6 +43,8 @@ pub struct AuthState {
     pub sealer: Sealer,
     /// Recent verdicts on credentials sent directly as bearer tokens.
     pub bearer_checks: CheckCache,
+    /// Runs upstream checks: shared per credential, capped and timed out.
+    pub checks: CheckRunner,
     services: Vec<String>,
 }
 
@@ -70,6 +76,7 @@ impl AuthState {
                 BEARER_INVALID_FOR,
                 BEARER_CACHE_ENTRIES,
             ),
+            checks: CheckRunner::new(MAX_RUNNING_CHECKS, CHECK_TIMEOUT),
             services: services.iter().map(|s| s.to_string()).collect(),
         })
     }

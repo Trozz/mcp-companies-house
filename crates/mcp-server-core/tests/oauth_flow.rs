@@ -391,7 +391,7 @@ async fn full_oauth_dance_reaches_the_requested_service_only() {
         ),
     )
     .await;
-    assert_eq!(res.status(), StatusCode::FOUND);
+    assert_eq!(res.status(), StatusCode::SEE_OTHER);
     let loc = url::Url::parse(res.headers()["location"].to_str().unwrap()).unwrap();
     let code = loc
         .query_pairs()

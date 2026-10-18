@@ -3,9 +3,9 @@ use std::net::{IpAddr, Ipv6Addr};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-/// Failures across all clients within one window that block every login.
-/// Trade-off: during an active distributed attack the owner is locked out
-/// too, but the total guessing rate stays bounded.
+/// Failures across all clients within one window after which any client with a failure of its
+/// own in the window is blocked. Clients with a clean record are never blocked by other
+/// people's failures; the cap keeps repeat offenders from spreading attempts over many addresses.
 const GLOBAL_MAX_FAILURES: usize = 30;
 const MAX_TRACKED_KEYS: usize = 10_000;
 const SWEEP_INTERVAL: Duration = Duration::from_secs(1);
@@ -68,28 +68,68 @@ impl LoginLimiter {
     pub fn is_blocked(&self, ip: IpAddr) -> bool {
         let mut state = self.state.lock().expect("limiter lock");
         let now = Instant::now();
+        self.blocked(&mut state, limiter_key(ip), now)
+    }
+
+    fn blocked(&self, state: &mut LimiterState, key: IpAddr, now: Instant) -> bool {
         state.prune(now, self.window);
-        if state.global.len() >= GLOBAL_MAX_FAILURES {
-            return true;
-        }
-        let Some(times) = state.per_key.get_mut(&limiter_key(ip)) else {
+        let global_full = state.global.len() >= GLOBAL_MAX_FAILURES;
+        let Some(times) = state.per_key.get_mut(&key) else {
             return false;
         };
         times.retain(|t| now.duration_since(*t) < self.window);
-        times.len() >= self.max
+        times.len() >= self.max || (global_full && !times.is_empty())
     }
 
     pub fn record_failure(&self, ip: IpAddr) {
         let mut state = self.state.lock().expect("limiter lock");
         let now = Instant::now();
         state.prune(now, self.window);
+        Self::push(&mut state, limiter_key(ip), now);
+    }
+
+    fn push(state: &mut LimiterState, key: IpAddr, now: Instant) {
         state.global.push_back(now);
-        let key = limiter_key(ip);
         if state.per_key.len() >= MAX_TRACKED_KEYS && !state.per_key.contains_key(&key) {
             return;
         }
         state.per_key.entry(key).or_default().push(now);
     }
+
+    /// Counts an attempt as a failure before it is checked, so concurrent attempts share the
+    /// limit. `None` when the client is blocked. Give the reservation back with [`Self::refund`]
+    /// when the attempt turns out not to be a failure.
+    pub fn try_reserve(&self, ip: IpAddr) -> Option<Reservation> {
+        let mut state = self.state.lock().expect("limiter lock");
+        let now = Instant::now();
+        let key = limiter_key(ip);
+        if self.blocked(&mut state, key, now) {
+            return None;
+        }
+        Self::push(&mut state, key, now);
+        Some(Reservation { key, at: now })
+    }
+
+    /// Removes a reserved attempt again: it was accepted, or could not be checked.
+    pub fn refund(&self, reservation: Reservation) {
+        let mut state = self.state.lock().expect("limiter lock");
+        if let Some(i) = state.global.iter().rposition(|t| *t == reservation.at) {
+            state.global.remove(i);
+        }
+        if let Some(times) = state.per_key.get_mut(&reservation.key)
+            && let Some(i) = times.iter().rposition(|t| *t == reservation.at)
+        {
+            times.remove(i);
+        }
+    }
+}
+
+/// An attempt counted by [`LoginLimiter::try_reserve`] until it is refunded.
+#[derive(Debug)]
+#[must_use = "refund the reservation unless the attempt failed"]
+pub struct Reservation {
+    key: IpAddr,
+    at: Instant,
 }
 
 pub struct ReplayGuard {
@@ -106,7 +146,8 @@ impl ReplayGuard {
     pub fn first_use(&self, jti: &str, exp_unix: u64) -> bool {
         let now = jsonwebtoken::get_current_timestamp();
         let mut used = self.used.lock().expect("replay lock");
-        used.retain(|_, exp| *exp >= now);
+        // Tokens stay valid for the JWT leeway after `exp`, so remember them that long too.
+        used.retain(|_, exp| *exp + crate::jwt::LEEWAY_SECS >= now);
         used.insert(jti.to_string(), exp_unix).is_none()
     }
 
@@ -171,14 +212,41 @@ mod tests {
     }
 
     #[test]
-    fn global_ceiling_blocks_a_fresh_ip() {
+    fn global_ceiling_blocks_only_clients_that_failed_too() {
         let l = LoginLimiter::new(5, Duration::from_secs(60));
         for i in 0..GLOBAL_MAX_FAILURES {
             let ip = IpAddr::from([10, 0, (i / 256) as u8, (i % 256) as u8]);
             assert!(!l.is_blocked(ip));
             l.record_failure(ip);
         }
-        assert!(l.is_blocked("192.0.2.1".parse().unwrap()));
+        assert!(
+            !l.is_blocked("192.0.2.1".parse().unwrap()),
+            "a clean client is never blocked by other people's failures"
+        );
+        assert!(l.is_blocked("10.0.0.0".parse().unwrap()));
+        let ip: IpAddr = "192.0.2.2".parse().unwrap();
+        l.record_failure(ip);
+        assert!(
+            l.is_blocked(ip),
+            "one failure is enough once the ceiling is reached"
+        );
+    }
+
+    #[test]
+    fn reservations_count_at_once_and_refunds_give_them_back() {
+        let l = LoginLimiter::new(3, Duration::from_secs(60));
+        let ip: IpAddr = "10.0.0.1".parse().unwrap();
+        let held: Vec<_> = (0..3)
+            .map(|_| l.try_reserve(ip).expect("allowed"))
+            .collect();
+        assert!(l.try_reserve(ip).is_none(), "in-flight attempts count");
+        for r in held {
+            l.refund(r);
+        }
+        assert!(!l.is_blocked(ip));
+        let r = l.try_reserve(ip).unwrap();
+        l.refund(r);
+        assert_eq!(l.state.lock().unwrap().global.len(), 0);
     }
 
     #[test]
@@ -200,6 +268,14 @@ mod tests {
         assert!(g.first_use("jti-1", exp));
         assert!(!g.first_use("jti-1", exp));
         assert!(g.first_use("jti-2", exp));
+    }
+
+    #[test]
+    fn replay_guard_remembers_tokens_through_the_leeway() {
+        let g = ReplayGuard::new();
+        let just_expired = jsonwebtoken::get_current_timestamp() - 2;
+        assert!(g.first_use("late", just_expired));
+        assert!(!g.first_use("late", just_expired));
     }
 
     #[test]

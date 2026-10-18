@@ -1,5 +1,5 @@
 use super::AuthState;
-use crate::credential::{self, CredentialCheck};
+use crate::credential::CredentialCheck;
 use crate::jwt::{Payload, TokenKind};
 use crate::pkce;
 use axum::extract::{ConnectInfo, Form, FromRequestParts, Query, State};
@@ -374,15 +374,30 @@ pub async fn post_authorize(
     }
     let label = st.verifier.label();
     let entered = form.credential.trim();
-    let verdict = if credential::plausible(entered) {
-        st.verifier.check(entered).await
-    } else {
-        CredentialCheck::Invalid(None)
+    // Input that could not be a credential is refused here without asking upstream, so it costs
+    // nothing and is not counted as a failed attempt.
+    if !st.verifier.plausible(entered) {
+        return login_page(
+            &st,
+            &v,
+            StatusCode::UNAUTHORIZED,
+            Some(&format!("That is not a {label}.")),
+        );
+    }
+    let Some(reservation) = st.limiter.try_reserve(ip) else {
+        metrics::counter!("oauth_requests_total", "endpoint" => "authorize", "outcome" => "rate_limited").increment(1);
+        return error_page(
+            StatusCode::TOO_MANY_REQUESTS,
+            "Too many failed attempts. Wait a minute and try again.",
+        );
     };
+    let verdict = st.checks.check(st.verifier.as_ref(), entered).await;
+    if !matches!(verdict, CredentialCheck::Invalid(_)) {
+        st.limiter.refund(reservation);
+    }
     match verdict {
         CredentialCheck::Valid => {}
         CredentialCheck::Invalid(reason) => {
-            st.limiter.record_failure(ip);
             metrics::counter!("oauth_login_failures_total").increment(1);
             tracing::warn!(%ip, "oauth login failed: credential rejected");
             let message = reason.unwrap_or_else(|| format!("That {label} was not accepted."));
@@ -432,7 +447,9 @@ pub async fn post_authorize(
     metrics::counter!("oauth_requests_total", "endpoint" => "authorize", "outcome" => "ok")
         .increment(1);
     tracing::info!("oauth authorization granted");
-    let mut res = Redirect::to(url.as_str()).into_response().with_found();
+    // 303 after the POST that carried the credential, so no user agent re-sends the form body
+    // to the client's redirect_uri (RFC 9700 4.12).
+    let mut res = Redirect::to(url.as_str()).into_response();
     res.headers_mut()
         .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
     res
