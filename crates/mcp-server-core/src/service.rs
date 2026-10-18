@@ -16,9 +16,13 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
 
-/// Tracing targets kept at warn whatever `LOG_LEVEL` says: rmcp's session manager logs every
-/// MCP session id at info, and session ids should stay out of logs and traces.
-pub const QUIET_LOG_TARGETS: &[&str] = &["rmcp::transport::streamable_http_server::session"];
+/// Tracing targets kept at warn whatever `LOG_LEVEL` says: rmcp's streamable HTTP server logs
+/// MCP session ids (at info and in error text), and its transport workers carry them in a trace
+/// span name, while session ids should stay out of logs and traces.
+pub const QUIET_LOG_TARGETS: &[&str] = &[
+    "rmcp::transport::streamable_http_server",
+    "rmcp::transport::worker",
+];
 
 /// The environment reader every service factory receives.
 pub type ServiceEnv = EnvReader<Box<dyn Fn(&str) -> Option<String>>>;
@@ -113,24 +117,44 @@ where
         .enforce_origin_validation()
         .with_max_request_body_bytes(BODY_LIMIT)
         .with_cancellation_token(ctx.shutdown.clone());
-    let service =
-        StreamableHttpService::new(factory, Arc::new(LocalSessionManager::default()), config);
-    let owners = Arc::new(SessionOwners::default());
+    let manager = Arc::new(LocalSessionManager::default());
+    let service = StreamableHttpService::new(factory, manager.clone(), config);
+    let owners = Arc::new(SessionOwners::new(manager, SessionLimits::DEFAULT));
     axum::Router::new()
         .fallback_service(service)
         .layer(axum::middleware::from_fn_with_state(owners, bind_sessions))
 }
 
 const SESSION_HEADER: &str = "mcp-session-id";
-/// A session not used for this long is forgotten here; rmcp ends idle sessions sooner.
-const SESSION_IDLE: Duration = Duration::from_secs(3600);
-const MAX_SESSIONS: usize = 10_000;
+
+/// Bounds on the session-owner table of one mount.
+#[derive(Debug, Clone, Copy)]
+struct SessionLimits {
+    /// Sessions remembered at once. When full, entries of sessions rmcp has ended are dropped;
+    /// if none has ended, new sessions are refused rather than pushing out someone else's.
+    total: usize,
+    /// Sessions one credential may hold; opening another closes its own least recently used one.
+    per_owner: usize,
+    /// An entry unused for this long is treated as gone: a little longer than rmcp's own idle
+    /// timeout, after which rmcp has ended the session anyway.
+    idle: Duration,
+}
+
+impl SessionLimits {
+    const DEFAULT: SessionLimits = SessionLimits {
+        total: 10_000,
+        per_owner: 50,
+        idle: Duration::from_secs(360),
+    };
+}
 
 /// Which credential opened each MCP session on one mount, by fingerprint. A session id is only
 /// usable with the credential that opened it, so on a server shared by many people one person
-/// cannot read or end another's session even if they learn its id.
-#[derive(Default)]
+/// cannot read or end another's session even if they learn its id, and cannot push other
+/// people's sessions out by opening many of their own.
 struct SessionOwners {
+    manager: Arc<LocalSessionManager>,
+    limits: SessionLimits,
     sessions: Mutex<HashMap<String, Owner>>,
 }
 
@@ -138,13 +162,33 @@ struct SessionOwners {
 /// session was last used.
 type Owner = (Option<[u8; 32]>, Instant);
 
+/// What [`SessionOwners::admit`] decided about a new session.
+#[derive(Debug, PartialEq, Eq)]
+enum Admission {
+    /// Recorded. These sessions were dropped to make room and should be closed.
+    Admitted(Vec<String>),
+    /// The table is full of entries that may still be live: the caller should look up which
+    /// sessions rmcp still holds and ask again.
+    NeedLiveSessions,
+    /// Full of live sessions: refuse the new one.
+    Full,
+}
+
 impl SessionOwners {
+    fn new(manager: Arc<LocalSessionManager>, limits: SessionLimits) -> Self {
+        SessionOwners {
+            manager,
+            limits,
+            sessions: Mutex::new(HashMap::new()),
+        }
+    }
+
     /// Whether `who` opened session `id`; refreshes its last use when it did.
     fn owned_by(&self, id: &str, who: Option<[u8; 32]>) -> bool {
         let now = Instant::now();
         let mut sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
         match sessions.get_mut(id) {
-            Some((owner, used)) if now.duration_since(*used) < SESSION_IDLE => {
+            Some((owner, used)) if now.duration_since(*used) < self.limits.idle => {
                 if *owner == who {
                     *used = now;
                     true
@@ -160,21 +204,48 @@ impl SessionOwners {
         }
     }
 
-    fn insert(&self, id: String, who: Option<[u8; 32]>) {
+    /// Records a new session `id` opened by `who`. `live` is the set of sessions rmcp still
+    /// holds, needed only when the table is full.
+    fn admit(
+        &self,
+        id: &str,
+        who: Option<[u8; 32]>,
+        live: Option<&std::collections::HashSet<String>>,
+    ) -> Admission {
         let now = Instant::now();
+        let limits = self.limits;
         let mut sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
-        if sessions.len() >= MAX_SESSIONS {
-            sessions.retain(|_, (_, used)| now.duration_since(*used) < SESSION_IDLE);
-        }
-        if sessions.len() >= MAX_SESSIONS
-            && let Some(oldest) = sessions
+        let mut dropped = Vec::new();
+        if who.is_some() {
+            let mut own: Vec<(String, Instant)> = sessions
                 .iter()
-                .min_by_key(|(_, (_, used))| *used)
-                .map(|(k, _)| k.clone())
-        {
-            sessions.remove(&oldest);
+                .filter(|(_, (owner, _))| *owner == who)
+                .map(|(k, (_, used))| (k.clone(), *used))
+                .collect();
+            if own.len() >= limits.per_owner {
+                // Make room for the new one by closing this owner's least recently used.
+                own.sort_by_key(|(_, used)| *used);
+                let excess = own.len() + 1 - limits.per_owner;
+                for (k, _) in own.into_iter().take(excess) {
+                    sessions.remove(&k);
+                    dropped.push(k);
+                }
+            }
         }
-        sessions.insert(id, (who, now));
+        if sessions.len() >= limits.total {
+            sessions.retain(|_, (_, used)| now.duration_since(*used) < limits.idle);
+        }
+        if sessions.len() >= limits.total {
+            let Some(live) = live else {
+                return Admission::NeedLiveSessions;
+            };
+            sessions.retain(|k, _| live.contains(k));
+        }
+        if sessions.len() >= limits.total {
+            return Admission::Full;
+        }
+        sessions.insert(id.to_owned(), (who, now));
+        Admission::Admitted(dropped)
     }
 
     fn remove(&self, id: &str) {
@@ -182,6 +253,21 @@ impl SessionOwners {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .remove(id);
+    }
+
+    async fn live_sessions(&self) -> std::collections::HashSet<String> {
+        self.manager
+            .sessions
+            .read()
+            .await
+            .keys()
+            .map(|k| k.to_string())
+            .collect()
+    }
+
+    async fn close(&self, id: &str) {
+        use rmcp::transport::streamable_http_server::session::SessionManager as _;
+        let _ = self.manager.close_session(&Arc::from(id)).await;
     }
 }
 
@@ -210,18 +296,47 @@ async fn bind_sessions(
     let res = next.run(req).await;
     match session {
         None => {
-            if let Some(id) = res
+            let Some(id) = res
                 .headers()
                 .get(SESSION_HEADER)
                 .and_then(|v| v.to_str().ok())
-            {
-                owners.insert(id.to_owned(), who);
+                .map(str::to_owned)
+            else {
+                return res;
+            };
+            let mut admission = owners.admit(&id, who, None);
+            if admission == Admission::NeedLiveSessions {
+                let live = owners.live_sessions().await;
+                admission = owners.admit(&id, who, Some(&live));
+            }
+            match admission {
+                Admission::Admitted(dropped) => {
+                    for old in dropped {
+                        owners.close(&old).await;
+                    }
+                    res
+                }
+                Admission::NeedLiveSessions | Admission::Full => {
+                    owners.close(&id).await;
+                    let mut busy = (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "This server has too many open sessions. Try again shortly.",
+                    )
+                        .into_response();
+                    busy.headers_mut().insert(
+                        axum::http::header::RETRY_AFTER,
+                        axum::http::HeaderValue::from_static("30"),
+                    );
+                    busy
+                }
             }
         }
-        Some(id) if delete && res.status().is_success() => owners.remove(&id),
-        Some(_) => {}
+        Some(id) if delete && res.status().is_success() => {
+            owners.remove(&id);
+            res
+        }
+        Some(_) => res,
     }
-    res
 }
 
 /// A service's `serverInfo` icons as data URIs: the 128x128 PNG first, then the SVG.
@@ -259,6 +374,69 @@ mod tests {
         );
         assert_eq!(icons[1].mime_type.as_deref(), Some("image/svg+xml"));
         assert_eq!(icons[1].sizes, Some(vec!["any".to_string()]));
+    }
+
+    fn owners(total: usize, per_owner: usize) -> SessionOwners {
+        SessionOwners::new(
+            Arc::new(LocalSessionManager::default()),
+            SessionLimits {
+                total,
+                per_owner,
+                idle: Duration::from_secs(360),
+            },
+        )
+    }
+
+    #[test]
+    fn one_owner_cannot_hold_more_than_its_share() {
+        let o = owners(100, 3);
+        let (alice, bob) = (Some([1; 32]), Some([2; 32]));
+        assert_eq!(o.admit("a1", alice, None), Admission::Admitted(vec![]));
+        for i in 0..3 {
+            assert_eq!(
+                o.admit(&format!("b{i}"), bob, None),
+                Admission::Admitted(vec![])
+            );
+        }
+        assert_eq!(
+            o.admit("b3", bob, None),
+            Admission::Admitted(vec!["b0".into()]),
+            "Bob's own oldest session makes room"
+        );
+        assert!(o.owned_by("a1", alice), "Alice is untouched");
+        assert!(!o.owned_by("b0", bob));
+        assert!(o.owned_by("b3", bob));
+    }
+
+    #[test]
+    fn a_full_table_keeps_live_sessions_and_refuses_new_ones() {
+        let o = owners(3, 10);
+        for (i, who) in [[1; 32], [2; 32], [3; 32]].into_iter().enumerate() {
+            assert_eq!(
+                o.admit(&format!("s{i}"), Some(who), None),
+                Admission::Admitted(vec![])
+            );
+        }
+        assert_eq!(
+            o.admit("new", Some([4; 32]), None),
+            Admission::NeedLiveSessions
+        );
+        let all: std::collections::HashSet<String> =
+            ["s0", "s1", "s2"].iter().map(|s| s.to_string()).collect();
+        assert_eq!(o.admit("new", Some([4; 32]), Some(&all)), Admission::Full);
+        assert!(
+            o.owned_by("s0", Some([1; 32])),
+            "nobody's live session is pushed out"
+        );
+        let some: std::collections::HashSet<String> =
+            ["s0", "s2"].iter().map(|s| s.to_string()).collect();
+        assert_eq!(
+            o.admit("new", Some([4; 32]), Some(&some)),
+            Admission::Admitted(vec![]),
+            "sessions rmcp has ended make room"
+        );
+        assert!(!o.owned_by("s1", Some([2; 32])));
+        assert!(o.owned_by("new", Some([4; 32])));
     }
 
     #[test]

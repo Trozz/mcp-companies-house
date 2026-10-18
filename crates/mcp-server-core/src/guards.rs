@@ -3,9 +3,11 @@ use std::net::{IpAddr, Ipv6Addr};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-/// Failures across all clients within one window after which any client with a failure of its
-/// own in the window is blocked. Clients with a clean record are never blocked by other
-/// people's failures; the cap keeps repeat offenders from spreading attempts over many addresses.
+/// Failures across all clients within one window after which any client with an attempt of its
+/// own in the window (a rejection, or a check still in flight) is blocked. A client with no
+/// attempts is not blocked by other people's failures, unless so many addresses are being
+/// tracked that the table is full, when untracked addresses are blocked too. The cap keeps an
+/// attacker from spreading guesses over many addresses.
 const GLOBAL_MAX_FAILURES: usize = 30;
 const MAX_TRACKED_KEYS: usize = 10_000;
 const SWEEP_INTERVAL: Duration = Duration::from_secs(1);
@@ -75,7 +77,8 @@ impl LoginLimiter {
         state.prune(now, self.window);
         let global_full = state.global.len() >= GLOBAL_MAX_FAILURES;
         let Some(times) = state.per_key.get_mut(&key) else {
-            return false;
+            // Untracked because the table is full: its attempts only show in the global count.
+            return global_full && state.per_key.len() >= MAX_TRACKED_KEYS;
         };
         times.retain(|t| now.duration_since(*t) < self.window);
         times.len() >= self.max || (global_full && !times.is_empty())
@@ -230,6 +233,23 @@ mod tests {
             l.is_blocked(ip),
             "one failure is enough once the ceiling is reached"
         );
+    }
+
+    #[test]
+    fn untracked_addresses_are_blocked_once_the_table_is_full_and_the_ceiling_reached() {
+        let l = LoginLimiter::new(5, Duration::from_secs(60));
+        for i in 0..MAX_TRACKED_KEYS as u32 {
+            l.record_failure(IpAddr::from(i.to_be_bytes()));
+        }
+        let fresh: IpAddr = "203.0.113.7".parse().unwrap();
+        assert!(l.is_blocked(fresh));
+        assert!(l.try_reserve(fresh).is_none());
+        // Below the tracking limit a fresh address stays free, as before.
+        let l = LoginLimiter::new(5, Duration::from_secs(60));
+        for i in 0..GLOBAL_MAX_FAILURES as u32 {
+            l.record_failure(IpAddr::from(i.to_be_bytes()));
+        }
+        assert!(!l.is_blocked(fresh));
     }
 
     #[test]

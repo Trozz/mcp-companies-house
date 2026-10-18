@@ -417,7 +417,7 @@ mod tests {
 
     #[test]
     fn log_filter_caps_every_listed_target() {
-        const Q: &str = "rmcp::transport::streamable_http_server::session=warn";
+        const Q: &str = "rmcp::transport::streamable_http_server=warn,rmcp::transport::worker=warn";
         assert_eq!(
             log_filter("trace,a=trace,b::x=debug", &["a", "b"]),
             format!("trace,a=info,b=info,{Q}")
@@ -447,6 +447,15 @@ mod tests {
             assert!(tracing::enabled!(
                 target: "rmcp::transport::streamable_http_server::session::local",
                 Level::WARN
+            ));
+            assert!(!tracing::enabled!(
+                target: "rmcp::transport::streamable_http_server::tower",
+                Level::INFO
+            ));
+            // The transport worker's trace span carries the session id in its name.
+            assert!(!tracing::span_enabled!(
+                target: "rmcp::transport::worker",
+                Level::TRACE
             ));
             assert!(tracing::enabled!(target: "rmcp::handler", Level::TRACE));
         });

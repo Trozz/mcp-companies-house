@@ -113,6 +113,32 @@ async fn a_session_works_only_with_the_key_that_opened_it() {
 }
 
 #[tokio::test]
+async fn one_key_opening_many_sessions_cannot_push_out_anyone_elses() {
+    let app = app();
+    let alice = open_session(&app, ALICE).await;
+    let first_of_bobs = open_session(&app, BOB).await;
+    for _ in 0..60 {
+        open_session(&app, BOB).await;
+    }
+    let ping = || Some(json!({"jsonrpc": "2.0", "id": 9, "method": "ping"}));
+    let res = app
+        .clone()
+        .oneshot(req("POST", ALICE, Some(&alice), ping()))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK, "Alice's session is untouched");
+    let res = app
+        .oneshot(req("POST", BOB, Some(&first_of_bobs), ping()))
+        .await
+        .unwrap();
+    assert_eq!(
+        res.status(),
+        StatusCode::NOT_FOUND,
+        "Bob's own oldest session made room"
+    );
+}
+
+#[tokio::test]
 async fn each_person_gets_their_own_session() {
     let app = app();
     let alice = open_session(&app, ALICE).await;

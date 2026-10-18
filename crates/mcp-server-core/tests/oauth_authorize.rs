@@ -175,6 +175,7 @@ async fn an_unavailable_check_is_503_and_not_a_failed_attempt() {
     for _ in 0..6 {
         let res = send(&app, post(&form_fields(&html, DOWN_KEY))).await;
         assert_eq!(res.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(res.headers()["retry-after"], "30");
         assert!(
             body_text(res)
                 .await

@@ -14,7 +14,7 @@ use tower::ServiceExt;
 
 const GOOD: &str = "good-key-0123456789";
 
-/// Accepts only `GOOD`, after a delay, counting its checks.
+/// Accepts keys starting `good-` (such as `GOOD`), after a delay, counting its checks.
 struct Slow {
     checks: AtomicUsize,
 }
@@ -28,7 +28,7 @@ impl CredentialVerifier for Slow {
     }
     fn check<'a>(&'a self, credential: &'a str) -> CheckFuture<'a> {
         self.checks.fetch_add(1, Ordering::SeqCst);
-        let ok = credential == GOOD;
+        let ok = credential.starts_with("good-");
         Box::pin(async move {
             tokio::time::sleep(Duration::from_millis(50)).await;
             if ok {
@@ -149,6 +149,45 @@ async fn other_peoples_failures_never_block_a_clean_client() {
         .await
         .unwrap();
     assert_eq!(res.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(res.headers()["retry-after"], "30");
+}
+
+#[tokio::test]
+async fn a_check_abandoned_by_the_client_is_not_counted_as_a_rejection() {
+    let (app, v) = setup();
+    // Six people behind one address give up on their requests while the keys are checked.
+    for i in 0..6 {
+        let req = bearer(&format!("Bearer good-key-{i:04}-abcdef"), [10, 0, 2, 1]);
+        let gave_up =
+            tokio::time::timeout(Duration::from_millis(10), app.clone().oneshot(req)).await;
+        assert!(gave_up.is_err(), "the request was abandoned mid-check");
+    }
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(
+        v.checks.load(Ordering::SeqCst),
+        6,
+        "the checks still finished"
+    );
+    let res = app
+        .clone()
+        .oneshot(bearer("Bearer good-key-9999-abcdef", [10, 0, 2, 1]))
+        .await
+        .unwrap();
+    assert_eq!(
+        res.status(),
+        StatusCode::OK,
+        "nothing was counted against the address"
+    );
+    let res = app
+        .oneshot(bearer("Bearer good-key-0001-abcdef", [10, 0, 2, 1]))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(
+        v.checks.load(Ordering::SeqCst),
+        7,
+        "the abandoned key's verdict was cached"
+    );
 }
 
 #[tokio::test]

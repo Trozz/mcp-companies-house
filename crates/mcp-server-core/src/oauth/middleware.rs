@@ -1,6 +1,7 @@
 use super::AuthState;
 use super::authorize::client_ip;
 use crate::credential::{self, Credential, CredentialCheck};
+use crate::credential::{CheckRunner, Lead, Ticket};
 use crate::guards::Reservation;
 use crate::jwt::TokenKind;
 use axum::extract::{ConnectInfo, Request, State};
@@ -34,6 +35,63 @@ fn unavailable(st: &AuthState, why: &str) -> Response {
     res.headers_mut()
         .insert(header::RETRY_AFTER, HeaderValue::from_static("30"));
     res
+}
+
+/// Seconds a client is asked to wait after being refused for too many attempts.
+pub(crate) const RETRY_AFTER_SECS: &str = "30";
+
+/// 429 for a client with too many rejected credentials, or too many checks in flight.
+fn too_many_attempts() -> Response {
+    let mut res = (
+        StatusCode::TOO_MANY_REQUESTS,
+        "Too many attempts from this address: credentials were rejected, or several are being \
+         checked at once. Try again shortly.",
+    )
+        .into_response();
+    res.headers_mut().insert(
+        header::RETRY_AFTER,
+        HeaderValue::from_static(RETRY_AFTER_SECS),
+    );
+    res
+}
+
+/// The verdict followers get when their lead was refused for too many attempts.
+pub(crate) fn refused() -> CredentialCheck {
+    CredentialCheck::Unavailable("too many attempts from this address; try again shortly".into())
+}
+
+/// Runs `lead`'s upstream check and settles what the attempt cost, in a task of its own so the
+/// outcome is recorded even if the client goes away mid-check: the reservation is kept only for
+/// a rejection and given back otherwise, and with `cache` the verdict is remembered.
+pub(crate) async fn settled_check(
+    st: &Arc<AuthState>,
+    credential: &str,
+    lead: Lead,
+    reservation: Reservation,
+    cache: Option<[u8; 32]>,
+) -> CredentialCheck {
+    let task = {
+        let st = st.clone();
+        let credential = credential.to_owned();
+        tokio::spawn(async move {
+            let verdict = st
+                .checks
+                .lead(lead, st.verifier.as_ref(), &credential)
+                .await;
+            let rejected = matches!(verdict, CredentialCheck::Invalid(_));
+            if !rejected {
+                st.limiter.refund(reservation);
+            }
+            if let Some(fp) = cache
+                && !matches!(verdict, CredentialCheck::Unavailable(_))
+            {
+                st.bearer_checks.put(fp, !rejected);
+            }
+            verdict
+        })
+    };
+    task.await
+        .unwrap_or_else(|_| CredentialCheck::Unavailable("the check stopped unexpectedly".into()))
 }
 
 /// The token of an `Authorization: Bearer <token>` value. The scheme is case-insensitive.
@@ -102,47 +160,35 @@ pub async fn require_bearer(
                 .get::<ConnectInfo<SocketAddr>>()
                 .map(|c| c.0.ip());
             let ip = client_ip(peer, req.headers(), &st.settings.trusted_proxies);
-            // A request joining a check that is already running shares its verdict and is not
-            // counted again; any other attempt counts before it goes upstream, so concurrent
-            // attempts cannot get past the limit.
-            let reservation: Option<Reservation> = if st.checks.is_running(&fingerprint) {
-                None
-            } else {
-                match st.limiter.try_reserve(ip) {
-                    Some(r) => Some(r),
-                    None => {
+            // A request arriving while the same credential is being checked follows that check
+            // and is not counted again. The request that leads the check counts before anything
+            // goes upstream, so concurrent attempts cannot get past the limit.
+            let verdict = match st.checks.join(fingerprint) {
+                Ticket::Follow(rx) => CheckRunner::follow(rx).await,
+                Ticket::Lead(lead) => {
+                    let Some(reservation) = st.limiter.try_reserve(ip) else {
+                        st.checks.finish(lead, refused());
                         metrics::counter!("bearer_credential_checks_total", "outcome" => "rate_limited")
                             .increment(1);
-                        return (
-                            StatusCode::TOO_MANY_REQUESTS,
-                            "Too many rejected credentials. Wait a minute and try again.",
-                        )
-                            .into_response();
-                    }
+                        return too_many_attempts();
+                    };
+                    settled_check(&st, &token, lead, reservation, Some(fingerprint)).await
                 }
             };
-            match st.checks.check(st.verifier.as_ref(), &token).await {
+            match verdict {
                 CredentialCheck::Valid => {
                     metrics::counter!("bearer_credential_checks_total", "outcome" => "valid")
                         .increment(1);
-                    if let Some(r) = reservation {
-                        st.limiter.refund(r);
-                    }
-                    st.bearer_checks.put(fingerprint, true);
                 }
                 CredentialCheck::Invalid(_) => {
                     metrics::counter!("bearer_credential_checks_total", "outcome" => "invalid")
                         .increment(1);
-                    st.bearer_checks.put(fingerprint, false);
                     tracing::warn!(%ip, "bearer credential rejected");
                     return unauthorized(&st, &service, true);
                 }
                 CredentialCheck::Unavailable(why) => {
                     metrics::counter!("bearer_credential_checks_total", "outcome" => "unavailable")
                         .increment(1);
-                    if let Some(r) = reservation {
-                        st.limiter.refund(r);
-                    }
                     tracing::warn!(reason = %why, "bearer credential could not be checked");
                     return unavailable(&st, &why);
                 }
