@@ -378,11 +378,35 @@ fn token_with(service: &str, key: Option<&str>) -> String {
             scope: Some(service.into()),
             resource: Some(resource.clone()),
             credential: key.map(|k| Sealer::new(SIGNING_KEY.as_bytes()).seal(k).unwrap()),
+            ver: Some(sign_in_version()),
+            auth_time: Some(now()),
             ..Payload::default()
         },
         &resource,
     )
     .unwrap()
+}
+
+/// The sign-in version this server's tokens carry.
+fn sign_in_version() -> String {
+    let mut env = ServiceEnv::new(Box::new(|k: &str| {
+        match k {
+            "PUBLIC_URL" => Some("https://ch.example.com"),
+            "OAUTH_SIGNING_KEY" => Some(SIGNING_KEY),
+            "COMPANIES_HOUSE_API_URL" => Some("http://127.0.0.1:9"),
+            _ => None,
+        }
+        .map(str::to_string)
+    }));
+    let loaded = ch_server().load(&mut env).expect("loads");
+    mcp_server_core::oauth::sign_in_version(SIGNING_KEY.as_bytes(), loaded.verifier.as_ref())
+}
+
+fn now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
 }
 
 #[tokio::test]
