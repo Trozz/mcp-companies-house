@@ -153,6 +153,143 @@ pub fn insolvency(v: &Value) -> Value {
     Value::Object(out)
 }
 
+/// `/company/{number}/registers`: where each statutory register is kept, latest move first.
+/// `location` is where the register is now: `public-register` (held at Companies House),
+/// `registered-office`, `single-alternative-inspection-location` or `unspecified-location`.
+pub fn registers(v: &Value) -> Value {
+    let mut out: Vec<Value> = Vec::new();
+    if let Some(all) = v.get("registers").and_then(Value::as_object) {
+        for (name, register) in all {
+            let mut moves: Vec<Value> = register
+                .get("items")
+                .and_then(Value::as_array)
+                .map(|items| {
+                    items
+                        .iter()
+                        .map(|i| {
+                            let transaction_id = at(i, "links/filing")
+                                .and_then(Value::as_str)
+                                .and_then(last_segment);
+                            object(vec![
+                                ("location", field(i, "register_moved_to")),
+                                ("moved_on", field(i, "moved_on")),
+                                ("transaction_id", transaction_id.map(Value::from)),
+                            ])
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            // Dates are YYYY-MM-DD, so they sort as text; undated moves go last.
+            moves.sort_by(|a, b| {
+                let date = |m: &Value| m.get("moved_on").and_then(Value::as_str).map(String::from);
+                date(b).cmp(&date(a))
+            });
+            let latest = moves.first().cloned().unwrap_or(Value::Null);
+            out.push(object(vec![
+                ("register", Some(Value::from(name.as_str()))),
+                ("location", latest.get("location").cloned()),
+                ("since", latest.get("moved_on").cloned()),
+                ("history", Some(Value::Array(moves))),
+            ]));
+        }
+    }
+    let mut map = Map::new();
+    map.insert("registers".into(), Value::Array(out));
+    Value::Object(map)
+}
+
+/// `/company/{number}/exemptions`: each exemption with its periods; `current` when a period has
+/// no end date.
+pub fn exemptions(v: &Value) -> Value {
+    let mut out: Vec<Value> = Vec::new();
+    if let Some(all) = v.get("exemptions").and_then(Value::as_object) {
+        for (name, exemption) in all {
+            let periods: Vec<Value> = exemption
+                .get("items")
+                .and_then(Value::as_array)
+                .map(|items| {
+                    items
+                        .iter()
+                        .map(|i| {
+                            object(vec![
+                                ("exempt_from", field(i, "exempt_from")),
+                                ("exempt_to", field(i, "exempt_to")),
+                            ])
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            let current = periods.iter().any(|p| p.get("exempt_to").is_none());
+            let kind = text(exemption, "exemption_type").unwrap_or(name);
+            out.push(object(vec![
+                ("exemption", Some(Value::from(kind))),
+                ("current", Some(Value::Bool(current))),
+                ("periods", Some(Value::Array(periods))),
+            ]));
+        }
+    }
+    let mut map = Map::new();
+    map.insert("exemptions".into(), Value::Array(out));
+    Value::Object(map)
+}
+
+/// One UK establishment (branch) of an overseas company.
+pub fn uk_establishment_item(item: &Value) -> Value {
+    object(vec![
+        ("company_number", field(item, "company_number")),
+        ("company_name", field(item, "company_name")),
+        ("company_status", field(item, "company_status")),
+        ("locality", field(item, "locality")),
+    ])
+}
+
+/// The format names `download_filing_document` takes, with their content types.
+pub const DOCUMENT_FORMATS: &[(&str, &str)] = &[
+    ("pdf", "application/pdf"),
+    ("xhtml", "application/xhtml+xml"),
+    ("xml", "application/xml"),
+    ("json", "application/json"),
+];
+
+/// The format name of a content type, or the content type itself when it has none.
+pub fn format_name(content_type: &str) -> &str {
+    DOCUMENT_FORMATS
+        .iter()
+        .find(|(_, t)| t.eq_ignore_ascii_case(content_type))
+        .map(|(f, _)| *f)
+        .unwrap_or(content_type)
+}
+
+/// Document API metadata: what the document is and the formats it can be downloaded in.
+pub fn document_metadata(id: &str, v: &Value) -> Value {
+    let formats: Vec<Value> = v
+        .get("resources")
+        .and_then(Value::as_object)
+        .map(|resources| {
+            resources
+                .iter()
+                .map(|(content_type, r)| {
+                    object(vec![
+                        ("format", Some(Value::from(format_name(content_type)))),
+                        ("content_type", Some(Value::from(content_type.as_str()))),
+                        ("size_bytes", field(r, "content_length")),
+                    ])
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    object(vec![
+        ("document_id", Some(Value::from(id))),
+        ("company_number", field(v, "company_number")),
+        ("category", field(v, "category")),
+        ("pages", field(v, "pages")),
+        ("created_at", field(v, "created_at")),
+        ("significant_date", field(v, "significant_date")),
+        ("significant_date_type", field(v, "significant_date_type")),
+        ("formats", Some(Value::Array(formats))),
+    ])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -243,5 +380,75 @@ mod tests {
             })
         );
         assert_eq!(insolvency(&json!({})), json!({"cases": []}));
+    }
+
+    #[test]
+    fn registers_show_where_each_is_kept_now() {
+        let v = json!({
+            "registers": {
+                "directors": {"register_type": "directors", "items": [
+                    {"moved_on": "2018-01-01", "register_moved_to": "single-alternative-inspection-location"},
+                    {"moved_on": "2021-05-05", "register_moved_to": "public-register",
+                     "links": {"filing": "/company/00000001/filing-history/tx9"}}
+                ]},
+                "members": {"register_type": "members", "items": []}
+            }
+        });
+        assert_eq!(
+            registers(&v),
+            json!({"registers": [
+                {"register": "directors", "location": "public-register", "since": "2021-05-05", "history": [
+                    {"location": "public-register", "moved_on": "2021-05-05", "transaction_id": "tx9"},
+                    {"location": "single-alternative-inspection-location", "moved_on": "2018-01-01"}
+                ]},
+                {"register": "members"}
+            ]})
+        );
+        assert_eq!(registers(&json!({})), json!({"registers": []}));
+    }
+
+    #[test]
+    fn exemptions_say_whether_they_still_apply() {
+        let v = json!({"exemptions": {
+            "psc_exempt_as_trading_on_regulated_market": {
+                "exemption_type": "psc-exempt-as-trading-on-regulated-market",
+                "items": [{"exempt_from": "2016-04-06"}]
+            },
+            "disclosure_transparency_rules_chapter_five_applies": {
+                "exemption_type": "disclosure-transparency-rules-chapter-five-applies",
+                "items": [{"exempt_from": "2016-04-06", "exempt_to": "2019-01-01"}]
+            }
+        }});
+        assert_eq!(
+            exemptions(&v),
+            json!({"exemptions": [
+                {"exemption": "disclosure-transparency-rules-chapter-five-applies", "current": false,
+                 "periods": [{"exempt_from": "2016-04-06", "exempt_to": "2019-01-01"}]},
+                {"exemption": "psc-exempt-as-trading-on-regulated-market", "current": true,
+                 "periods": [{"exempt_from": "2016-04-06"}]}
+            ]})
+        );
+    }
+
+    #[test]
+    fn document_metadata_lists_formats_by_name() {
+        let v = json!({
+            "company_number": "00000001", "category": "accounts", "pages": 3, "etag": "",
+            "created_at": "2024-12-20T10:00:00Z", "significant_date": null,
+            "links": {"self": "x", "document": "x/content"},
+            "resources": {"application/pdf": {"content_length": 1234}, "application/xhtml+xml": {"content_length": 99}}
+        });
+        assert_eq!(
+            document_metadata("doc-1", &v),
+            json!({
+                "document_id": "doc-1", "company_number": "00000001", "category": "accounts", "pages": 3,
+                "created_at": "2024-12-20T10:00:00Z",
+                "formats": [
+                    {"format": "pdf", "content_type": "application/pdf", "size_bytes": 1234},
+                    {"format": "xhtml", "content_type": "application/xhtml+xml", "size_bytes": 99}
+                ]
+            })
+        );
+        assert_eq!(format_name("text/csv"), "text/csv");
     }
 }

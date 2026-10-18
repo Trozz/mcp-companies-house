@@ -21,6 +21,18 @@ pub const MAX_BODY_BYTES: usize = 8 * 1024 * 1024;
 const MAX_ERROR_DETAIL: usize = 300;
 /// Keys whose rate-limit window is remembered at once; expired windows are dropped first.
 const MAX_TRACKED_KEYS: usize = 10_000;
+/// The live Document API, which serves filed documents. It has no sandbox.
+pub const DEFAULT_DOCUMENT_API_URL: &str =
+    "https://document-api.company-information.service.gov.uk";
+/// Host of the live Public Data API, whose documents the live Document API serves.
+pub const LIVE_API_HOST: &str = "api.company-information.service.gov.uk";
+/// Largest filed document downloaded.
+pub const MAX_DOCUMENT_BYTES: usize = 10 * 1024 * 1024;
+/// Bytes of filed documents the server downloads and encodes at once, across everyone: a
+/// download reserves its `max_bytes` from this budget first and is refused while it is spent.
+pub const DOCUMENT_BUDGET_BYTES: usize = 64 * 1024 * 1024;
+/// Unit of the document budget's semaphore.
+const BUDGET_UNIT: usize = 1024;
 
 pub struct ApiSettings {
     /// `COMPANIES_HOUSE_API_URL`: every request goes to this origin and below this path.
@@ -32,11 +44,28 @@ pub struct ApiSettings {
     /// `DEBUG_UNSAFE_LOG_CONTENT` is on (read per request, because the service is built before
     /// logging is initialised).
     pub log_bodies: bool,
+    /// `COMPANIES_HOUSE_DOCUMENT_API_URL`: where filed documents are fetched. `None` when the
+    /// environment has no Document API (the sandbox).
+    pub documents: Option<Url>,
+}
+
+/// The Document API that goes with an API base: the live one for the live API, none otherwise.
+pub fn default_documents(base: &Url) -> Option<Url> {
+    (base.host_str() == Some(LIVE_API_HOST))
+        .then(|| Url::parse(DEFAULT_DOCUMENT_API_URL).expect("a valid constant URL"))
+}
+
+/// A filed document's bytes and the content type it was served as.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Document {
+    pub bytes: Vec<u8>,
+    pub content_type: String,
 }
 
 impl ApiSettings {
     pub fn new(base: Url) -> Self {
         ApiSettings {
+            documents: default_documents(&base),
             base,
             connect_timeout: CONNECT_TIMEOUT,
             request_timeout: REQUEST_TIMEOUT,
@@ -77,7 +106,12 @@ pub struct ChClient {
     /// The latest rate-limit window of each key, by key fingerprint: every person's key has
     /// its own 600 requests per 5 minutes.
     rates: Mutex<HashMap<[u8; 32], RateLimit>>,
+    /// [`DOCUMENT_BUDGET_BYTES`], in units of [`BUDGET_UNIT`].
+    documents_in_flight: std::sync::Arc<tokio::sync::Semaphore>,
 }
+
+/// Room reserved in the document budget, given back when dropped.
+pub type DocumentPermit = tokio::sync::OwnedSemaphorePermit;
 
 fn now_unix() -> u64 {
     SystemTime::now()
@@ -147,6 +181,10 @@ fn map_status(path: &str, status: StatusCode, body: &str, reset_in_secs: Option<
         403 => ChError::KeyRestricted,
         404 => ChError::NotFound(format!("nothing found at {path}")),
         429 => ChError::RateLimited { reset_in_secs },
+        406 => ChError::Validation(
+            "Companies House cannot provide that document in the requested format (HTTP 406); check its formats with metadata_only"
+                .into(),
+        ),
         416 => ChError::Validation(
             "Companies House refused the requested range (HTTP 416); search results stop at the first 1000 matches, so narrow the query"
                 .into(),
@@ -177,11 +215,34 @@ impl ChClient {
             http,
             settings,
             rates: Mutex::new(HashMap::new()),
+            documents_in_flight: std::sync::Arc::new(tokio::sync::Semaphore::new(
+                DOCUMENT_BUDGET_BYTES / BUDGET_UNIT,
+            )),
         })
+    }
+
+    /// Reserves `max_bytes` of the server's document budget for one download, until the permit
+    /// is dropped. Refused (`Busy`) while other downloads hold too much of it.
+    pub fn reserve_document(&self, max_bytes: usize) -> Result<DocumentPermit> {
+        let units = max_bytes.div_ceil(BUDGET_UNIT).max(1) as u32;
+        self.documents_in_flight
+            .clone()
+            .try_acquire_many_owned(units)
+            .map_err(|_| {
+                metrics::counter!("companies_house_document_downloads_refused_total").increment(1);
+                ChError::Busy(
+                    "the server is downloading too many documents at once; try again in a minute, or ask for a smaller max_bytes".into(),
+                )
+            })
     }
 
     pub fn base(&self) -> &Url {
         &self.settings.base
+    }
+
+    /// The Document API filed documents come from; `None` when this server has none.
+    pub fn documents(&self) -> Option<&Url> {
+        self.settings.documents.as_ref()
     }
 
     /// The rate-limit window of `key` from its latest response, if Companies House sent one.
@@ -268,7 +329,164 @@ impl ChClient {
         segments: &[&str],
         query: &[(&str, String)],
     ) -> Result<Value> {
-        let url = self.url(segments, query);
+        self.get_url(key, endpoint, self.url(segments, query)).await
+    }
+
+    /// The Document API URL of document `id`, or of its content.
+    pub fn document_url(&self, id: &str, content: bool) -> Result<Url> {
+        let base = self.settings.documents.as_ref().ok_or_else(|| {
+            ChError::invalid(
+                "filed documents cannot be downloaded on this server: Companies House's Document API has no sandbox, so documents are only available on a server using the live API",
+            )
+        })?;
+        let mut url = base.clone();
+        {
+            let mut segs = url
+                .path_segments_mut()
+                .expect("an http(s) base URL has path segments");
+            segs.pop_if_empty().extend(["document", id]);
+            if content {
+                segs.push("content");
+            }
+        }
+        Ok(url)
+    }
+
+    /// The Document API's metadata for document `id`: page count, dates and the formats
+    /// (content types) it is available in, with their sizes.
+    pub async fn document_metadata(&self, key: &Credential, id: &str) -> Result<Value> {
+        self.get_url(key, "document_metadata", self.document_url(id, false)?)
+            .await
+    }
+
+    /// The content of document `id` as `accept` (e.g. `application/pdf`), at most `max_bytes`.
+    /// Companies House answers with a redirect to its document storage, which is fetched without
+    /// the caller's key and only over https (or http to a loopback address, for tests).
+    pub async fn document_content(
+        &self,
+        key: &Credential,
+        id: &str,
+        accept: &str,
+        max_bytes: usize,
+        size_hint: Option<usize>,
+    ) -> Result<Document> {
+        let url = self.document_url(id, true)?;
+        let path = url.path().to_string();
+        let fingerprint = key.fingerprint();
+        if let Some(reset_in_secs) = self.exhausted_for(&fingerprint) {
+            metrics::counter!("companies_house_rate_limited_total", "source" => "local")
+                .increment(1);
+            tracing::warn!(
+                endpoint = "document_content",
+                reset_in_secs,
+                "rate limit used up; not calling Companies House"
+            );
+            return Err(ChError::RateLimited {
+                reset_in_secs: Some(reset_in_secs),
+            });
+        }
+        let request = self
+            .http
+            .get(url.clone())
+            .basic_auth(key.expose(), Some(""))
+            .header(reqwest::header::ACCEPT, accept);
+        let response = self
+            .send_retrying("document_content", request)
+            .await
+            .map_err(|e| ChError::Upstream(format!("GET {path} failed: {}", describe(e))))?;
+        let status = response.status();
+        let reset_in_secs = self.record_rate(fingerprint, response.headers(), status);
+        let capacity = size_hint.unwrap_or(0).min(max_bytes);
+        if status.is_success() {
+            return read_document(response, &path, accept, max_bytes, capacity).await;
+        }
+        if !status.is_redirection() {
+            if status == StatusCode::TOO_MANY_REQUESTS {
+                metrics::counter!("companies_house_rate_limited_total", "source" => "upstream")
+                    .increment(1);
+            }
+            let body = read_body(response, &path).await.unwrap_or_default();
+            return Err(map_status(&path, status, &body, reset_in_secs));
+        }
+        let location = response
+            .headers()
+            .get(reqwest::header::LOCATION)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|l| url.join(l).ok())
+            .ok_or_else(|| {
+                ChError::Upstream(format!("GET {path} redirected without a usable location"))
+            })?;
+        let safe = location.username().is_empty()
+            && location.password().is_none()
+            && (location.scheme() == "https"
+                || (location.scheme() == "http" && crate::config::is_loopback(&location)));
+        if !safe {
+            return Err(ChError::Upstream(format!(
+                "GET {path} redirected to a location that is not https; not following it"
+            )));
+        }
+        let request = self
+            .http
+            .get(location)
+            .header(reqwest::header::ACCEPT, accept);
+        let stored = self
+            .send_retrying("document_storage", request)
+            .await
+            .map_err(|e| {
+                ChError::Upstream(format!(
+                    "fetching document {id} from storage failed: {}",
+                    describe(e)
+                ))
+            })?;
+        if !stored.status().is_success() {
+            return Err(ChError::Upstream(format!(
+                "fetching document {id} from storage returned HTTP {}",
+                stored.status().as_u16()
+            )));
+        }
+        read_document(stored, &path, accept, max_bytes, capacity).await
+    }
+
+    /// Sends a GET, timed and counted under `endpoint`, and sends it once more after a network
+    /// error or a 5xx, as JSON requests are.
+    async fn send_retrying(
+        &self,
+        endpoint: &'static str,
+        request: reqwest::RequestBuilder,
+    ) -> std::result::Result<reqwest::Response, reqwest::Error> {
+        let again = request.try_clone();
+        let first = self.send_timed(endpoint, request).await;
+        let retry = match &first {
+            Err(_) => true,
+            Ok(r) => r.status().is_server_error(),
+        };
+        match (retry, again) {
+            (true, Some(again)) => {
+                tracing::debug!(endpoint, "retrying");
+                tokio::time::sleep(self.settings.retry_delay).await;
+                self.send_timed(endpoint, again).await
+            }
+            _ => first,
+        }
+    }
+
+    async fn send_timed(
+        &self,
+        endpoint: &'static str,
+        request: reqwest::RequestBuilder,
+    ) -> std::result::Result<reqwest::Response, reqwest::Error> {
+        let started = Instant::now();
+        let response = request.send().await;
+        let status = response.as_ref().ok().map(|r| r.status());
+        metrics::counter!("companies_house_requests_total", "endpoint" => endpoint, "status_class" => status_class(status))
+            .increment(1);
+        metrics::histogram!("companies_house_request_duration_seconds", "endpoint" => endpoint)
+            .record(started.elapsed().as_secs_f64());
+        response
+    }
+
+    /// GET a JSON resource at `url` (on the API or the Document API).
+    async fn get_url(&self, key: &Credential, endpoint: &'static str, url: Url) -> Result<Value> {
         let path = url.path().to_string();
         let fingerprint = key.fingerprint();
         if let Some(reset_in_secs) = self.exhausted_for(&fingerprint) {
@@ -363,6 +581,47 @@ fn describe(e: reqwest::Error) -> String {
         source = s.source();
     }
     msg
+}
+
+/// Reads a document body of at most `max_bytes`, refusing a larger one.
+async fn read_document(
+    mut response: reqwest::Response,
+    path: &str,
+    accept: &str,
+    max_bytes: usize,
+    capacity: usize,
+) -> Result<Document> {
+    let content_type = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.split(';').next().unwrap_or(v).trim().to_string())
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| accept.to_string());
+    let mut bytes: Vec<u8> = Vec::with_capacity(capacity);
+    loop {
+        match response.chunk().await {
+            Ok(Some(chunk)) => {
+                if bytes.len() + chunk.len() > max_bytes {
+                    return Err(ChError::Validation(format!(
+                        "the document is larger than max_bytes ({max_bytes}); raise max_bytes (up to {MAX_DOCUMENT_BYTES}) or use metadata_only to see its size"
+                    )));
+                }
+                bytes.extend_from_slice(&chunk);
+            }
+            Ok(None) => break,
+            Err(e) => {
+                return Err(ChError::Upstream(format!(
+                    "reading the document for {path} failed: {}",
+                    describe(e)
+                )));
+            }
+        }
+    }
+    Ok(Document {
+        bytes,
+        content_type,
+    })
 }
 
 async fn read_body(mut response: reqwest::Response, path: &str) -> Result<String> {

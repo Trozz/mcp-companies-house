@@ -10,6 +10,9 @@ pub const SANDBOX_API_URL: &str = "https://api-sandbox.company-information.servi
 /// logging). There is no API key: each person signs in with their own.
 pub struct DataConfig {
     pub api_url: Url,
+    /// `COMPANIES_HOUSE_DOCUMENT_API_URL`, when set. Unset, the live Document API is used with
+    /// the live API, and no Document API with any other (the sandbox has none).
+    pub document_api_url: Option<Url>,
 }
 
 impl DataConfig {
@@ -18,28 +21,50 @@ impl DataConfig {
         let raw_url = env
             .optional("COMPANIES_HOUSE_API_URL")
             .unwrap_or_else(|| DEFAULT_API_URL.to_string());
-        let api_url = match parse_api_url(&raw_url) {
+        let api_url = match parse_url(API_URL_VAR, &raw_url) {
             Ok(u) => Some(u),
             Err(msg) => {
                 env.errors.push(msg);
                 None
             }
         };
+        let document_api_url = match env.optional(DOCUMENT_API_URL_VAR) {
+            Some(raw) => match parse_url(DOCUMENT_API_URL_VAR, &raw) {
+                Ok(u) => Some(u),
+                Err(msg) => {
+                    env.errors.push(msg);
+                    None
+                }
+            },
+            None => None,
+        };
         if env.errors.len() != errors_before {
             return None;
         }
-        Some(DataConfig { api_url: api_url? })
+        Some(DataConfig {
+            api_url: api_url?,
+            document_api_url,
+        })
     }
 }
 
+const API_URL_VAR: &str = "COMPANIES_HOUSE_API_URL";
+const DOCUMENT_API_URL_VAR: &str = "COMPANIES_HOUSE_DOCUMENT_API_URL";
+
+#[cfg(test)]
 fn parse_api_url(raw: &str) -> Result<Url, String> {
-    let url =
-        Url::parse(raw).map_err(|e| format!("COMPANIES_HOUSE_API_URL is not a valid URL: {e}"))?;
+    parse_url(API_URL_VAR, raw)
+}
+
+/// An API origin from variable `name`: https, or http to a loopback address; no credentials,
+/// query or fragment.
+fn parse_url(name: &str, raw: &str) -> Result<Url, String> {
+    let url = Url::parse(raw).map_err(|e| format!("{name} is not a valid URL: {e}"))?;
     if !url.username().is_empty() || url.password().is_some() {
-        return Err("COMPANIES_HOUSE_API_URL must not contain credentials".into());
+        return Err(format!("{name} must not contain credentials"));
     }
     if url.query().is_some() || url.fragment().is_some() {
-        return Err("COMPANIES_HOUSE_API_URL must not contain a query or fragment".into());
+        return Err(format!("{name} must not contain a query or fragment"));
     }
     if url.scheme() == "https" && url.host_str().is_some() {
         return Ok(url);
@@ -47,13 +72,12 @@ fn parse_api_url(raw: &str) -> Result<Url, String> {
     if url.scheme() == "http" && is_loopback(&url) {
         return Ok(url);
     }
-    Err(
-        "COMPANIES_HOUSE_API_URL must use https (http is only allowed for loopback addresses)"
-            .into(),
-    )
+    Err(format!(
+        "{name} must use https (http is only allowed for loopback addresses)"
+    ))
 }
 
-fn is_loopback(url: &Url) -> bool {
+pub(crate) fn is_loopback(url: &Url) -> bool {
     match url.host() {
         Some(url::Host::Domain(d)) => d.eq_ignore_ascii_case("localhost"),
         Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
@@ -121,6 +145,30 @@ mod tests {
         assert!(c.is_none());
         assert!(
             errors.iter().any(|e| e.contains("COMPANIES_HOUSE_API_URL")),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn the_document_api_is_optional_and_checked_like_the_api() {
+        let (c, errors) = load(&[]);
+        assert!(errors.is_empty(), "{errors:?}");
+        assert!(c.unwrap().document_api_url.is_none());
+        let (c, errors) = load(&[(
+            "COMPANIES_HOUSE_DOCUMENT_API_URL",
+            "http://127.0.0.1:9999/docs/",
+        )]);
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(
+            c.unwrap().document_api_url.unwrap().as_str(),
+            "http://127.0.0.1:9999/docs/"
+        );
+        let (c, errors) = load(&[("COMPANIES_HOUSE_DOCUMENT_API_URL", "http://example.com")]);
+        assert!(c.is_none());
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("COMPANIES_HOUSE_DOCUMENT_API_URL must use https")),
             "{errors:?}"
         );
     }

@@ -20,6 +20,9 @@ pub enum ChError {
     },
     #[error("{0}")]
     Validation(String),
+    /// The server is too busy for this request just now (for example, document downloads).
+    #[error("{0}")]
+    Busy(String),
     #[error("Companies House error: {0}")]
     Upstream(String),
     #[error("{0}")]
@@ -39,7 +42,7 @@ impl ChError {
         match self {
             ChError::Auth | ChError::KeyRestricted | ChError::MissingKey => "auth",
             ChError::NotFound(_) => "not_found",
-            ChError::RateLimited { .. } => "rate_limited",
+            ChError::RateLimited { .. } | ChError::Busy(_) => "rate_limited",
             ChError::Validation(_) => "validation",
             ChError::Upstream(_) => "upstream",
             ChError::Internal(_) => "internal",

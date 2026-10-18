@@ -21,8 +21,9 @@ pub const SERVICES: &[(&str, ServiceFactory)] =
     &[("companies", mcp_companies_house_data::from_env)];
 
 /// The server: `COMPANIES_HOUSE_SERVICES`, `COMPANIES_HOUSE_COMBINED` and
-/// `COMPANIES_HOUSE_READ_ONLY` choose what runs, and people sign in with the Companies House API
-/// key of the first service that checks one.
+/// `COMPANIES_HOUSE_READ_ONLY` choose what runs, and people sign in with their own Companies House
+/// API key, checked by the one enabled service that defines sign-in (more than one is a startup
+/// error).
 pub fn server() -> Server {
     Server::new(SERVICE_NAME, VERSION)
         .env_prefix("COMPANIES_HOUSE")
@@ -116,7 +117,7 @@ mod tests {
         let mut e = env(CORE);
         let loaded = server().load(&mut e).expect("loads");
         let names = Server::combined_tool_names(&loaded.services);
-        assert_eq!(names.len(), 18);
+        assert_eq!(names.len(), 26);
         assert!(names.contains(&"companies_search_companies".to_string()));
         let unique: std::collections::HashSet<_> = names.iter().collect();
         assert_eq!(unique.len(), names.len());

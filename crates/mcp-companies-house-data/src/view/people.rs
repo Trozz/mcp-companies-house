@@ -1,6 +1,6 @@
 //! Shapes for officers, appointments, persons with significant control and disqualified officers.
 
-use super::{at, birth, field, object, one_line_address, segment_after, text};
+use super::{at, birth, field, last_segment, object, one_line_address, segment_after, text};
 use serde_json::Value;
 
 fn address(v: &Value, key: &str) -> Option<Value> {
@@ -9,6 +9,19 @@ fn address(v: &Value, key: &str) -> Option<Value> {
 
 fn link<'a>(v: &'a Value, path: &str) -> Option<&'a str> {
     at(v, path).and_then(Value::as_str)
+}
+
+/// The id at the end of a link, e.g. the appointment id of `/company/{n}/appointments/{id}`.
+fn link_id(v: &Value, path: &str) -> Option<Value> {
+    link(v, path).and_then(last_segment).map(Value::from)
+}
+
+/// `identity_verification_details` of an officer or PSC: when Companies House received their
+/// identity verification statement for this role (`appointment_verification_start_on`), when it
+/// is due, and, for checks made by an authorised agent, who made it. Absent means none is on
+/// record, not that verification failed.
+fn identity_verification(item: &Value) -> Option<Value> {
+    item.get("identity_verification_details").cloned()
 }
 
 /// One officer of `/company/{number}/officers`. `officer_id` is what
@@ -45,7 +58,15 @@ pub fn officer_item(item: &Value) -> Value {
         ("address", address(item, "address")),
         ("former_names", Some(Value::Array(former))),
         ("identification", field(item, "identification")),
+        ("identity_verification", identity_verification(item)),
+        ("responsibilities", field(item, "responsibilities")),
+        (
+            "principal_office_address",
+            address(item, "principal_office_address"),
+        ),
+        ("contact_details", field(item, "contact_details")),
         ("officer_id", officer_id.map(Value::from)),
+        ("appointment_id", link_id(item, "links/self")),
     ])
 }
 
@@ -69,8 +90,12 @@ pub fn appointment_item(item: &Value) -> Value {
         ("appointed_before", field(item, "appointed_before")),
         ("resigned_on", field(item, "resigned_on")),
         ("occupation", field(item, "occupation")),
+        ("nationality", field(item, "nationality")),
+        ("country_of_residence", field(item, "country_of_residence")),
         ("name", field(item, "name")),
         ("address", address(item, "address")),
+        ("identification", field(item, "identification")),
+        ("identity_verification", identity_verification(item)),
     ])
 }
 
@@ -115,6 +140,8 @@ pub fn psc_item(item: &Value) -> Value {
         ("identification", field(item, "identification")),
         ("is_sanctioned", field(item, "is_sanctioned")),
         ("description", field(item, "description")),
+        ("identity_verification", identity_verification(item)),
+        ("psc_id", link_id(item, "links/self")),
     ])
 }
 
@@ -128,6 +155,11 @@ pub fn psc_statement_item(item: &Value) -> Value {
         (
             "restrictions_notice_withdrawal_reason",
             field(item, "restrictions_notice_withdrawal_reason"),
+        ),
+        ("statement_id", link_id(item, "links/self")),
+        (
+            "psc_id",
+            link_id(item, "links/person_with_significant_control"),
         ),
     ])
 }
@@ -170,6 +202,7 @@ mod tests {
             "address": {"premises": "1", "address_line_1": "Park Row", "locality": "Leeds", "postal_code": "LS1 5AB"},
             "former_names": [{"forenames": "Jane", "surname": "Jones"}],
             "links": {"self": "/company/00000001/appointments/apt1", "officer": {"appointments": "/officers/off-Jane_1/appointments"}},
+            "identity_verification_details": {"appointment_verification_start_on": "2025-11-18"},
             "etag": "e"
         });
         assert_eq!(
@@ -178,7 +211,8 @@ mod tests {
                 "name": "SMITH, Jane Anne", "officer_role": "director", "appointed_on": "2015-03-01",
                 "occupation": "Engineer", "nationality": "British", "country_of_residence": "England",
                 "date_of_birth": "1980-04", "address": "1, Park Row, Leeds, LS1 5AB",
-                "former_names": ["Jane Jones"], "officer_id": "off-Jane_1"
+                "former_names": ["Jane Jones"], "officer_id": "off-Jane_1", "appointment_id": "apt1",
+                "identity_verification": {"appointment_verification_start_on": "2025-11-18"}
             })
         );
     }
@@ -219,14 +253,26 @@ mod tests {
         let item = json!({
             "name": "Mrs Jane Anne Smith", "kind": "individual-person-with-significant-control",
             "notified_on": "2016-04-06", "natures_of_control": ["ownership-of-shares-75-to-100-percent"],
-            "date_of_birth": {"month": 4, "year": 1980}, "etag": "e", "links": {"self": "/x"}
+            "date_of_birth": {"month": 4, "year": 1980}, "etag": "e",
+            "links": {"self": "/company/00000001/persons-with-significant-control/individual/psc-1"}
         });
         assert_eq!(
             psc_item(&item),
             json!({
                 "name": "Mrs Jane Anne Smith", "kind": "individual", "notified_on": "2016-04-06",
-                "natures_of_control": ["ownership-of-shares-75-to-100-percent"], "date_of_birth": "1980-04"
+                "natures_of_control": ["ownership-of-shares-75-to-100-percent"], "date_of_birth": "1980-04",
+                "psc_id": "psc-1"
             })
+        );
+        let statement = json!({
+            "statement": "psc-details-not-confirmed", "linked_psc_name": "Jane Smith",
+            "links": {"self": "/company/00000001/persons-with-significant-control-statements/st-1",
+                      "person_with_significant_control": "/company/00000001/persons-with-significant-control/individual/psc-1"}
+        });
+        assert_eq!(
+            psc_statement_item(&statement),
+            json!({"statement": "psc-details-not-confirmed", "linked_psc_name": "Jane Smith",
+                   "statement_id": "st-1", "psc_id": "psc-1"})
         );
         let bo = json!({"name": "X", "kind": "individual-beneficial-owner"});
         assert_eq!(psc_item(&bo)["kind"], "individual-beneficial-owner");
