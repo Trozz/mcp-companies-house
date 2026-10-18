@@ -79,8 +79,6 @@ jobs:
       - name: Append install instructions
         env:
           VERSION: ${{ needs.version.outputs.version }}
-          TAG: ${{ needs.version.outputs.tag }}
-          REPO: ${{ github.repository }}
         run: |
           cat >> NOTES.md <<EOF
 
@@ -111,7 +109,7 @@ jobs:
           - claude.ai: add a custom connector for \`https://<your PUBLIC_URL host>/mcp\` and sign in with your Companies House API key.
           - Claude Code: \`claude mcp add --transport http companies-house https://<host>/mcp --header "Authorization: Bearer <your Companies House API key>"\`
 
-          Full configuration reference: https://github.com/${REPO}/blob/${TAG}/README.md
+          Full configuration reference: https://trozz.github.io/mcp-companies-house/configuration.html
           EOF
       - uses: softprops/action-gh-release@v3
         with:

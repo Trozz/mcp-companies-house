@@ -1,0 +1,19 @@
+[book]
+title = "mcp-companies-house"
+description = "A self-hosted MCP server for the UK Companies House register"
+language = "en"
+src = "src"
+
+[build]
+create-missing = false
+
+[preprocessor.mermaid]
+command = "mdbook-mermaid"
+
+[output]
+
+[output.html]
+site-url = "/mcp-companies-house/"
+git-repository-url = "https://github.com/Trozz/mcp-companies-house"
+edit-url-template = "https://github.com/Trozz/mcp-companies-house/edit/develop/docs/{path}"
+additional-js = ["mermaid.min.js", "mermaid-init.js"]

@@ -86,6 +86,19 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
+  docs:
+    name: docs
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - run: |
+          bash scripts/install-docs-tools.sh "$RUNNER_TEMP/bin"
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+      - run: bash scripts/build-docs.sh
+
   scripts:
     name: scripts
     runs-on: ubuntu-24.04
