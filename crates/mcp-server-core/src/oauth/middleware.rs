@@ -2,7 +2,7 @@ use super::AuthState;
 use super::authorize::client_ip;
 use crate::credential::{self, Credential, CredentialCheck};
 use crate::credential::{CheckRunner, Lead, Ticket};
-use crate::guards::Reservation;
+use crate::guards::{Refusal, Reservation};
 use crate::jwt::TokenKind;
 use axum::extract::{ConnectInfo, Request, State};
 use axum::http::{HeaderValue, StatusCode, header};
@@ -55,6 +55,10 @@ fn too_many_attempts() -> Response {
     res
 }
 
+/// Why a key cannot be checked while the server refuses new addresses during an attack.
+pub(crate) const BUSY: &str =
+    "the server is refusing new addresses while it is under heavy load; try again shortly";
+
 /// The verdict followers get when their lead was refused for too many attempts.
 pub(crate) fn refused() -> CredentialCheck {
     CredentialCheck::Unavailable("too many attempts from this address; try again shortly".into())
@@ -79,7 +83,9 @@ pub(crate) async fn settled_check(
                 .lead(lead, st.verifier.as_ref(), &credential)
                 .await;
             let rejected = matches!(verdict, CredentialCheck::Invalid(_));
-            if !rejected {
+            if rejected {
+                st.limiter.fail(reservation);
+            } else {
                 st.limiter.refund(reservation);
             }
             if let Some(fp) = cache
@@ -165,15 +171,20 @@ pub async fn require_bearer(
             // goes upstream, so concurrent attempts cannot get past the limit.
             let verdict = match st.checks.join(fingerprint) {
                 Ticket::Follow(rx) => CheckRunner::follow(rx).await,
-                Ticket::Lead(lead) => {
-                    let Some(reservation) = st.limiter.try_reserve(ip) else {
+                Ticket::Lead(lead) => match st.limiter.try_reserve(ip) {
+                    Ok(reservation) => {
+                        settled_check(&st, &token, lead, reservation, Some(fingerprint)).await
+                    }
+                    Err(refusal) => {
                         st.checks.finish(lead, refused());
                         metrics::counter!("bearer_credential_checks_total", "outcome" => "rate_limited")
                             .increment(1);
-                        return too_many_attempts();
-                    };
-                    settled_check(&st, &token, lead, reservation, Some(fingerprint)).await
-                }
+                        return match refusal {
+                            Refusal::TooMany => too_many_attempts(),
+                            Refusal::Busy => unavailable(&st, BUSY),
+                        };
+                    }
+                },
             };
             match verdict {
                 CredentialCheck::Valid => {
