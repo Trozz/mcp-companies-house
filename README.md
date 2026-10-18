@@ -76,6 +76,23 @@ Every Companies House request then uses the caller's own key, so each person has
 | `officer_network` | Every company one officer is or was appointed to, split into `current` and `past` (resigned, or the company dissolved or closed), with each company's status and a count by status. Reads the whole appointment list, up to 1000. Takes `officer_id`, or `officer_name` when it matches exactly one officer: names are not unique, so otherwise it lists the candidates |
 | `search_disqualified_officers`, `get_disqualified_officer` | People and companies disqualified from being directors, and the details of each disqualification |
 
+### Prompts
+
+Ready-made requests for common jobs. Clients show them as slash commands or in a prompt menu (on `/mcp` they are prefixed too: `companies_due_diligence`). Each one tells the model which tools to call, in what order, how many requests it may spend, how to set out the answer and what the register cannot say.
+
+| Prompt | Arguments | What it does |
+|---|---|---|
+| `overview` | `company`, optional `since` | A factual summary of one company; with `since`, a timeline of what it has filed since that date |
+| `due_diligence` | `company`, optional `context` | A screen before dealing with a company: the register's flags, disqualification searches and other companies for its directors, who controls it, and, given what the business told you, how that compares with the register. It never clears a company |
+| `director_check` | `name`, optional `company`, `born` | Picks the right person among people with the same name, then maps their appointments, what became of those companies, and any matching disqualification |
+| `ownership_chain` | `company` | Follows corporate owners up the PSC register to the people at the top, and says where the trail stops |
+| `read_accounts` | `company`, optional `focus` | Downloads and reads the latest filed accounts: key figures for two years, the audit position and notes such as going concern (live API only) |
+| `find_companies` | `criteria` | Turns a description such as "active craft breweries in Leeds" into SIC codes and advanced-search filters |
+| `name_check` | `names`, optional `business` | Checks proposed company names for same-name conflicts and close names, and lists what the check does not cover |
+| `watchlist` | `companies`, optional `since` | Status and filing deadlines for up to 20 companies, most urgent first |
+
+Arguments are plain text (up to 2000 characters); a company can be given by name or number.
+
 ### Conventions
 
 - Companies are addressed by company number. Tools ignore spaces, upper-case letters and pad short numbers with zeros (`445790` becomes `00445790`, `SC1234` becomes `SC001234`). Officers, charges, filings, documents and disqualified officers are addressed by the ids the list and search tools return.

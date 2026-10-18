@@ -6,7 +6,12 @@ use chrono::NaiveDate;
 use mcp_server_core::credential::Credential;
 use mcp_server_core::observability::content_logging_enabled;
 use rmcp::handler::server::router::tool::ToolRouter;
-use rmcp::model::{CallToolResult, ContentBlock, Implementation, ServerCapabilities, ServerConfig};
+use rmcp::model::{
+    CallToolResult, ContentBlock, GetPromptRequestParams, GetPromptResponse, GetPromptResult,
+    Implementation, ListPromptsResult, PaginatedRequestParams, PromptMessage, Role,
+    ServerCapabilities, ServerConfig,
+};
+use rmcp::service::{RequestContext, RoleServer};
 use rmcp::{ErrorData as McpError, ServerHandler, tool_handler};
 use serde_json::Value;
 use std::future::Future;
@@ -231,16 +236,45 @@ impl Caller {
 #[tool_handler(router = self.tool_router)]
 impl ServerHandler for CompaniesServer {
     fn get_info(&self) -> ServerConfig {
-        ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
-            .with_server_info(
-                Implementation::new(crate::config::SERVICE_NAME, crate::VERSION).with_icons(
-                    mcp_server_core::service::icons(
-                        include_bytes!("../../assets/icon.png"),
-                        include_str!("../../assets/icon.svg"),
-                    ),
+        ServerConfig::new(
+            ServerCapabilities::builder()
+                .enable_tools()
+                .enable_prompts()
+                .build(),
+        )
+        .with_server_info(
+            Implementation::new(crate::config::SERVICE_NAME, crate::VERSION).with_icons(
+                mcp_server_core::service::icons(
+                    include_bytes!("../../assets/icon.png"),
+                    include_str!("../../assets/icon.svg"),
                 ),
-            )
-            .with_instructions(INSTRUCTIONS)
+            ),
+        )
+        .with_instructions(INSTRUCTIONS)
+    }
+
+    async fn list_prompts(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<ListPromptsResult, McpError> {
+        Ok(ListPromptsResult::with_all_items(crate::prompts::list()))
+    }
+
+    async fn get_prompt(
+        &self,
+        request: GetPromptRequestParams,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<GetPromptResponse, McpError> {
+        let spec = crate::prompts::find(&request.name)
+            .ok_or_else(|| McpError::invalid_params("prompt not found", None))?;
+        let text = crate::prompts::render(spec, &request.arguments.unwrap_or_default())
+            .map_err(|e| McpError::invalid_params(e, None))?;
+        Ok(
+            GetPromptResult::new(vec![PromptMessage::new_text(Role::User, text)])
+                .with_description(spec.description)
+                .into(),
+        )
     }
 }
 
@@ -478,6 +512,41 @@ mod tests {
                 .to_string()
                 .contains("query must not be empty")
         );
+    }
+
+    #[test]
+    fn prompts_name_only_tools_that_exist() {
+        let client = Arc::new(
+            ChClient::new(crate::api::ApiSettings::new(
+                url::Url::parse("https://api.example.com").unwrap(),
+            ))
+            .unwrap(),
+        );
+        let tools = CompaniesServer::new(client).tool_names();
+        let verbs = [
+            "get_",
+            "list_",
+            "search_",
+            "filter_",
+            "browse_",
+            "check_",
+            "lookup_",
+            "download_",
+        ];
+        for spec in crate::prompts::PROMPTS {
+            let words = spec
+                .template
+                .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                .filter(|w| verbs.iter().any(|v| w.starts_with(v)) || w.ends_with("_check"));
+            for word in words {
+                assert!(
+                    tools.iter().any(|t| t == word) || word == "due_diligence_check",
+                    "prompt {} names {word}, which is not a tool",
+                    spec.name
+                );
+            }
+        }
+        assert!(tools.iter().any(|t| t == "due_diligence_check"));
     }
 
     #[test]
