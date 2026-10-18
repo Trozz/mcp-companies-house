@@ -8,7 +8,7 @@ Both services can be built, but each does less than its name suggests. The Strea
 
 **Shared decision.** `COMPANIES_HOUSE_SERVICES` defaults to "all". If "all" grows to include `streaming` and `filing`, existing deployments will fail at startup because they have no stream key or OAuth client. Proposal: the new services run only when listed explicitly, so the default stays `companies`.
 
-**Sign-in.** People now sign in with their own REST key and the server holds no Companies House key. The core has one sign-in per server, checked by the first enabled service. A `/streaming` service would need either a server-wide stream key (as configured below), or a core change so people can also give their own stream key at sign-in. `/filing` already signs each person in with Companies House itself, so it fits the per-person model.
+**Sign-in.** People now sign in with their own REST key and the server holds no Companies House key. The core has one sign-in per server, and a second enabled service defining `credential_verifier` is a startup error. A `/streaming` service would need either a server-wide stream key (as configured below, without its own verifier), or a core change so people can also give their own stream key at sign-in. `/filing` already signs each person in with Companies House itself, so it fits the per-person model.
 
 ## 1. Streaming service (`/streaming`)
 
