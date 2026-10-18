@@ -1,0 +1,256 @@
+name: release
+
+on:
+  push:
+    branches: [develop, main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref_name }}
+  cancel-in-progress: false
+
+env:
+  IMAGE: ghcr.io/trozz/mcp-companies-house
+  CARGO_TERM_COLOR: always
+
+jobs:
+  version:
+    name: version
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+      tag: ${{ steps.v.outputs.tag }}
+      release: ${{ steps.v.outputs.release }}
+      previous: ${{ steps.v.outputs.previous }}
+      range: ${{ steps.v.outputs.range }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+          fetch-tags: true
+      - id: v
+        env:
+          BRANCH: ${{ github.ref_name }}
+          RUN_NUMBER: ${{ github.run_number }}
+          GH_TOKEN: ${{ github.token }}
+        run: bash scripts/next-version.sh
+
+  test:
+    name: test
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@1.99.1
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --workspace --locked
+
+  draft:
+    name: draft release
+    needs: [version, test]
+    if: needs.version.outputs.release == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+          fetch-tags: true
+      - uses: orhun/git-cliff-action@v4
+        with:
+          config: cliff.toml
+          args: --tag ${{ needs.version.outputs.tag }} --strip header ${{ needs.version.outputs.range }}
+        env:
+          OUTPUT: NOTES.md
+      - name: Append install instructions
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          cat >> NOTES.md <<EOF
+
+          ## Install
+
+          ### Docker
+
+          \`\`\`bash
+          docker run -d --name mcp-companies-house -p 8443:8443 \\
+            -e PUBLIC_URL=https://companies-house.example.com \\
+            -e OAUTH_SIGNING_KEY="\$(openssl rand -hex 32)" \\
+            -v /path/to/certs:/certs:ro \\
+            -e TLS_CERT_PATH=/certs/fullchain.pem \\
+            -e TLS_KEY_PATH=/certs/privkey.pem \\
+            ${IMAGE}:${VERSION}
+          \`\`\`
+
+          ### Binary
+
+          Download the archive for your platform below, verify it with the matching \`.sha256\` file (\`shasum -a 256 -c <file>.sha256\`), extract it and run \`./mcp-companies-house\` with the same environment variables.
+
+          ### Connect
+
+          Every service is at \`https://<your PUBLIC_URL host>/mcp\`, with tool names prefixed by their service (\`companies_search_companies\`). Each service also has its own path: company data at \`/companies\`. Set \`COMPANIES_HOUSE_SERVICES\` to run only some of them.
+
+          Each person signs in with their own Companies House REST API key (the server has none). Add \`-e COMPANIES_HOUSE_API_URL=https://api-sandbox.company-information.service.gov.uk\` to serve the sandbox, for sandbox keys.
+
+          - claude.ai: add a custom connector for \`https://<your PUBLIC_URL host>/mcp\` and sign in with your Companies House API key.
+          - Claude Code: \`claude mcp add --transport http companies-house https://<host>/mcp --header "Authorization: Bearer <your Companies House API key>"\`
+
+          Full configuration reference: https://trozz.github.io/mcp-companies-house/configuration.html
+          EOF
+      - uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ needs.version.outputs.tag }}
+          name: mcp-companies-house ${{ needs.version.outputs.version }}
+          body_path: NOTES.md
+          target_commitish: ${{ github.sha }}
+          draft: true
+          prerelease: ${{ github.ref_name == 'develop' }}
+
+  binaries:
+    name: binary ${{ matrix.target }}
+    needs: [version, draft]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-24.04
+            zig: true
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-24.04
+            zig: true
+          - target: aarch64-apple-darwin
+            os: macos-15
+            zig: false
+    env:
+      APP_VERSION: ${{ needs.version.outputs.version }}
+      ARCHIVE: mcp-companies-house-${{ needs.version.outputs.version }}-${{ matrix.target }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@1.99.1
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - if: matrix.zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+      - if: matrix.zig
+        name: Install cargo-zigbuild
+        run: |
+          curl -fsSL -o cargo-zigbuild.tar.xz "https://github.com/rust-cross/cargo-zigbuild/releases/download/v0.23.4/cargo-zigbuild-x86_64-unknown-linux-gnu.tar.xz"
+          echo "6b69963040818ca1ef573d8135a95aa902e17cf7f873c32c6426642dadfe7f59  cargo-zigbuild.tar.xz" | sha256sum -c -
+          sudo tar -xJf cargo-zigbuild.tar.xz -C /usr/local/bin --strip-components=1
+          rm cargo-zigbuild.tar.xz
+          cargo-zigbuild --version
+      - name: Build
+        run: |
+          if [ "${{ matrix.zig }}" = "true" ]; then
+            cargo zigbuild --release --locked -p mcp-companies-house --target "${{ matrix.target }}"
+          else
+            cargo build --release --locked -p mcp-companies-house --target "${{ matrix.target }}"
+          fi
+      - name: Package
+        run: |
+          mkdir -p "dist/${ARCHIVE}"
+          cp "target/${{ matrix.target }}/release/mcp-companies-house" README.md LICENSE "dist/${ARCHIVE}/"
+          tar -C dist -czf "dist/${ARCHIVE}.tar.gz" "${ARCHIVE}"
+          (cd dist && shasum -a 256 "${ARCHIVE}.tar.gz" > "${ARCHIVE}.tar.gz.sha256")
+      - uses: actions/attest-build-provenance@v4
+        with:
+          subject-path: dist/${{ env.ARCHIVE }}.tar.gz
+      - name: Upload to draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "${{ needs.version.outputs.tag }}" "dist/${ARCHIVE}.tar.gz" "dist/${ARCHIVE}.tar.gz.sha256" --clobber --repo "${{ github.repository }}"
+
+  image:
+    name: image
+    needs: [version, draft]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: docker/setup-buildx-action@v4
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ${{ env.IMAGE }}
+          flavor: latest=false
+          tags: |
+            type=raw,value=${{ needs.version.outputs.version }}
+            type=raw,value=develop,enable=${{ github.ref_name == 'develop' }}
+            type=semver,pattern={{major}}.{{minor}},value=${{ needs.version.outputs.version }},enable=${{ github.ref_name == 'main' }}
+            type=semver,pattern={{major}},value=${{ needs.version.outputs.version }},enable=${{ github.ref_name == 'main' }}
+            type=raw,value=latest,enable=${{ github.ref_name == 'main' }}
+      - id: build
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            APP_VERSION=${{ needs.version.outputs.version }}
+          provenance: mode=max
+          sbom: true
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - uses: actions/attest-build-provenance@v4
+        with:
+          subject-name: ${{ env.IMAGE }}
+          subject-digest: ${{ steps.build.outputs.digest }}
+          push-to-registry: true
+
+  publish:
+    name: publish release
+    needs: [version, binaries, image]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - name: Publish draft (creates the tag)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          latest=false
+          if [ "${{ github.ref_name }}" = "main" ]; then latest=true; fi
+          gh release edit "${{ needs.version.outputs.tag }}" --repo "${{ github.repository }}" --draft=false --latest="${latest}"
