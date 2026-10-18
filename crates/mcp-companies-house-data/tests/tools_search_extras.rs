@@ -1,7 +1,7 @@
 mod support;
 use serde_json::json;
 use support::fake_ch::{FakeCh, FakeState, Injected};
-use support::tools::{error_text, json, params, server};
+use support::tools::{auth, error_text, json, params, server};
 
 async fn fake() -> FakeCh {
     FakeCh::start(FakeState::register()).await
@@ -12,7 +12,7 @@ async fn get_company_describes_its_sic_codes() {
     let fake = fake().await;
     let v = json(
         &server(&fake)
-            .get_company(params(json!({"company_number": "2"})))
+            .get_company(params(json!({"company_number": "2"})), auth())
             .await
             .unwrap(),
     );
@@ -31,7 +31,7 @@ async fn dissolved_companies_are_found_by_name_or_previous_name() {
     let fake = fake().await;
     let s = server(&fake);
     let v = json(
-        &s.search_dissolved_companies(params(json!({"query": "thistle"})))
+        &s.search_dissolved_companies(params(json!({"query": "thistle"})), auth())
             .await
             .unwrap(),
     );
@@ -52,9 +52,10 @@ async fn dissolved_companies_are_found_by_name_or_previous_name() {
     assert_eq!(log[0].param("size"), Some("20"));
 
     let v = json(
-        &s.search_dissolved_companies(params(
-            json!({"query": "thistle code", "match_on": "previous_names"}),
-        ))
+        &s.search_dissolved_companies(
+            params(json!({"query": "thistle code", "match_on": "previous_names"})),
+            auth(),
+        )
         .await
         .unwrap(),
     );
@@ -65,7 +66,7 @@ async fn dissolved_companies_are_found_by_name_or_previous_name() {
     );
 
     let v = json(
-        &s.search_dissolved_companies(params(json!({"query": "nothing like it"})))
+        &s.search_dissolved_companies(params(json!({"query": "nothing like it"})), auth())
             .await
             .unwrap(),
     );
@@ -77,7 +78,7 @@ async fn name_availability_uses_the_legally_equivalent_search() {
     let fake = fake().await;
     let s = server(&fake);
     let v = json(
-        &s.check_company_name_availability(params(json!({"name": "Acme Widgets Ltd"})))
+        &s.check_company_name_availability(params(json!({"name": "Acme Widgets Ltd"})), auth())
             .await
             .unwrap(),
     );
@@ -95,7 +96,7 @@ async fn name_availability_uses_the_legally_equivalent_search() {
         "kind": "search#companies", "total_results": 0, "items": [], "items_per_page": 100, "start_index": 0
     })));
     let v = json(
-        &s.check_company_name_availability(params(json!({"name": "Zebra Quantum Ltd"})))
+        &s.check_company_name_availability(params(json!({"name": "Zebra Quantum Ltd"})), auth())
             .await
             .unwrap(),
     );
@@ -108,7 +109,7 @@ async fn name_availability_uses_the_legally_equivalent_search() {
                    "company_type": "ltd", "address_snippet": "Leeds", "date_of_creation": "2015-03-01"}]
     })));
     let v = json(
-        &s.check_company_name_availability(params(json!({"name": "Acme Widgets"})))
+        &s.check_company_name_availability(params(json!({"name": "Acme Widgets"})), auth())
             .await
             .unwrap(),
     );
@@ -121,7 +122,7 @@ async fn browse_lists_companies_in_name_order() {
     let fake = fake().await;
     let v = json(
         &server(&fake)
-            .browse_company_names(params(json!({"name": "acme h", "limit": 3})))
+            .browse_company_names(params(json!({"name": "acme h", "limit": 3})), auth())
             .await
             .unwrap(),
     );

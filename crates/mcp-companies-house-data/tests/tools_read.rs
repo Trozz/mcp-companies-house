@@ -1,7 +1,7 @@
 mod support;
 use serde_json::{Value, json};
 use support::fake_ch::{FakeCh, FakeState, Injected, now_unix};
-use support::tools::{error_text, json, params, server, server_with_key};
+use support::tools::{auth, auth_with, error_text, json, no_auth, params, server};
 
 async fn fake() -> FakeCh {
     FakeCh::start(FakeState::register()).await
@@ -20,7 +20,7 @@ fn numbers(v: &Value) -> Vec<&str> {
 async fn search_companies_returns_compact_matches() {
     let fake = fake().await;
     let r = server(&fake)
-        .search_companies(params(json!({"query": "acme"})))
+        .search_companies(params(json!({"query": "acme"})), auth())
         .await
         .unwrap();
     let v = json(&r);
@@ -52,16 +52,17 @@ async fn search_companies_pages_and_filters_to_active() {
     let fake = fake().await;
     let s = server(&fake);
     let v = json(
-        &s.search_companies(params(json!({"query": "acme", "limit": 2})))
+        &s.search_companies(params(json!({"query": "acme", "limit": 2})), auth())
             .await
             .unwrap(),
     );
     assert_eq!(numbers(&v), vec!["00000001", "00000002"]);
     assert_eq!(v["next_start_index"], 2);
     let v = json(
-        &s.search_companies(params(
-            json!({"query": "acme", "limit": 2, "start_index": 2}),
-        ))
+        &s.search_companies(
+            params(json!({"query": "acme", "limit": 2, "start_index": 2})),
+            auth(),
+        )
         .await
         .unwrap(),
     );
@@ -69,9 +70,12 @@ async fn search_companies_pages_and_filters_to_active() {
     assert!(v.get("next_start_index").is_none(), "{v}");
 
     let v = json(
-        &s.search_companies(params(json!({"query": "acme", "active_only": true})))
-            .await
-            .unwrap(),
+        &s.search_companies(
+            params(json!({"query": "acme", "active_only": true})),
+            auth(),
+        )
+        .await
+        .unwrap(),
     );
     assert_eq!(numbers(&v), vec!["00000001", "00000002"]);
     let last = fake.requests().pop().unwrap();
@@ -83,7 +87,7 @@ async fn search_companies_shows_cessation_dates() {
     let fake = fake().await;
     let v = json(
         &server(&fake)
-            .search_companies(params(json!({"query": "thistle"})))
+            .search_companies(params(json!({"query": "thistle"})), auth())
             .await
             .unwrap(),
     );
@@ -110,7 +114,10 @@ async fn search_companies_validates_before_calling() {
             "query is limited to 200 characters",
         ),
     ] {
-        let r = s.search_companies(params(args.clone())).await.unwrap();
+        let r = s
+            .search_companies(params(args.clone()), auth())
+            .await
+            .unwrap();
         let text = error_text(&r);
         assert!(text.starts_with("validation: "), "{args}: {text}");
         assert!(text.contains(msg), "{args}: {text}");
@@ -123,11 +130,14 @@ async fn filter_companies_combines_filters() {
     let fake = fake().await;
     let s = server(&fake);
     let v = json(
-        &s.filter_companies(params(json!({
-            "location": "leeds",
-            "status": ["active"],
-            "company_type": ["ltd"],
-        })))
+        &s.filter_companies(
+            params(json!({
+                "location": "leeds",
+                "status": ["active"],
+                "company_type": ["ltd"],
+            })),
+            auth(),
+        )
         .await
         .unwrap(),
     );
@@ -159,7 +169,7 @@ async fn filter_companies_by_sic_code_subtype_and_dates() {
     let fake = fake().await;
     let s = server(&fake);
     let v = json(
-        &s.filter_companies(params(json!({"sic_codes": ["62012", "62020"]})))
+        &s.filter_companies(params(json!({"sic_codes": ["62012", "62020"]})), auth())
             .await
             .unwrap(),
     );
@@ -170,9 +180,12 @@ async fn filter_companies_by_sic_code_subtype_and_dates() {
     );
 
     let v = json(
-        &s.filter_companies(params(json!({"subtype": ["community-interest-company"]})))
-            .await
-            .unwrap(),
+        &s.filter_companies(
+            params(json!({"subtype": ["community-interest-company"]})),
+            auth(),
+        )
+        .await
+        .unwrap(),
     );
     assert_eq!(numbers(&v), vec!["00000005"]);
     assert_eq!(
@@ -181,21 +194,27 @@ async fn filter_companies_by_sic_code_subtype_and_dates() {
     );
 
     let v = json(
-        &s.filter_companies(params(json!({
-            "incorporated_from": "2018-01-01",
-            "incorporated_to": "2021-12-31"
-        })))
+        &s.filter_companies(
+            params(json!({
+                "incorporated_from": "2018-01-01",
+                "incorporated_to": "2021-12-31"
+            })),
+            auth(),
+        )
         .await
         .unwrap(),
     );
     assert_eq!(numbers(&v), vec!["00000002", "OC000004"]);
 
     let v = json(
-        &s.filter_companies(params(json!({
-            "status": ["dissolved"],
-            "dissolved_from": "2020-01-01",
-            "dissolved_to": "2020-12-31"
-        })))
+        &s.filter_companies(
+            params(json!({
+                "status": ["dissolved"],
+                "dissolved_from": "2020-01-01",
+                "dissolved_to": "2020-12-31"
+            })),
+            auth(),
+        )
         .await
         .unwrap(),
     );
@@ -208,7 +227,7 @@ async fn filter_companies_counts_with_limit_one_and_pages() {
     let fake = fake().await;
     let s = server(&fake);
     let v = json(
-        &s.filter_companies(params(json!({"name_includes": "acme", "limit": 1})))
+        &s.filter_companies(params(json!({"name_includes": "acme", "limit": 1})), auth())
             .await
             .unwrap(),
     );
@@ -216,9 +235,12 @@ async fn filter_companies_counts_with_limit_one_and_pages() {
     assert_eq!(v["count"], 1);
     assert_eq!(v["next_start_index"], 1);
     let v = json(
-        &s.filter_companies(params(json!({
-            "name_includes": "acme", "name_excludes": "bakery", "limit": 1, "start_index": 1
-        })))
+        &s.filter_companies(
+            params(json!({
+                "name_includes": "acme", "name_excludes": "bakery", "limit": 1, "start_index": 1
+            })),
+            auth(),
+        )
         .await
         .unwrap(),
     );
@@ -231,7 +253,7 @@ async fn filter_companies_counts_with_limit_one_and_pages() {
 async fn filter_companies_with_no_matches_is_an_empty_page() {
     let fake = fake().await;
     let r = server(&fake)
-        .filter_companies(params(json!({"location": "Aberystwyth"})))
+        .filter_companies(params(json!({"location": "Aberystwyth"})), auth())
         .await
         .unwrap();
     assert_eq!(
@@ -250,7 +272,10 @@ async fn filter_companies_rejects_bad_arguments_before_calling() {
         (json!({"sic_codes": ["software"]}), "SIC 2007"),
         (json!({"location": "Leeds", "limit": 101}), "limit"),
     ] {
-        let r = s.filter_companies(params(args.clone())).await.unwrap();
+        let r = s
+            .filter_companies(params(args.clone()), auth())
+            .await
+            .unwrap();
         let text = error_text(&r);
         assert!(text.starts_with("validation: "), "{args}: {text}");
         assert!(text.contains(msg), "{args}: {text}");
@@ -263,7 +288,7 @@ async fn get_company_returns_the_profile_without_noise() {
     let fake = fake().await;
     let v = json(
         &server(&fake)
-            .get_company(params(json!({"company_number": "6"})))
+            .get_company(params(json!({"company_number": "6"})), auth())
             .await
             .unwrap(),
     );
@@ -291,7 +316,7 @@ async fn get_company_keeps_previous_names() {
     let fake = fake().await;
     let v = json(
         &server(&fake)
-            .get_company(params(json!({"company_number": "sc 000003"})))
+            .get_company(params(json!({"company_number": "sc 000003"})), auth())
             .await
             .unwrap(),
     );
@@ -305,7 +330,7 @@ async fn get_company_reports_unknown_and_invalid_numbers() {
     let fake = fake().await;
     let s = server(&fake);
     let text = error_text(
-        &s.get_company(params(json!({"company_number": "12345678"})))
+        &s.get_company(params(json!({"company_number": "12345678"})), auth())
             .await
             .unwrap(),
     );
@@ -313,7 +338,7 @@ async fn get_company_reports_unknown_and_invalid_numbers() {
     assert!(text.contains("12345678"), "{text}");
     assert!(text.contains("search_companies"), "{text}");
     let text = error_text(
-        &s.get_company(params(json!({"company_number": "../search"})))
+        &s.get_company(params(json!({"company_number": "../search"})), auth())
             .await
             .unwrap(),
     );
@@ -325,18 +350,18 @@ async fn get_company_reports_unknown_and_invalid_numbers() {
 async fn upstream_failures_are_tool_errors_with_a_kind() {
     let fake = fake().await;
     let text = error_text(
-        &server_with_key(&fake, "wrong-key")
-            .search_companies(params(json!({"query": "acme"})))
+        &server(&fake)
+            .search_companies(params(json!({"query": "acme"})), auth_with("wrong-key"))
             .await
             .unwrap(),
     );
     assert!(text.starts_with("auth: "), "{text}");
-    assert!(text.contains("COMPANIES_HOUSE_API_KEY"), "{text}");
+    assert!(text.contains("Sign in again"), "{text}");
 
     fake.inject(Injected::json(429, json!({})).header("retry-after", "60"));
     let s = server(&fake);
     let text = error_text(
-        &s.get_company(params(json!({"company_number": "00000001"})))
+        &s.get_company(params(json!({"company_number": "00000001"})), auth())
             .await
             .unwrap(),
     );
@@ -348,7 +373,7 @@ async fn upstream_failures_are_tool_errors_with_a_kind() {
     fake.inject(Injected::status(500));
     let text = error_text(
         &server(&fake)
-            .filter_companies(params(json!({"location": "leeds"})))
+            .filter_companies(params(json!({"location": "leeds"})), auth())
             .await
             .unwrap(),
     );
@@ -366,12 +391,12 @@ async fn a_used_up_rate_limit_stops_calls_until_the_reset() {
     let s = server(&fake);
     // This call uses the last request of the window (remaining becomes 0).
     json(
-        &s.get_company(params(json!({"company_number": "00000001"})))
+        &s.get_company(params(json!({"company_number": "00000001"})), auth())
             .await
             .unwrap(),
     );
     let text = error_text(
-        &s.search_companies(params(json!({"query": "acme"})))
+        &s.search_companies(params(json!({"query": "acme"})), auth())
             .await
             .unwrap(),
     );
@@ -384,7 +409,7 @@ async fn search_with_limit_one_returns_the_best_match_first() {
     let fake = fake().await;
     let s = server(&fake);
     let v = json(
-        &s.search_companies(params(json!({"query": "acme", "limit": 1})))
+        &s.search_companies(params(json!({"query": "acme", "limit": 1})), auth())
             .await
             .unwrap(),
     );
@@ -393,9 +418,10 @@ async fn search_with_limit_one_returns_the_best_match_first() {
     assert_eq!(v["next_start_index"], 1);
     assert_eq!(fake.requests()[0].param("items_per_page"), Some("2"));
     let v = json(
-        &s.search_companies(params(
-            json!({"query": "acme", "limit": 1, "start_index": 1}),
-        ))
+        &s.search_companies(
+            params(json!({"query": "acme", "limit": 1, "start_index": 1})),
+            auth(),
+        )
         .await
         .unwrap(),
     );
@@ -410,9 +436,10 @@ async fn an_unaligned_start_returns_the_rest_of_its_page() {
     // the page [0, 2) and returns its second item, labelled with the real offset.
     let v = json(
         &server(&fake)
-            .search_companies(params(
-                json!({"query": "acme", "limit": 2, "start_index": 1}),
-            ))
+            .search_companies(
+                params(json!({"query": "acme", "limit": 2, "start_index": 1})),
+                auth(),
+            )
             .await
             .unwrap(),
     );
@@ -429,9 +456,12 @@ async fn search_stops_at_the_companies_house_window() {
     let fake = fake().await;
     let s = server(&fake);
     let text = error_text(
-        &s.search_companies(params(json!({"query": "acme", "start_index": 1000})))
-            .await
-            .unwrap(),
+        &s.search_companies(
+            params(json!({"query": "acme", "start_index": 1000})),
+            auth(),
+        )
+        .await
+        .unwrap(),
     );
     assert!(text.starts_with("validation: "), "{text}");
     assert!(text.contains("first 1000 matches"), "{text}");
@@ -446,7 +476,7 @@ async fn search_stops_at_the_companies_house_window() {
         json!({"kind": "search#companies", "total_results": 5000, "start_index": 980, "items_per_page": 20, "items": items}),
     ));
     let v = json(
-        &s.search_companies(params(json!({"query": "co", "start_index": 980})))
+        &s.search_companies(params(json!({"query": "co", "start_index": 980})), auth())
             .await
             .unwrap(),
     );
@@ -457,13 +487,84 @@ async fn search_stops_at_the_companies_house_window() {
 
     // Near the window the page is shortened so the request stays inside it.
     json(
-        &s.search_companies(params(
-            json!({"query": "acme", "start_index": 990, "limit": 20}),
-        ))
+        &s.search_companies(
+            params(json!({"query": "acme", "start_index": 990, "limit": 20})),
+            auth(),
+        )
         .await
         .unwrap(),
     );
     let last = fake.requests().pop().unwrap();
     assert_eq!(last.param("items_per_page"), Some("10"));
     assert_eq!(last.param("start_index"), Some("990"));
+}
+
+#[tokio::test]
+async fn each_call_uses_the_callers_own_key() {
+    let fake = fake().await;
+    let s = server(&fake);
+    json(
+        &s.get_company(params(json!({"company_number": "1"})), auth())
+            .await
+            .unwrap(),
+    );
+    let text = error_text(
+        &s.get_company(
+            params(json!({"company_number": "1"})),
+            auth_with("someone-elses-key"),
+        )
+        .await
+        .unwrap(),
+    );
+    assert!(text.starts_with("auth: "), "{text}");
+    let log = fake.requests();
+    assert_ne!(log[0].authorization, log[1].authorization);
+}
+
+#[tokio::test]
+async fn a_call_without_a_key_is_refused_before_calling() {
+    let fake = fake().await;
+    let text = error_text(
+        &server(&fake)
+            .get_company(params(json!({"company_number": "1"})), no_auth())
+            .await
+            .unwrap(),
+    );
+    assert!(
+        text.starts_with("auth: this request carried no Companies House API key"),
+        "{text}"
+    );
+    assert!(fake.requests().is_empty());
+}
+
+#[tokio::test]
+async fn one_callers_used_up_rate_limit_does_not_block_another() {
+    let fake = fake().await;
+    let s = server(&fake);
+    fake.inject(Injected::json(429, json!({})).header("retry-after", "60"));
+    let text = error_text(
+        &s.get_company(params(json!({"company_number": "1"})), auth())
+            .await
+            .unwrap(),
+    );
+    assert!(text.starts_with("rate_limited: "), "{text}");
+    // The same caller is now held back locally; a different caller's key still works upstream
+    // (the fake rejects it, which proves the request was sent).
+    let text = error_text(
+        &s.get_company(params(json!({"company_number": "1"})), auth())
+            .await
+            .unwrap(),
+    );
+    assert!(text.starts_with("rate_limited: "), "{text}");
+    let before = fake.requests().len();
+    let text = error_text(
+        &s.get_company(
+            params(json!({"company_number": "1"})),
+            auth_with("other-key"),
+        )
+        .await
+        .unwrap(),
+    );
+    assert!(text.starts_with("auth: "), "{text}");
+    assert_eq!(fake.requests().len(), before + 1);
 }

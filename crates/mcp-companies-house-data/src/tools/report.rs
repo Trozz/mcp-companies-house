@@ -2,6 +2,8 @@
 
 use super::{CompaniesServer, json_result, normalise_company_number, run};
 use crate::error::{self, ChError};
+use axum::http::request::Parts;
+use rmcp::handler::server::tool::Extension;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::CallToolResult;
 use rmcp::schemars::JsonSchema;
@@ -147,9 +149,11 @@ impl CompaniesServer {
     pub async fn company_report(
         &self,
         Parameters(p): Parameters<CompanyReportParams>,
+        Extension(parts): Extension<Parts>,
     ) -> Result<CallToolResult, McpError> {
         tracing::debug!(args = ?p, "company_report");
         run("company_report", async {
+            let c = self.caller(&parts)?;
             let number = normalise_company_number(&p.company_number)?;
             let filings = p.filings.unwrap_or(DEFAULT_FILINGS);
             if filings > MAX_FILINGS {
@@ -157,7 +161,7 @@ impl CompaniesServer {
                     "filings must be between 0 and {MAX_FILINGS}"
                 )));
             }
-            let profile = self.profile(&number).await?;
+            let profile = c.profile(&number).await?;
             let records: Vec<&str> = profile
                 .get("records_available")
                 .and_then(Value::as_array)
@@ -169,25 +173,25 @@ impl CompaniesServer {
             let section_page = paging(SECTION_PAGE);
             let filing_page = paging(filings.max(1));
             let (officers, psc, recent, charges, insolvency) = tokio::join!(
-                self.officers_page(&number, &section_page, 0),
-                self.psc_page(&number, &section_page, 0),
+                c.officers_page(&number, &section_page, 0),
+                c.psc_page(&number, &section_page, 0),
                 async {
                     if filings == 0 {
                         return Ok(None);
                     }
-                    self.filings_page(&number, &filing_page, 0).await.map(Some)
+                    c.filings_page(&number, &filing_page, 0).await.map(Some)
                 },
                 async {
                     if !has_charges {
                         return Ok(None);
                     }
-                    self.charges_page(&number, &section_page, 0).await.map(Some)
+                    c.charges_page(&number, &section_page, 0).await.map(Some)
                 },
                 async {
                     if !has_insolvency {
                         return Ok(None);
                     }
-                    self.insolvency_record(&number).await
+                    c.insolvency_record(&number).await
                 },
             );
 

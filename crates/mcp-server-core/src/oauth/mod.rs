@@ -6,6 +6,7 @@ pub mod token;
 
 pub use middleware::require_bearer;
 
+use crate::credential::{CheckCache, CredentialVerifier, Sealer};
 use crate::guards::{LoginLimiter, ReplayGuard};
 use crate::jwt::Jwt;
 use axum::Router;
@@ -18,16 +19,26 @@ use std::time::Duration;
 pub struct OAuthSettings {
     pub public_url: String,
     pub signing_key: SecretString,
-    pub admin_password: SecretString,
-    pub static_token: Option<SecretString>,
     pub trusted_proxies: Vec<IpAddr>,
 }
+
+/// How long a bearer credential found valid upstream is trusted before it is checked again.
+pub const BEARER_VALID_FOR: Duration = Duration::from_secs(600);
+/// How long a rejected bearer credential is remembered.
+pub const BEARER_INVALID_FOR: Duration = Duration::from_secs(60);
+const BEARER_CACHE_ENTRIES: usize = 10_000;
 
 pub struct AuthState {
     pub settings: OAuthSettings,
     pub jwt: Jwt,
     pub limiter: LoginLimiter,
     pub replay: ReplayGuard,
+    /// Checks each person's credential with the upstream service.
+    pub verifier: Arc<dyn CredentialVerifier>,
+    /// Seals credentials into tokens.
+    pub sealer: Sealer,
+    /// Recent verdicts on credentials sent directly as bearer tokens.
+    pub bearer_checks: CheckCache,
     services: Vec<String>,
 }
 
@@ -35,17 +46,30 @@ impl AuthState {
     /// `services` are the enabled service names; each is the protected resource `PUBLIC_URL/<name>`.
     /// Tokens the authorization server keeps for itself (client, csrf, code, refresh) use the
     /// public URL as audience; access tokens use their resource.
-    pub fn new(settings: OAuthSettings, services: &[&str]) -> Arc<Self> {
+    pub fn new(
+        settings: OAuthSettings,
+        services: &[&str],
+        verifier: Arc<dyn CredentialVerifier>,
+    ) -> Arc<Self> {
+        let key = settings.signing_key.expose_secret().as_bytes();
         let jwt = Jwt::new(
-            settings.signing_key.expose_secret().as_bytes(),
+            key,
             settings.public_url.clone(),
             settings.public_url.clone(),
         );
+        let sealer = Sealer::new(key);
         Arc::new(Self {
             settings,
             jwt,
             limiter: LoginLimiter::new(5, Duration::from_secs(60)),
             replay: ReplayGuard::new(),
+            verifier,
+            sealer,
+            bearer_checks: CheckCache::new(
+                BEARER_VALID_FOR,
+                BEARER_INVALID_FOR,
+                BEARER_CACHE_ENTRIES,
+            ),
             services: services.iter().map(|s| s.to_string()).collect(),
         })
     }

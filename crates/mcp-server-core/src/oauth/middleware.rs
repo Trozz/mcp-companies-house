@@ -1,11 +1,12 @@
 use super::AuthState;
+use super::authorize::client_ip;
+use crate::credential::{self, Credential, CredentialCheck};
 use crate::jwt::TokenKind;
-use crate::pkce;
-use axum::extract::{Request, State};
+use axum::extract::{ConnectInfo, Request, State};
 use axum::http::{HeaderValue, StatusCode, header};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
-use secrecy::ExposeSecret;
+use std::net::SocketAddr;
 use std::sync::Arc;
 
 fn unauthorized(st: &AuthState, service: &str, token_present: bool) -> Response {
@@ -23,8 +24,26 @@ fn unauthorized(st: &AuthState, service: &str, token_present: bool) -> Response 
     res
 }
 
-/// Guards one service path: accepts the static token, or an OAuth access token whose audience is
-/// this service's resource.
+fn unavailable(st: &AuthState, why: &str) -> Response {
+    let body = format!(
+        "Your {} could not be checked right now: {why}",
+        st.verifier.label()
+    );
+    let mut res = (StatusCode::SERVICE_UNAVAILABLE, body).into_response();
+    res.headers_mut()
+        .insert(header::RETRY_AFTER, HeaderValue::from_static("30"));
+    res
+}
+
+/// An OAuth token from this server is a JWT; a credential sent directly is not.
+fn looks_like_jwt(token: &str) -> bool {
+    token.split('.').count() == 3
+}
+
+/// Guards one service path. It accepts either an OAuth access token issued for this service,
+/// whose sealed credential is opened, or the person's credential itself as the bearer token,
+/// which is checked upstream (the verdict is cached briefly under its fingerprint). Either way
+/// the request goes on with a [`Credential`] extension; an access token also adds its claims.
 pub async fn require_bearer(
     State((st, service)): State<(Arc<AuthState>, String)>,
     mut req: Request,
@@ -35,26 +54,76 @@ pub async fn require_bearer(
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "))
-        .map(str::to_owned);
-    let Some(token) = token else {
+        .map(|t| t.trim().to_owned());
+    let Some(token) = token.filter(|t| !t.is_empty()) else {
         return unauthorized(&st, &service, false);
     };
-    if st
-        .settings
-        .static_token
-        .as_ref()
-        .is_some_and(|s| pkce::ct_eq(&token, s.expose_secret()))
-    {
+
+    if looks_like_jwt(&token) {
+        let Ok(claims) = st
+            .jwt
+            .verify_for(&token, TokenKind::Access, &st.resource(&service))
+        else {
+            return unauthorized(&st, &service, true);
+        };
+        let Some(credential) = claims
+            .payload
+            .credential
+            .as_deref()
+            .and_then(|sealed| st.sealer.open(sealed).ok())
+        else {
+            return unauthorized(&st, &service, true);
+        };
+        req.extensions_mut().insert(credential);
+        req.extensions_mut().insert(claims);
         return next.run(req).await;
     }
-    match st
-        .jwt
-        .verify_for(&token, TokenKind::Access, &st.resource(&service))
-    {
-        Ok(claims) => {
-            req.extensions_mut().insert(claims);
-            next.run(req).await
-        }
-        Err(_) => unauthorized(&st, &service, true),
+
+    if !credential::plausible(&token) {
+        return unauthorized(&st, &service, true);
     }
+    let fingerprint = credential::fingerprint(&token);
+    match st.bearer_checks.get(&fingerprint) {
+        Some(true) => {}
+        Some(false) => return unauthorized(&st, &service, true),
+        None => {
+            let peer = req
+                .extensions()
+                .get::<ConnectInfo<SocketAddr>>()
+                .map(|c| c.0.ip());
+            let ip = client_ip(peer, req.headers(), &st.settings.trusted_proxies);
+            if st.limiter.is_blocked(ip) {
+                metrics::counter!("bearer_credential_checks_total", "outcome" => "rate_limited")
+                    .increment(1);
+                return (
+                    StatusCode::TOO_MANY_REQUESTS,
+                    "Too many rejected credentials. Wait a minute and try again.",
+                )
+                    .into_response();
+            }
+            match st.verifier.check(&token).await {
+                CredentialCheck::Valid => {
+                    metrics::counter!("bearer_credential_checks_total", "outcome" => "valid")
+                        .increment(1);
+                    st.bearer_checks.put(fingerprint, true);
+                }
+                CredentialCheck::Invalid(_) => {
+                    metrics::counter!("bearer_credential_checks_total", "outcome" => "invalid")
+                        .increment(1);
+                    st.bearer_checks.put(fingerprint, false);
+                    st.limiter.record_failure(ip);
+                    tracing::warn!(%ip, "bearer credential rejected");
+                    return unauthorized(&st, &service, true);
+                }
+                CredentialCheck::Unavailable(why) => {
+                    metrics::counter!("bearer_credential_checks_total", "outcome" => "unavailable")
+                        .increment(1);
+                    tracing::warn!(reason = %why, "bearer credential could not be checked");
+                    return unavailable(&st, &why);
+                }
+            }
+        }
+    }
+    req.extensions_mut().insert(Credential::new(token));
+    next.run(req).await
 }

@@ -1,5 +1,4 @@
 use mcp_server_core::config::EnvReader;
-use secrecy::{ExposeSecret, SecretString};
 use url::Url;
 
 /// MCP `serverInfo.name` of the company data service.
@@ -8,24 +7,19 @@ pub const DEFAULT_API_URL: &str = "https://api.company-information.service.gov.u
 pub const SANDBOX_API_URL: &str = "https://api-sandbox.company-information.service.gov.uk";
 
 /// Company data settings only: the server binary owns the core configuration (URL, OAuth, TLS,
-/// logging).
+/// logging). There is no API key: each person signs in with their own.
 pub struct DataConfig {
-    pub api_key: SecretString,
     pub api_url: Url,
 }
 
 impl DataConfig {
     pub fn from_env<F: Fn(&str) -> Option<String>>(env: &mut EnvReader<F>) -> Option<Self> {
         let errors_before = env.errors.len();
-        let api_key = env.secret_required("COMPANIES_HOUSE_API_KEY");
-        if let Some(k) = &api_key {
-            let k = k.expose_secret();
-            if k.contains(':') || k.chars().any(char::is_whitespace) {
-                env.errors.push(
-                    "COMPANIES_HOUSE_API_KEY must not contain spaces or a colon; paste the key exactly as the Developer Hub shows it"
-                        .into(),
-                );
-            }
+        if env.optional("COMPANIES_HOUSE_API_KEY").is_some() {
+            env.errors.push(
+                "COMPANIES_HOUSE_API_KEY is no longer used: each person signs in with their own Companies House API key. Remove it"
+                    .into(),
+            );
         }
         let raw_url = env
             .optional("COMPANIES_HOUSE_API_URL")
@@ -40,10 +34,7 @@ impl DataConfig {
         if env.errors.len() != errors_before {
             return None;
         }
-        Some(DataConfig {
-            api_key: api_key?,
-            api_url: api_url?,
-        })
+        Some(DataConfig { api_url: api_url? })
     }
 }
 
@@ -82,16 +73,11 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
 
-    const KEY: &str = "test-api-key";
-
-    fn load(extra: &[(&str, &str)]) -> (Option<DataConfig>, Vec<String>) {
-        let mut map: HashMap<String, String> = [("COMPANIES_HOUSE_API_KEY", KEY)]
+    fn load(pairs: &[(&str, &str)]) -> (Option<DataConfig>, Vec<String>) {
+        let map: HashMap<String, String> = pairs
             .iter()
             .map(|(a, b)| (a.to_string(), b.to_string()))
             .collect();
-        for (k, v) in extra {
-            map.insert(k.to_string(), v.to_string());
-        }
         let mut env = EnvReader::new(move |k: &str| map.get(k).cloned());
         let c = DataConfig::from_env(&mut env);
         (c, env.errors)
@@ -101,10 +87,8 @@ mod tests {
     fn defaults_to_the_live_api() {
         let (c, errors) = load(&[]);
         assert!(errors.is_empty(), "{errors:?}");
-        let c = c.unwrap();
-        assert_eq!(c.api_key.expose_secret(), KEY);
         assert_eq!(
-            c.api_url.as_str(),
+            c.unwrap().api_url.as_str(),
             "https://api.company-information.service.gov.uk/"
         );
     }
@@ -148,32 +132,15 @@ mod tests {
     }
 
     #[test]
-    fn missing_key_is_reported() {
-        let mut env = EnvReader::new(|_: &str| None);
-        assert!(DataConfig::from_env(&mut env).is_none());
-        assert_eq!(
-            env.errors,
-            vec!["COMPANIES_HOUSE_API_KEY is required".to_string()]
-        );
-    }
-
-    #[test]
-    fn malformed_key_is_rejected_without_echoing_it() {
-        let (c, errors) = load(&[("COMPANIES_HOUSE_API_KEY", "abc:def secret")]);
+    fn a_server_key_is_refused_without_echoing_it() {
+        let (c, errors) = load(&[("COMPANIES_HOUSE_API_KEY", "0f1e2d3c-secret")]);
         assert!(c.is_none());
         let joined = errors.join("\n");
-        assert!(joined.contains("COMPANIES_HOUSE_API_KEY"), "{joined}");
-        assert!(!joined.contains("abc:def"), "secret leaked: {joined}");
-    }
-
-    #[test]
-    fn errors_are_reported_together() {
-        let (c, errors) = load(&[
-            ("COMPANIES_HOUSE_API_KEY", "has space"),
-            ("COMPANIES_HOUSE_API_URL", "ftp://x"),
-        ]);
-        assert!(c.is_none());
-        assert_eq!(errors.len(), 2, "{errors:?}");
+        assert!(
+            joined.contains("COMPANIES_HOUSE_API_KEY is no longer used"),
+            "{joined}"
+        );
+        assert!(!joined.contains("0f1e2d3c"), "secret leaked: {joined}");
     }
 
     #[test]
@@ -182,7 +149,7 @@ mod tests {
         let seen = read.clone();
         let mut env = EnvReader::new(move |k: &str| {
             seen.lock().unwrap().push(k.to_string());
-            (k == "COMPANIES_HOUSE_API_KEY").then(|| KEY.to_string())
+            None
         });
         assert!(DataConfig::from_env(&mut env).is_some(), "{:?}", env.errors);
         let read = read.lock().unwrap();

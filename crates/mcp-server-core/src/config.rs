@@ -163,15 +163,15 @@ impl CoreConfig {
                     .push("OAUTH_SIGNING_KEY must be at least 32 bytes".into());
             }
         }
-        let admin_password = env.secret_required("OAUTH_ADMIN_PASSWORD");
-        if let Some(p) = &admin_password {
-            use secrecy::ExposeSecret;
-            if p.expose_secret().chars().count() < 12 {
-                env.errors
-                    .push("OAUTH_ADMIN_PASSWORD must be at least 12 characters".into());
+        // People sign in with their own credential (see `credential`); a shared password or
+        // static token would be a second, weaker way in, so refuse to start with one set.
+        for retired in ["OAUTH_ADMIN_PASSWORD", "MCP_AUTH_TOKEN"] {
+            if env.optional(retired).is_some() {
+                env.errors.push(format!(
+                    "{retired} is no longer used: each person signs in with their own credential. Remove it"
+                ));
             }
         }
-        let static_token = env.secret_optional("MCP_AUTH_TOKEN");
         let mut trusted_proxies = Vec::new();
         for raw in env.list("TRUSTED_PROXIES") {
             match raw.parse::<IpAddr>() {
@@ -208,8 +208,6 @@ impl CoreConfig {
             oauth: OAuthSettings {
                 public_url: public_url.clone(),
                 signing_key: signing_key?,
-                admin_password: admin_password?,
-                static_token,
                 trusted_proxies,
             },
             public_url,
@@ -324,7 +322,6 @@ mod tests {
         let mut v: Vec<(String, String)> = [
             ("PUBLIC_URL", "https://mail.example.com/"),
             ("OAUTH_SIGNING_KEY", "0123456789abcdef0123456789abcdef"),
-            ("OAUTH_ADMIN_PASSWORD", "a long password"),
         ]
         .iter()
         .map(|(a, b)| (a.to_string(), b.to_string()))
@@ -376,10 +373,6 @@ mod tests {
             "{joined}"
         );
         assert!(
-            joined.contains("OAUTH_ADMIN_PASSWORD is required"),
-            "{joined}"
-        );
-        assert!(
             joined.contains("TLS_CERT_PATH and TLS_KEY_PATH must be set together"),
             "{joined}"
         );
@@ -400,18 +393,22 @@ mod tests {
     }
 
     #[test]
-    fn short_admin_password_is_rejected_without_echoing_it() {
-        let (c, errors) = core(core_env(&[("OAUTH_ADMIN_PASSWORD", "elevenchars")]));
+    fn retired_password_and_static_token_stop_startup_without_echoing_them() {
+        let (c, errors) = core(core_env(&[
+            ("OAUTH_ADMIN_PASSWORD", "hunter2-secret"),
+            ("MCP_AUTH_TOKEN", "static-secret"),
+        ]));
         assert!(c.is_none());
         let joined = errors.join("\n");
         assert!(
-            joined.contains("OAUTH_ADMIN_PASSWORD must be at least 12 characters"),
+            joined.contains("OAUTH_ADMIN_PASSWORD is no longer used"),
             "{joined}"
         );
-        assert!(!joined.contains("elevenchars"), "secret leaked: {joined}");
-        let (c, errors) = core(core_env(&[("OAUTH_ADMIN_PASSWORD", "twelve chars")]));
-        assert!(errors.is_empty(), "{errors:?}");
-        assert!(c.is_some());
+        assert!(
+            joined.contains("MCP_AUTH_TOKEN is no longer used"),
+            "{joined}"
+        );
+        assert!(!joined.contains("secret"), "secret leaked: {joined}");
     }
 
     #[test]

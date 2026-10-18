@@ -43,7 +43,7 @@ fn extract_hidden(html: &str, name: &str) -> String {
         .replace("&amp;", "&")
 }
 
-fn form_fields(html: &str, password: &str) -> Vec<(String, String)> {
+fn form_fields(html: &str, credential: &str) -> Vec<(String, String)> {
     let mut v: Vec<(String, String)> = [
         "response_type",
         "client_id",
@@ -58,7 +58,7 @@ fn form_fields(html: &str, password: &str) -> Vec<(String, String)> {
     .iter()
     .map(|n| (n.to_string(), extract_hidden(html, n)))
     .collect();
-    v.push(("password".into(), password.into()));
+    v.push(("credential".into(), credential.into()));
     v
 }
 
@@ -99,11 +99,22 @@ async fn login_page_escapes_parameters() {
 }
 
 #[tokio::test]
-async fn correct_password_redirects_with_code_and_state() {
+async fn login_page_asks_for_the_credential_without_storing_it() {
+    let st = state();
+    let html = login_page(&app(st.clone()), &client_id(&st)).await;
+    assert!(html.contains("name=\"credential\""), "{html}");
+    assert!(html.contains("autocomplete=\"off\""), "{html}");
+    assert!(html.contains("Sign in with your own API key"), "{html}");
+    assert!(html.contains("The key for the test service."), "{html}");
+    assert!(!html.contains("name=\"password\""), "{html}");
+}
+
+#[tokio::test]
+async fn correct_credential_redirects_with_code_and_state() {
     let st = state();
     let app = app(st.clone());
     let html = login_page(&app, &client_id(&st)).await;
-    let res = send(&app, post(&form_fields(&html, PASSWORD))).await;
+    let res = send(&app, post(&form_fields(&html, KEY))).await;
     assert_eq!(res.status(), StatusCode::FOUND);
     assert_eq!(res.headers()["cache-control"], "no-store");
     let loc = url::Url::parse(res.headers()["location"].to_str().unwrap()).unwrap();
@@ -117,20 +128,60 @@ async fn correct_password_redirects_with_code_and_state() {
         Some("https://app.example.com/cb")
     );
     assert!(code.exp.unwrap() - code.iat <= 60);
+    // The credential travels sealed: the code (a JWT anyone can decode) never holds it in clear.
+    let sealed = code.payload.credential.expect("a sealed credential");
+    assert!(!q["code"].contains(KEY) && !sealed.contains(KEY));
+    assert_eq!(st.sealer.open(&sealed).unwrap().expose(), KEY);
 }
 
 #[tokio::test]
-async fn wrong_password_rerenders_with_401() {
+async fn wrong_credential_rerenders_with_401() {
     let st = state();
     let app = app(st.clone());
     let html = login_page(&app, &client_id(&st)).await;
     let res = send(&app, post(&form_fields(&html, "nope"))).await;
     assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
-    assert!(body_text(res).await.contains("Incorrect password"));
+    assert!(
+        body_text(res)
+            .await
+            .contains("That API key was not accepted.")
+    );
 }
 
 #[tokio::test]
-async fn sixth_attempt_is_rate_limited_even_with_correct_password() {
+async fn implausible_credentials_are_rejected_without_asking_upstream() {
+    let v = verifier();
+    let st = state_with_verifier(v.clone());
+    let app = app(st.clone());
+    let html = login_page(&app, &client_id(&st)).await;
+    for bad in ["has space", "", &"x".repeat(300)] {
+        let res = send(&app, post(&form_fields(&html, bad))).await;
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED, "{bad:?}");
+    }
+    assert_eq!(v.checks(), 0);
+}
+
+#[tokio::test]
+async fn an_unavailable_check_is_503_and_not_a_failed_attempt() {
+    let st = state();
+    let app = app(st.clone());
+    let html = login_page(&app, &client_id(&st)).await;
+    for _ in 0..6 {
+        let res = send(&app, post(&form_fields(&html, DOWN_KEY))).await;
+        assert_eq!(res.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(
+            body_text(res)
+                .await
+                .contains("could not be checked right now")
+        );
+    }
+    // Six unavailable checks did not use up the five allowed failures.
+    let res = send(&app, post(&form_fields(&html, KEY))).await;
+    assert_eq!(res.status(), StatusCode::FOUND);
+}
+
+#[tokio::test]
+async fn sixth_attempt_is_rate_limited_even_with_a_valid_credential() {
     let st = state();
     let app = app(st.clone());
     let html = login_page(&app, &client_id(&st)).await;
@@ -141,9 +192,7 @@ async fn sixth_attempt_is_rate_limited_even_with_correct_password() {
         );
     }
     assert_eq!(
-        send(&app, post(&form_fields(&html, PASSWORD)))
-            .await
-            .status(),
+        send(&app, post(&form_fields(&html, KEY))).await.status(),
         StatusCode::TOO_MANY_REQUESTS
     );
 }
@@ -153,7 +202,7 @@ async fn tampered_parameters_fail_csrf_binding() {
     let st = state();
     let app = app(st.clone());
     let html = login_page(&app, &client_id(&st)).await;
-    let mut fields = form_fields(&html, PASSWORD);
+    let mut fields = form_fields(&html, KEY);
     for f in fields.iter_mut() {
         if f.0 == "state" {
             f.1 = "different".into();
@@ -224,7 +273,7 @@ async fn fail_five_times_then_try(
     }
     send(
         &app,
-        post_from(&form_fields(&html, PASSWORD), [10, 0, 0, 1], second_xff),
+        post_from(&form_fields(&html, KEY), [10, 0, 0, 1], second_xff),
     )
     .await
     .status()
@@ -299,7 +348,7 @@ async fn granted_scope_is_the_resource_service() {
     let res = send(&app, get(&format!("/authorize?{q}"))).await;
     assert_eq!(res.status(), StatusCode::OK);
     let html = body_text(res).await;
-    let mut fields = form_fields(&html, PASSWORD);
+    let mut fields = form_fields(&html, KEY);
     for f in fields.iter_mut() {
         if f.0 == "scope" {
             f.1 = "evil".into();
@@ -324,7 +373,7 @@ async fn empty_state_is_omitted_from_redirect() {
     let q =
         query(&client_id(&st), "https://app.example.com/cb").replace("state=st%3Cate%3E", "state=");
     let html = body_text(send(&app, get(&format!("/authorize?{q}"))).await).await;
-    let res = send(&app, post(&form_fields(&html, PASSWORD))).await;
+    let res = send(&app, post(&form_fields(&html, KEY))).await;
     assert_eq!(res.status(), StatusCode::FOUND);
     let loc = url::Url::parse(res.headers()["location"].to_str().unwrap()).unwrap();
     assert!(loc.query_pairs().any(|(k, _)| k == "code"));

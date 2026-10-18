@@ -5,6 +5,7 @@ pub mod error;
 pub mod service;
 pub mod sic;
 pub mod tools;
+pub mod verifier;
 pub mod view;
 
 pub use service::{DataService, from_env};

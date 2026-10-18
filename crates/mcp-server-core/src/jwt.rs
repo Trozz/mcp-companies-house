@@ -32,6 +32,9 @@ pub struct Payload {
     pub resource: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub binding: Option<String>,
+    /// The person's credential, sealed by `credential::Sealer` (code, access and refresh tokens).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -1,30 +1,51 @@
 use super::fake_ch::{API_KEY, FakeCh};
+use axum::http::request::Parts;
 use mcp_companies_house_data::api::{ApiSettings, ChClient};
 use mcp_companies_house_data::tools::CompaniesServer;
+use mcp_server_core::credential::Credential;
+use rmcp::handler::server::tool::Extension;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::CallToolResult;
-use secrecy::SecretString;
 use serde::de::DeserializeOwned;
 use std::sync::Arc;
 use std::time::Duration;
 
 /// Client settings for the fake: no delay between a failure and its retry.
-pub fn settings(fake: &FakeCh, key: &str) -> ApiSettings {
-    let mut s = ApiSettings::new(fake.url.clone(), SecretString::from(key.to_string()));
+pub fn settings(fake: &FakeCh) -> ApiSettings {
+    let mut s = ApiSettings::new(fake.url.clone());
     s.retry_delay = Duration::ZERO;
     s
 }
 
 pub fn client(fake: &FakeCh) -> Arc<ChClient> {
-    Arc::new(ChClient::new(settings(fake, API_KEY)).unwrap())
+    Arc::new(ChClient::new(settings(fake)).unwrap())
 }
 
 pub fn server(fake: &FakeCh) -> CompaniesServer {
     CompaniesServer::new(client(fake))
 }
 
-pub fn server_with_key(fake: &FakeCh, key: &str) -> CompaniesServer {
-    CompaniesServer::new(Arc::new(ChClient::new(settings(fake, key)).unwrap()))
+/// The test key, as a credential.
+pub fn key() -> Credential {
+    Credential::new(API_KEY)
+}
+
+/// The request details a tool sees when the caller signed in with `key`.
+pub fn auth_with(key: &str) -> Extension<Parts> {
+    let (mut parts, ()) = axum::http::Request::new(()).into_parts();
+    parts.extensions.insert(Credential::new(key));
+    Extension(parts)
+}
+
+/// The request details of a caller signed in with the test key.
+pub fn auth() -> Extension<Parts> {
+    auth_with(API_KEY)
+}
+
+/// Request details without a credential, as if the bearer guard were missing.
+pub fn no_auth() -> Extension<Parts> {
+    let (parts, ()) = axum::http::Request::new(()).into_parts();
+    Extension(parts)
 }
 
 pub fn params<T: DeserializeOwned>(v: serde_json::Value) -> Parameters<T> {

@@ -2,8 +2,8 @@
 //! disqualified officers.
 
 use super::{
-    CompaniesServer, Query, count, id_arg, items, json_result, limit_arg, normalise_company_number,
-    nothing_listed, required_text, run,
+    Caller, CompaniesServer, Query, count, id_arg, items, json_result, limit_arg,
+    normalise_company_number, nothing_listed, required_text, run,
 };
 use crate::error::{self, ChError};
 use crate::view::people::{
@@ -11,6 +11,8 @@ use crate::view::people::{
     psc_statement_item,
 };
 use crate::view::{birth, detail, page};
+use axum::http::request::Parts;
+use rmcp::handler::server::tool::Extension;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::CallToolResult;
 use rmcp::schemars::JsonSchema;
@@ -131,7 +133,7 @@ fn with_counts(mut page: Value, source: &Value, keys: &[&str]) -> Value {
     page
 }
 
-impl CompaniesServer {
+impl Caller {
     /// One page of a company's officers, shaped for output.
     pub(crate) async fn officers_page(
         &self,
@@ -227,9 +229,11 @@ impl CompaniesServer {
     pub async fn list_officers(
         &self,
         Parameters(p): Parameters<ListOfficersParams>,
+        Extension(parts): Extension<Parts>,
     ) -> Result<CallToolResult, McpError> {
         tracing::debug!(args = ?p, "list_officers");
         run("list_officers", async {
+            let c = self.caller(&parts)?;
             let number = normalise_company_number(&p.company_number)?;
             let (start, mut q) = paging(p.limit, p.start_index)?;
             if let Some(order) = p.order_by {
@@ -240,9 +244,9 @@ impl CompaniesServer {
                 };
                 q.push(("order_by", o.to_string()));
             }
-            let out = self.officers_page(&number, &q, start).await?;
+            let out = c.officers_page(&number, &q, start).await?;
             if nothing_listed(&out, start) {
-                self.ensure_company(&number).await?;
+                c.ensure_company(&number).await?;
             }
             Ok(json_result(&out))
         })
@@ -256,15 +260,17 @@ impl CompaniesServer {
     pub async fn get_officer_appointments(
         &self,
         Parameters(p): Parameters<OfficerAppointmentsParams>,
+        Extension(parts): Extension<Parts>,
     ) -> Result<CallToolResult, McpError> {
         tracing::debug!(args = ?p, "get_officer_appointments");
         run("get_officer_appointments", async {
+            let c = self.caller(&parts)?;
             let id = id_arg("officer_id", &p.officer_id)?;
             let (start, mut q) = paging(p.limit, p.start_index)?;
             if p.active_only == Some(true) {
                 q.push(("filter", "active".to_string()));
             }
-            let found = self
+            let found = c
                 .get_optional("officer_appointments", &["officers", &id, "appointments"], &q)
                 .await?
                 .ok_or_else(|| {
@@ -298,12 +304,14 @@ impl CompaniesServer {
     pub async fn search_officers(
         &self,
         Parameters(p): Parameters<SearchPeopleParams>,
+        Extension(parts): Extension<Parts>,
     ) -> Result<CallToolResult, McpError> {
         tracing::debug!(args = ?p, "search_officers");
         run("search_officers", async {
+            let c = self.caller(&parts)?;
             let query = required_text("query", &p.query)?;
             let limit = limit_arg(p.limit)?;
-            let out = self
+            let out = c
                 .search_page(
                     "search_officers",
                     &["search", "officers"],
@@ -325,14 +333,16 @@ impl CompaniesServer {
     pub async fn list_persons_with_significant_control(
         &self,
         Parameters(p): Parameters<ListPscParams>,
+        Extension(parts): Extension<Parts>,
     ) -> Result<CallToolResult, McpError> {
         tracing::debug!(args = ?p, "list_persons_with_significant_control");
         run("list_persons_with_significant_control", async {
+            let c = self.caller(&parts)?;
             let number = normalise_company_number(&p.company_number)?;
             let (start, q) = paging(p.limit, p.start_index)?;
-            let out = self.psc_page(&number, &q, start).await?;
+            let out = c.psc_page(&number, &q, start).await?;
             if nothing_listed(&out, start) {
-                self.ensure_company(&number).await?;
+                c.ensure_company(&number).await?;
             }
             Ok(json_result(&out))
         })
@@ -346,12 +356,14 @@ impl CompaniesServer {
     pub async fn search_disqualified_officers(
         &self,
         Parameters(p): Parameters<SearchPeopleParams>,
+        Extension(parts): Extension<Parts>,
     ) -> Result<CallToolResult, McpError> {
         tracing::debug!(args = ?p, "search_disqualified_officers");
         run("search_disqualified_officers", async {
+            let c = self.caller(&parts)?;
             let query = required_text("query", &p.query)?;
             let limit = limit_arg(p.limit)?;
-            let out = self
+            let out = c
                 .search_page(
                     "search_disqualified",
                     &["search", "disqualified-officers"],
@@ -373,16 +385,18 @@ impl CompaniesServer {
     pub async fn get_disqualified_officer(
         &self,
         Parameters(p): Parameters<GetDisqualifiedOfficerParams>,
+        Extension(parts): Extension<Parts>,
     ) -> Result<CallToolResult, McpError> {
         tracing::debug!(args = ?p, "get_disqualified_officer");
         run("get_disqualified_officer", async {
+            let c = self.caller(&parts)?;
             let id = id_arg("officer_id", &p.officer_id)?;
             let kinds = match p.officer_kind {
                 Some(k) => vec![k],
                 None => vec![DisqualifiedKind::Natural, DisqualifiedKind::Corporate],
             };
             for kind in kinds {
-                if let Some(v) = self
+                if let Some(v) = c
                     .get_optional(
                         "disqualified_officer",
                         &["disqualified-officers", kind.segment(), &id],

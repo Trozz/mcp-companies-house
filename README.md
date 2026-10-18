@@ -8,23 +8,29 @@ A self-hosted [Model Context Protocol](https://modelcontextprotocol.io) server f
 
 - Single static Rust binary, shipped as a `FROM scratch` container image.
 - TLS end to end: the server terminates TLS itself, and every call to Companies House is verified.
+- Each person signs in with their own Companies House API key, so one server serves many people. The server holds no Companies House key.
 - Built-in OAuth 2.1 authorization server so each service works as a claude.ai remote connector. No database, no volume.
 - Read only: the public data API cannot change anything at Companies House.
 
-The server shares its core (OAuth, TLS, routing, observability) with [mcp-icloud](https://github.com/Trozz/mcp-icloud): `mcp-server-core` is a git dependency pinned to a commit in `Cargo.toml`.
+The core (OAuth, TLS, routing, observability) started as a copy of `mcp-server-core` from [mcp-icloud](https://github.com/Trozz/mcp-icloud) and lives in `crates/mcp-server-core`, where it gained per-person sign-in.
 
 ## How it works
 
-The server calls the Companies House [Public Data API](https://developer-specs.company-information.service.gov.uk/companies-house-public-data-api/reference) with a REST API key, sent as the HTTP Basic username with a blank password:
+The server calls the Companies House [Public Data API](https://developer-specs.company-information.service.gov.uk/companies-house-public-data-api/reference) with the REST API key of the person using it, sent as the HTTP Basic username with a blank password:
 
 | Environment | Host | Data |
 |---|---|---|
 | Live (default) | `api.company-information.service.gov.uk` | The real register |
 | Sandbox | `api-sandbox.company-information.service.gov.uk` | Test companies you create with the test data generator; search answers are mostly empty |
 
-Keys belong to one environment: a sandbox key is rejected by the live API and the other way round.
+Keys belong to one environment: a sandbox key is rejected by the live API and the other way round. `COMPANIES_HOUSE_API_URL` sets the environment for the whole server, so everyone needs a key for that environment.
 
-MCP clients reach each service over HTTPS at its path (`https://<host>/companies`). They authenticate with an OAuth access token (claude.ai) or a static bearer token (Claude Code and other clients that can send a header). The Companies House key never leaves the server.
+MCP clients reach each service over HTTPS at its path (`https://<host>/companies`). Each person brings their own Companies House REST API key, in one of two ways:
+
+- **Sign in (OAuth, for claude.ai and Claude Desktop).** The server's sign-in page asks for the key and checks it with Companies House. It is then encrypted into that connection's OAuth tokens; the server stores nothing.
+- **Key as the bearer token (Claude Code and other clients that can send a header).** The client sends `Authorization: Bearer <key>`. The server checks the key with Companies House the first time it sees it.
+
+Every Companies House request then uses the caller's own key, so each person has their own rate limit and sees only what their key may see.
 
 `COMPANIES_HOUSE_SERVICES` chooses which services run (default: all). A service that is not enabled is not mounted and does not read its configuration.
 
@@ -74,7 +80,7 @@ MCP clients reach each service over HTTPS at its path (`https://<host>/companies
 
 ### Rate limit
 
-Companies House allows 600 requests per 5 minutes per key and answers `429` for the rest of the window once it is used up; applications that keep exceeding it can be banned. The server tracks the `X-Ratelimit-*` headers: when the window is used up, tools return `rate_limited` with the seconds until it resets, without calling Companies House again until then. A request is retried once only after a network error or a `5xx`.
+Companies House allows 600 requests per 5 minutes per key and answers `429` for the rest of the window once it is used up; applications that keep exceeding it can be banned. The server tracks the `X-Ratelimit-*` headers separately for each person's key: when a key's window is used up, that person's tools return `rate_limited` with the seconds until it resets, without calling Companies House again until then. Other people are not affected. A request is retried once only after a network error or a `5xx`.
 
 ### SIC codes
 
@@ -82,29 +88,21 @@ Companies House allows 600 requests per 5 minutes per key and answers `429` for 
 
 ## Quick start
 
-### 1. Create an API key
-
-1. Register at the [Companies House Developer Hub](https://developer.company-information.service.gov.uk/get-started/) and create an application. Choose the **live** environment for real data, or **test** for the sandbox.
-2. In the application, create a **REST** API key. (Stream keys and web OAuth clients are for other APIs and do not work here.)
-3. Optionally restrict the key to the IP address the server calls from.
-
-### 2. Run with Docker
+### 1. Run with Docker
 
 ```bash
 docker run -d --name mcp-companies-house -p 8443:8443 \
-  -e COMPANIES_HOUSE_API_KEY=your-rest-api-key \
   -e PUBLIC_URL=https://companies-house.example.com \
   -e OAUTH_SIGNING_KEY="$(openssl rand -hex 32)" \
-  -e OAUTH_ADMIN_PASSWORD=choose-a-password-of-12-or-more-chars \
   -v /path/to/certs:/certs:ro \
   -e TLS_CERT_PATH=/certs/fullchain.pem \
   -e TLS_KEY_PATH=/certs/privkey.pem \
   ghcr.io/trozz/mcp-companies-house:latest
 ```
 
-For a sandbox key add `-e COMPANIES_HOUSE_API_URL=https://api-sandbox.company-information.service.gov.uk`. Keep `OAUTH_SIGNING_KEY` stable: changing it signs everyone out. Store secrets in a secret store, not in shell history.
+This serves the live register. To serve the sandbox instead, add `-e COMPANIES_HOUSE_API_URL=https://api-sandbox.company-information.service.gov.uk`; people then need sandbox keys. Keep `OAUTH_SIGNING_KEY` stable: changing it signs everyone out. Store it in a secret store, not in shell history.
 
-### 3. Or run the binary
+### 2. Or run the binary
 
 Download the archive for your platform from [Releases](https://github.com/Trozz/mcp-companies-house/releases), verify the checksum, extract it and run:
 
@@ -112,7 +110,7 @@ Download the archive for your platform from [Releases](https://github.com/Trozz/
 shasum -a 256 -c mcp-companies-house-<version>-<target>.tar.gz.sha256
 tar -xzf mcp-companies-house-<version>-<target>.tar.gz
 cd mcp-companies-house-<version>-<target>
-COMPANIES_HOUSE_API_KEY=... PUBLIC_URL=... OAUTH_SIGNING_KEY=... OAUTH_ADMIN_PASSWORD=... ./mcp-companies-house
+PUBLIC_URL=... OAUTH_SIGNING_KEY=... ./mcp-companies-house
 ```
 
 `./mcp-companies-house --version` prints the version. `./mcp-companies-house --healthcheck` connects to `127.0.0.1` and exits 0 when the local server answers `/healthz` (used by the image `HEALTHCHECK`). `BIND_ADDR` must therefore listen on loopback; the default `0.0.0.0` does.
@@ -121,26 +119,38 @@ COMPANIES_HOUSE_API_KEY=... PUBLIC_URL=... OAUTH_SIGNING_KEY=... OAUTH_ADMIN_PAS
 
 Each service is a separate MCP server, so add one connector per service you want.
 
+### Get your API key
+
+Everyone who uses the server needs their own key:
+
+1. Register at the [Companies House Developer Hub](https://developer.company-information.service.gov.uk/get-started/) and create an application. Choose a **live** application for a server on the live register, or **test** for a sandbox server.
+2. In the application, create a **REST** API key. (Stream keys and web OAuth clients are for other APIs and do not work here.)
+3. If you restrict the key to IP addresses, include the address the server calls Companies House from.
+
 ### claude.ai, Claude Desktop and Claude mobile (remote connector)
 
 1. In claude.ai open **Settings**, then **Connectors**, then **Add custom connector**.
 2. Enter `https://<your PUBLIC_URL host>/companies`.
-3. A login page from this server opens, naming the service. Enter `OAUTH_ADMIN_PASSWORD`.
+3. A sign-in page from this server opens, naming the service. Enter your Companies House REST API key.
 
 claude.ai connects from Anthropic's servers, so the server must be reachable from the internet with a **publicly trusted** certificate (directly through `TLS_CERT_PATH`/`TLS_KEY_PATH`, or at a reverse proxy or tunnel in front of it).
 
 ### Claude Code
 
-Set `MCP_AUTH_TOKEN` on the server (for example `openssl rand -hex 32`), then:
+Send your key as the bearer token:
 
 ```bash
 claude mcp add --transport http companies-house https://companies-house.example.com/companies \
-  --header "Authorization: Bearer $MCP_AUTH_TOKEN"
+  --header "Authorization: Bearer $COMPANIES_HOUSE_API_KEY"
 ```
+
+`$COMPANIES_HOUSE_API_KEY` here is your own key on your own machine. Without `--header`, Claude Code uses the sign-in page instead (run `/mcp` to authenticate).
 
 ## Configuration
 
-Every secret can also be read from a file by appending `_FILE` to its name, for example `COMPANIES_HOUSE_API_KEY_FILE=/run/secrets/companies-house`. A directly set value wins over the file.
+Every secret can also be read from a file by appending `_FILE` to its name, for example `OAUTH_SIGNING_KEY_FILE=/run/secrets/oauth-signing-key`. A directly set value wins over the file.
+
+The server has no Companies House key of its own, and has no admin password or static token. `COMPANIES_HOUSE_API_KEY`, `OAUTH_ADMIN_PASSWORD` and `MCP_AUTH_TOKEN` from earlier versions stop startup with a message to remove them.
 
 ### Server
 
@@ -148,18 +158,16 @@ Every secret can also be read from a file by appending `_FILE` to its name, for 
 |---|---|---|---|
 | `COMPANIES_HOUSE_SERVICES` | no | all (`companies`) | Comma separated services to run. An unknown name or an empty list stops startup |
 | `PUBLIC_URL` | yes | | External base URL, for example `https://companies-house.example.com`. `http` is accepted only for `localhost` |
-| `OAUTH_SIGNING_KEY` | yes | | At least 32 bytes. Rotating it revokes every client and token |
-| `OAUTH_ADMIN_PASSWORD` | yes | | Password for the OAuth login page, at least 12 characters |
-| `MCP_AUTH_TOKEN` | no | | Static bearer token accepted on every service path |
-| `TRUSTED_PROXIES` | no | | Comma separated proxy IPs whose `X-Forwarded-For` is trusted for login rate limiting |
+| `OAUTH_SIGNING_KEY` | yes | | At least 32 bytes. Signs OAuth tokens and encrypts the keys inside them. Rotating it signs everyone out |
+| `TRUSTED_PROXIES` | no | | Comma separated proxy IPs whose `X-Forwarded-For` is trusted for sign-in rate limiting |
 | `ALLOWED_ORIGINS` | no | | Extra allowed `Origin` values, comma separated |
 | `BIND_ADDR` | no | `0.0.0.0:8443` | Listen address. Must listen on loopback (`0.0.0.0` does) so `--healthcheck` can connect to `127.0.0.1` |
 | `TLS_CERT_PATH`, `TLS_KEY_PATH` | no | | PEM certificate chain and key. Reloaded automatically when the files change |
 | `INSECURE_HTTP` | no | `false` | Serve plain HTTP without TLS |
 | `LOG_LEVEL` | no | `info` | Log filter, for example `info,mcp_companies_house_data::api=debug` |
 | `LOG_FORMAT` | no | `json` | `json` or `pretty` |
-| `DEBUG` | no | off | Debug logging: tool arguments, error messages, Companies House paths, statuses and timings. Never logs the API key |
-| `DEBUG_UNSAFE_LOG_CONTENT` | no | off | Also logs full tool results and Companies House response bodies. The API key is never logged |
+| `DEBUG` | no | off | Debug logging: tool arguments, error messages, Companies House paths, statuses and timings. Never logs API keys |
+| `DEBUG_UNSAFE_LOG_CONTENT` | no | off | Also logs full tool results and Companies House response bodies. API keys are never logged |
 | `METRICS_ADDR` | no | | Enables a Prometheus listener, for example `0.0.0.0:9090` |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | no | | Enables OpenTelemetry trace export over OTLP/HTTP |
 
@@ -167,8 +175,7 @@ Every secret can also be read from a file by appending `_FILE` to its name, for 
 
 | Variable | Required | Default | Description |
 |---|---|---|---|
-| `COMPANIES_HOUSE_API_KEY` | yes | | REST API key from the Developer Hub |
-| `COMPANIES_HOUSE_API_URL` | no | `https://api.company-information.service.gov.uk` | API base URL. Use `https://api-sandbox.company-information.service.gov.uk` with a sandbox key. Must be `https`, except a loopback address for testing |
+| `COMPANIES_HOUSE_API_URL` | no | `https://api.company-information.service.gov.uk` | API base URL, and so the environment everyone's keys must belong to. Use `https://api-sandbox.company-information.service.gov.uk` for the sandbox. Must be `https`, except a loopback address for testing |
 
 ## TLS
 
@@ -192,18 +199,20 @@ TLS_CERT_PATH=$PWD/cert.pem TLS_KEY_PATH=$PWD/key.pem ./mcp-companies-house
 ## Observability
 
 - Logs go to stdout as JSON by default. Every tool call is a span and is logged with its outcome and duration; OAuth requests are logged the same way. Companies House requests inside a tool call are logged at debug level.
-- Failed tool calls are logged at `warn` with the tool and the error kind only. `DEBUG=1` adds tool arguments (search terms included), error messages, Companies House paths, statuses and timings. The API key and the `Authorization` header are never logged.
+- Failed tool calls are logged at `warn` with the tool and the error kind only. `DEBUG=1` adds tool arguments (search terms included), error messages, Companies House paths, statuses and timings. API keys and the `Authorization` header are never logged.
 - `DEBUG_UNSAFE_LOG_CONTENT=1` also writes tool results and Companies House response bodies into the logs. The server prints a warning at startup.
-- `METRICS_ADDR` starts a separate Prometheus listener (plain HTTP, keep it on an internal network): `mcp_tool_calls_total`, `mcp_tool_duration_seconds`, `companies_house_requests_total`, `companies_house_request_duration_seconds`, `companies_house_ratelimit_remaining`, `companies_house_rate_limited_total`, `oauth_requests_total`, `oauth_login_failures_total`, `http_requests_total`.
+- `METRICS_ADDR` starts a separate Prometheus listener (plain HTTP, keep it on an internal network): `mcp_tool_calls_total`, `mcp_tool_duration_seconds`, `companies_house_requests_total`, `companies_house_request_duration_seconds`, `companies_house_rate_limited_total`, `oauth_requests_total`, `oauth_login_failures_total`, `bearer_credential_checks_total`, `http_requests_total`.
 - `OTEL_EXPORTER_OTLP_ENDPOINT` (with the standard `OTEL_EXPORTER_OTLP_HEADERS`) exports traces over OTLP/HTTP. Nothing is exported unless it is set.
 
 ## Security notes
 
-- Each service is its own OAuth protected resource (RFC 9728), with metadata at `/.well-known/oauth-protected-resource/<service>`. Access tokens are bound to the service they were issued for (RFC 8707). One login page and one `OAUTH_ADMIN_PASSWORD` cover all services.
-- `MCP_AUTH_TOKEN` is a single-owner shortcut accepted on every service path. Treat it like the admin password.
-- The OAuth login is limited to 5 failed attempts per minute per client, plus 30 failures per minute globally. Behind a reverse proxy, set `TRUSTED_PROXIES` so the per-client limit uses the real client address.
-- Access tokens last 1 hour, refresh tokens 30 days. There is no per-client revocation: rotate `OAUTH_SIGNING_KEY` to sign every client out.
-- The API key is sent only to `COMPANIES_HOUSE_API_URL`; redirects are not followed.
+- **Who can use it.** Anyone with a valid Companies House REST key for the server's environment. Keys are free, so treat a server reachable from the internet as public; limit who can reach it at the network if that matters. Each person's requests use, and are limited by, their own key.
+- **No stored keys.** At sign-in the key is checked with one Companies House search request, then sealed (ChaCha20-Poly1305, under a key derived from `OAUTH_SIGNING_KEY` with HKDF-SHA256) into that client's access and refresh tokens, and opened again on each request. The server writes no key to disk or logs. The client holds the sealed key inside its tokens and cannot read it.
+- **Keys as bearer tokens** are checked with Companies House on first use. The verdict is cached in memory for 10 minutes (1 minute for a rejected key) under the key's SHA-256, never the key itself. Every Companies House request still uses the key, so a key revoked at Companies House stops working at once.
+- Each service is its own OAuth protected resource (RFC 9728), with metadata at `/.well-known/oauth-protected-resource/<service>`. Access tokens are bound to the service they were issued for (RFC 8707).
+- Rejected keys, at the sign-in page or as bearer tokens, are limited to 5 per minute per client, plus 30 per minute across all clients. Behind a reverse proxy, set `TRUSTED_PROXIES` so the per-client limit uses the real client address. When Companies House cannot be reached, the key is not counted as rejected and the client is asked to retry.
+- Access tokens last 1 hour, refresh tokens 30 days. There is no per-client revocation: rotate `OAUTH_SIGNING_KEY` to sign every client out, which also makes every sealed key unreadable.
+- Keys are sent only to `COMPANIES_HOUSE_API_URL`; redirects are not followed.
 - Company names, addresses and other filed text are written by the public. The server instructions tell the model to treat them as data, not as instructions.
 - The container runs as UID 65532 with nothing else in the image.
 
@@ -217,7 +226,7 @@ cargo deny check
 bash scripts/test-next-version.sh
 ```
 
-The tests run against an in-memory fake of the Companies House API. Live smoke tests against the sandbox are ignored by default; they need a sandbox REST key and create test companies with the [test data generator](https://developer.company-information.service.gov.uk/api-testing), which they always delete again. The sandbox serves profiles, officers and PSCs for generated companies, but its search index is empty and filing history and PSC statements answer HTTP 500, so those tests check shapes and graceful failure rather than content:
+The tests run against an in-memory fake of the Companies House API. Live smoke tests against the sandbox are ignored by default; they need a sandbox REST key in `COMPANIES_HOUSE_API_KEY` (read only by the tests) and create test companies with the [test data generator](https://developer.company-information.service.gov.uk/api-testing), which they always delete again. The sandbox serves profiles, officers and PSCs for generated companies, but its search index is empty and filing history and PSC statements answer HTTP 500, so those tests check shapes and graceful failure rather than content:
 
 ```bash
 COMPANIES_HOUSE_API_KEY=... cargo test -p mcp-companies-house-data --test live_sandbox -- --ignored --nocapture
@@ -233,22 +242,24 @@ pub trait Service: Send + Sync + 'static {
     fn tool_names(&self) -> Vec<String>;
     fn log_caps(&self) -> &'static [&'static str] { &[] }
     fn router(self: Arc<Self>, ctx: &ServiceContext) -> axum::Router;
+    // How people sign in: checks their credential with the upstream service.
+    fn credential_verifier(&self) -> Option<Arc<dyn CredentialVerifier>> { None }
 }
 ```
 
 1. Create `crates/mcp-companies-house-<name>` as a library. Read its own variables in `pub fn from_env(env: &mut ServiceEnv) -> Option<Arc<dyn Service>>`, reporting problems through `env.errors`. Never read the server variables.
-2. Build the MCP endpoint in `router()` with `mcp_server_core::service::mcp_service(ctx, move || Ok(MyServer::new(...)))`.
+2. Build the MCP endpoint in `router()` with `mcp_server_core::service::mcp_service(ctx, move || Ok(MyServer::new(...)))`. Tools read the caller's key from the request: take `Extension(parts): Extension<http::request::Parts>` and get `mcp_server_core::credential::Credential` from `parts.extensions`.
 3. Add the crate to `crates/mcp-companies-house/Cargo.toml` and one line to `SERVICES` in `crates/mcp-companies-house/src/lib.rs`.
 
-Routing, OAuth metadata, token audiences, `COMPANIES_HOUSE_SERVICES` and the release pipeline pick the new service up without further changes.
+Routing, OAuth metadata, token audiences, `COMPANIES_HOUSE_SERVICES` and the release pipeline pick the new service up without further changes. The server has one sign-in, taken from the first enabled service that defines `credential_verifier`, so a service that needs a different credential (for example a stream key) needs a core change first.
 
 ### Planned services
 
 `docs/plans/streaming-and-filing.md` proposes a `/streaming` service (Streaming API, needs a stream key from a live application) and a `/filing` service (registered office and registered email address changes through the Companies House filing API and OAuth). Neither is built yet.
 
-### Updating the shared core
+### The core
 
-`mcp-server-core` comes from `Trozz/mcp-icloud` at the commit in the workspace `Cargo.toml`. To pick up core changes, set `rev` to the new commit and run `cargo update -p mcp-server-core`, then the checks above.
+`crates/mcp-server-core` was copied from `Trozz/mcp-icloud` at commit `d98557d` and has since gained per-person sign-in (`src/credential.rs`; `OAUTH_ADMIN_PASSWORD` and `MCP_AUTH_TOKEN` removed). Port fixes between the two by hand.
 
 ## Releases
 

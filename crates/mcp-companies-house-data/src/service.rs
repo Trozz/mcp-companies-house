@@ -1,6 +1,8 @@
 use crate::api::{ApiSettings, ChClient};
 use crate::config::DataConfig;
 use crate::tools::CompaniesServer;
+use crate::verifier::ChKeyVerifier;
+use mcp_server_core::credential::CredentialVerifier;
 use mcp_server_core::service::{Service, ServiceContext, ServiceEnv, mcp_service};
 use std::sync::Arc;
 
@@ -35,12 +37,16 @@ impl Service for DataService {
         );
         mcp_service(ctx, move || Ok(self.server()))
     }
+
+    fn credential_verifier(&self) -> Option<Arc<dyn CredentialVerifier>> {
+        Some(Arc::new(ChKeyVerifier::new(self.client.clone())))
+    }
 }
 
 /// Reads the company data configuration and builds the service. Errors go to `env.errors`.
 pub fn from_env(env: &mut ServiceEnv) -> Option<Arc<dyn Service>> {
     let cfg = DataConfig::from_env(env)?;
-    let client = match ChClient::new(ApiSettings::new(cfg.api_url, cfg.api_key)) {
+    let client = match ChClient::new(ApiSettings::new(cfg.api_url)) {
         Ok(c) => Arc::new(c),
         Err(e) => {
             env.errors
@@ -66,11 +72,13 @@ mod tests {
 
     #[test]
     fn builds_from_env() {
-        let mut e = env(&[("COMPANIES_HOUSE_API_KEY", "test-api-key")]);
+        let mut e = env(&[]);
         let svc = from_env(&mut e).expect("service");
         assert!(e.errors.is_empty(), "{:?}", e.errors);
         assert_eq!(svc.name(), "companies");
         assert!(svc.log_caps().is_empty());
+        let verifier = svc.credential_verifier().expect("a key verifier");
+        assert_eq!(verifier.label(), "Companies House API key");
         assert_eq!(
             svc.tool_names(),
             vec![
@@ -101,10 +109,6 @@ mod tests {
         let mut e = env(&[("COMPANIES_HOUSE_API_URL", "ftp://x")]);
         assert!(from_env(&mut e).is_none());
         let joined = e.errors.join("\n");
-        assert!(
-            joined.contains("COMPANIES_HOUSE_API_KEY is required"),
-            "{joined}"
-        );
         assert!(joined.contains("COMPANIES_HOUSE_API_URL"), "{joined}");
     }
 }

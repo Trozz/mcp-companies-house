@@ -1,9 +1,15 @@
 #[derive(Debug, thiserror::Error)]
 pub enum ChError {
     #[error(
-        "Companies House rejected the API key. Check COMPANIES_HOUSE_API_KEY is a REST API key (not a stream key) for the environment COMPANIES_HOUSE_API_URL points at: sandbox keys only work against the sandbox"
+        "Companies House rejected your API key. Sign in again with a REST API key (not a stream key) for the environment this server uses: keys from a test application only work with the sandbox"
     )]
     Auth,
+    #[error(
+        "Companies House refused your API key from this server (HTTP 403). Check the key's IP or domain restrictions in the Developer Hub"
+    )]
+    KeyRestricted,
+    #[error("this request carried no Companies House API key; sign in again")]
+    MissingKey,
     /// A complete message: tool errors are already prefixed with the kind, `not_found: `.
     #[error("{0}")]
     NotFound(String),
@@ -31,7 +37,7 @@ fn rate_limited_message(reset_in_secs: Option<u64>) -> String {
 impl ChError {
     pub fn kind(&self) -> &'static str {
         match self {
-            ChError::Auth => "auth",
+            ChError::Auth | ChError::KeyRestricted | ChError::MissingKey => "auth",
             ChError::NotFound(_) => "not_found",
             ChError::RateLimited { .. } => "rate_limited",
             ChError::Validation(_) => "validation",
@@ -72,10 +78,18 @@ mod tests {
     }
 
     #[test]
-    fn auth_message_explains_sandbox_keys() {
+    fn auth_messages_tell_the_person_what_to_do() {
         let msg = ChError::Auth.to_string();
-        assert!(msg.contains("COMPANIES_HOUSE_API_KEY"), "{msg}");
+        assert!(msg.contains("Sign in again"), "{msg}");
         assert!(msg.contains("sandbox"), "{msg}");
+        assert!(
+            ChError::KeyRestricted
+                .to_string()
+                .contains("IP or domain restrictions")
+        );
+        for e in [ChError::Auth, ChError::KeyRestricted, ChError::MissingKey] {
+            assert_eq!(e.kind(), "auth");
+        }
     }
 
     #[test]

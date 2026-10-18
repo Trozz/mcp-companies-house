@@ -1,7 +1,9 @@
 use crate::api::ChClient;
 use crate::error::{self, ChError};
 use crate::view::page;
+use axum::http::request::Parts;
 use chrono::NaiveDate;
+use mcp_server_core::credential::Credential;
 use mcp_server_core::observability::content_logging_enabled;
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::model::{CallToolResult, ContentBlock, Implementation, ServerCapabilities, ServerConfig};
@@ -75,6 +77,28 @@ impl CompaniesServer {
         names
     }
 
+    /// This call's view of Companies House: the shared client and the caller's own key, which
+    /// the bearer guard put in the request (from their sign-in token or their bearer key).
+    pub(crate) fn caller(&self, parts: &Parts) -> error::Result<Caller> {
+        let key = parts
+            .extensions
+            .get::<Credential>()
+            .cloned()
+            .ok_or(ChError::MissingKey)?;
+        Ok(Caller {
+            client: self.client.clone(),
+            key,
+        })
+    }
+}
+
+/// One tool call's access to Companies House: requests go out with the caller's key.
+pub(crate) struct Caller {
+    client: Arc<ChClient>,
+    key: Credential,
+}
+
+impl Caller {
     /// GET a resource; a 404, or a 2xx with an empty body (some endpoints answer an unknown id
     /// with 204 No Content), is `None`.
     pub(crate) async fn get_optional(
@@ -83,7 +107,7 @@ impl CompaniesServer {
         segments: &[&str],
         query: &[(&str, String)],
     ) -> error::Result<Option<Value>> {
-        match self.client.get(endpoint, segments, query).await {
+        match self.client.get(&self.key, endpoint, segments, query).await {
             Ok(Value::Null) => Ok(None),
             Ok(v) => Ok(Some(v)),
             Err(ChError::NotFound(_)) => Ok(None),

@@ -1,12 +1,14 @@
 //! Records about a company: filing history, charges (secured lending) and insolvency.
 
 use super::{
-    CompaniesServer, count, id_arg, items, json_result, limit_arg, normalise_company_number,
-    nothing_listed, run,
+    Caller, CompaniesServer, count, id_arg, items, json_result, limit_arg,
+    normalise_company_number, nothing_listed, run,
 };
 use crate::error::{self, ChError};
 use crate::view::page;
 use crate::view::records::{charge_detail, charge_item, filing_item, insolvency};
+use axum::http::request::Parts;
+use rmcp::handler::server::tool::Extension;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::CallToolResult;
 use rmcp::schemars::JsonSchema;
@@ -71,7 +73,7 @@ fn categories_arg(categories: Option<&[String]>) -> error::Result<Vec<String>> {
     Ok(out)
 }
 
-impl CompaniesServer {
+impl Caller {
     /// One page of a company's filing history, newest first, shaped for output.
     pub(crate) async fn filings_page(
         &self,
@@ -142,9 +144,11 @@ impl CompaniesServer {
     pub async fn list_filing_history(
         &self,
         Parameters(p): Parameters<ListFilingHistoryParams>,
+        Extension(parts): Extension<Parts>,
     ) -> Result<CallToolResult, McpError> {
         tracing::debug!(args = ?p, "list_filing_history");
         run("list_filing_history", async {
+            let c = self.caller(&parts)?;
             let number = normalise_company_number(&p.company_number)?;
             let limit = limit_arg(p.limit)?;
             let start = p.start_index.unwrap_or(0);
@@ -156,7 +160,7 @@ impl CompaniesServer {
             if !categories.is_empty() {
                 q.push(("category", categories.join(",")));
             }
-            Ok(json_result(&self.filings_page(&number, &q, start).await?))
+            Ok(json_result(&c.filings_page(&number, &q, start).await?))
         })
         .await
     }
@@ -168,9 +172,11 @@ impl CompaniesServer {
     pub async fn list_charges(
         &self,
         Parameters(p): Parameters<ListChargesParams>,
+        Extension(parts): Extension<Parts>,
     ) -> Result<CallToolResult, McpError> {
         tracing::debug!(args = ?p, "list_charges");
         run("list_charges", async {
+            let c = self.caller(&parts)?;
             let number = normalise_company_number(&p.company_number)?;
             let limit = limit_arg(p.limit)?;
             let start = p.start_index.unwrap_or(0);
@@ -178,9 +184,9 @@ impl CompaniesServer {
                 ("items_per_page", limit.to_string()),
                 ("start_index", start.to_string()),
             ];
-            let out = self.charges_page(&number, &q, start).await?;
+            let out = c.charges_page(&number, &q, start).await?;
             if nothing_listed(&out, start) {
-                self.ensure_company(&number).await?;
+                c.ensure_company(&number).await?;
             }
             Ok(json_result(&out))
         })
@@ -194,12 +200,14 @@ impl CompaniesServer {
     pub async fn get_charge(
         &self,
         Parameters(p): Parameters<GetChargeParams>,
+        Extension(parts): Extension<Parts>,
     ) -> Result<CallToolResult, McpError> {
         tracing::debug!(args = ?p, "get_charge");
         run("get_charge", async {
+            let c = self.caller(&parts)?;
             let number = normalise_company_number(&p.company_number)?;
             let id = id_arg("charge_id", &p.charge_id)?;
-            let found = self
+            let found = c
                 .get_optional("company_charge", &["company", &number, "charges", &id], &[])
                 .await?
                 .ok_or_else(|| {
@@ -219,14 +227,16 @@ impl CompaniesServer {
     pub async fn get_insolvency(
         &self,
         Parameters(p): Parameters<super::CompanyNumberParams>,
+        Extension(parts): Extension<Parts>,
     ) -> Result<CallToolResult, McpError> {
         tracing::debug!(args = ?p, "get_insolvency");
         run("get_insolvency", async {
+            let c = self.caller(&parts)?;
             let number = normalise_company_number(&p.company_number)?;
-            let out = match self.insolvency_record(&number).await? {
+            let out = match c.insolvency_record(&number).await? {
                 Some(v) => v,
                 None => {
-                    self.ensure_company(&number).await?;
+                    c.ensure_company(&number).await?;
                     json!({
                     "cases": [],
                         "note": "Companies House holds no insolvency record for this company",

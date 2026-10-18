@@ -1,11 +1,11 @@
 use super::AuthState;
+use crate::credential::{self, CredentialCheck};
 use crate::jwt::{Payload, TokenKind};
 use crate::pkce;
 use axum::extract::{ConnectInfo, Form, FromRequestParts, Query, State};
 use axum::http::request::Parts;
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{Html, IntoResponse, Redirect, Response};
-use secrecy::ExposeSecret;
 use serde::Deserialize;
 use std::convert::Infallible;
 use std::net::{IpAddr, SocketAddr};
@@ -168,7 +168,7 @@ pub struct LoginForm {
     #[serde(flatten)]
     pub params: AuthorizeParams,
     pub csrf: String,
-    pub password: String,
+    pub credential: String,
 }
 
 fn escape(s: &str) -> String {
@@ -262,12 +262,15 @@ fn login_page(
         .map(|e| format!("<p style=\"color:#b00\">{}</p>", escape(e)))
         .unwrap_or_default();
     let service = escape(&v.scope);
+    let label = escape(st.verifier.label());
+    let help = escape(st.verifier.help());
     let html = format!(
         "<!doctype html><html><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width\">\
-<title>Authorize</title><style>body{{font-family:system-ui;max-width:24rem;margin:4rem auto;padding:0 1rem}}input[type=password]{{width:100%;padding:.5rem}}button{{margin-top:1rem;padding:.5rem 1rem}}</style></head>\
-<body><h1>Authorize access</h1><p>An MCP client is requesting access to the <strong>{service}</strong> service on this server.</p>{client_html}{destination}{error_html}\
-<form method=\"post\" action=\"/authorize\">{hidden}<label>Password<input type=\"password\" name=\"password\" autofocus required></label>\
-<button type=\"submit\">Authorize</button></form></body></html>"
+<title>Authorize</title><style>body{{font-family:system-ui;max-width:24rem;margin:4rem auto;padding:0 1rem}}input[type=password]{{width:100%;padding:.5rem}}button{{margin-top:1rem;padding:.5rem 1rem}}small{{color:#555}}</style></head>\
+<body><h1>Authorize access</h1><p>An MCP client is requesting access to the <strong>{service}</strong> service on this server.</p>{client_html}{destination}\
+<p>Sign in with your own {label}. It is checked once, then kept only in encrypted form inside this connection's tokens; this server does not store it.</p>{error_html}\
+<form method=\"post\" action=\"/authorize\">{hidden}<label>{label}<input type=\"password\" name=\"credential\" autocomplete=\"off\" spellcheck=\"false\" autofocus required></label>\
+<p><small>{help}</small></p><button type=\"submit\">Authorize</button></form></body></html>"
     );
     with_page_headers(status, html)
 }
@@ -355,23 +358,45 @@ pub async fn post_authorize(
             "The login form expired or was modified. Start the connection again.",
         );
     }
-    if !pkce::ct_eq(&form.password, st.settings.admin_password.expose_secret()) {
-        st.limiter.record_failure(ip);
-        metrics::counter!("oauth_login_failures_total").increment(1);
-        tracing::warn!(%ip, "oauth login failed");
-        return login_page(
-            &st,
-            &v,
-            StatusCode::UNAUTHORIZED,
-            Some("Incorrect password"),
-        );
+    let label = st.verifier.label();
+    let entered = form.credential.trim();
+    let verdict = if credential::plausible(entered) {
+        st.verifier.check(entered).await
+    } else {
+        CredentialCheck::Invalid(None)
+    };
+    match verdict {
+        CredentialCheck::Valid => {}
+        CredentialCheck::Invalid(reason) => {
+            st.limiter.record_failure(ip);
+            metrics::counter!("oauth_login_failures_total").increment(1);
+            tracing::warn!(%ip, "oauth login failed: credential rejected");
+            let message = reason.unwrap_or_else(|| format!("That {label} was not accepted."));
+            return login_page(&st, &v, StatusCode::UNAUTHORIZED, Some(&message));
+        }
+        CredentialCheck::Unavailable(why) => {
+            metrics::counter!("oauth_requests_total", "endpoint" => "authorize", "outcome" => "unavailable").increment(1);
+            tracing::warn!(%ip, reason = %why, "oauth login: credential could not be checked");
+            return login_page(
+                &st,
+                &v,
+                StatusCode::SERVICE_UNAVAILABLE,
+                Some(&format!(
+                    "Your {label} could not be checked right now: {why}"
+                )),
+            );
+        }
     }
+    let Ok(sealed) = st.sealer.seal(entered) else {
+        return error_page(StatusCode::INTERNAL_SERVER_ERROR, "token error");
+    };
     let payload = Payload {
         client_id: Some(v.client_id.clone()),
         redirect_uri: Some(v.redirect_uri.clone()),
         code_challenge: Some(v.code_challenge.clone()),
         scope: Some(v.scope.clone()),
         resource: Some(v.resource.clone()),
+        credential: Some(sealed),
         ..Default::default()
     };
     let Ok(code) = st
@@ -410,11 +435,10 @@ mod tests {
             OAuthSettings {
                 public_url: "https://mail.example.com".into(),
                 signing_key: "0123456789abcdef0123456789abcdef".to_string().into(),
-                admin_password: "pw".to_string().into(),
-                static_token: None,
                 trusted_proxies: Vec::new(),
             },
             services,
+            crate::credential::TestVerifier::accepting(&["good-key"]),
         )
     }
 

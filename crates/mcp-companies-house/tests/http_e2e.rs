@@ -2,6 +2,7 @@ use axum::body::Body;
 use axum::http::{Request, Response, StatusCode};
 use http_body_util::BodyExt;
 use mcp_companies_house::{SERVICES, app, load};
+use mcp_server_core::credential::Sealer;
 use mcp_server_core::jwt::{Jwt, Payload, TokenKind};
 use mcp_server_core::service::{HttpSettings, ServiceContext, ServiceEnv};
 use serde_json::{Value, json};
@@ -10,7 +11,6 @@ use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 use tower::ServiceExt;
 
-const TOKEN: &str = "static-test-token-0123456789";
 const HOST: &str = "ch.example.com";
 const SIGNING_KEY: &str = "0123456789abcdef0123456789abcdef";
 
@@ -19,11 +19,8 @@ fn server(extra: &[(&str, &str)]) -> axum::Router {
     let mut vars: HashMap<String, String> = [
         ("PUBLIC_URL", "https://ch.example.com"),
         ("OAUTH_SIGNING_KEY", SIGNING_KEY),
-        ("OAUTH_ADMIN_PASSWORD", "a long password"),
-        ("MCP_AUTH_TOKEN", TOKEN),
         ("INSECURE_HTTP", "true"),
-        ("COMPANIES_HOUSE_API_KEY", "test-api-key"),
-        // Keep the service off the network: nothing here calls Companies House.
+        // Keep the service off the network: nothing here reaches Companies House.
         ("COMPANIES_HOUSE_API_URL", "http://127.0.0.1:9"),
     ]
     .iter()
@@ -102,11 +99,12 @@ async fn healthz_needs_no_auth() {
 }
 
 #[tokio::test]
-async fn companies_is_served_at_its_path_with_the_static_token() {
+async fn companies_is_served_at_its_path_with_an_oauth_token() {
     let app = server(&[]);
+    let token = access_token_for("companies");
     let res = app
         .clone()
-        .oneshot(rpc("/companies", initialize(), Some(TOKEN), None))
+        .oneshot(rpc("/companies", initialize(), Some(&token), None))
         .await
         .unwrap();
     assert_eq!(res.status(), StatusCode::OK);
@@ -124,7 +122,7 @@ async fn companies_is_served_at_its_path_with_the_static_token() {
         .oneshot(rpc(
             "/companies",
             json!({"jsonrpc": "2.0", "method": "notifications/initialized"}),
-            Some(TOKEN),
+            Some(&token),
             Some(&session),
         ))
         .await
@@ -134,7 +132,7 @@ async fn companies_is_served_at_its_path_with_the_static_token() {
         .oneshot(rpc(
             "/companies",
             json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}}),
-            Some(TOKEN),
+            Some(&token),
             Some(&session),
         ))
         .await
@@ -179,8 +177,9 @@ async fn companies_sub_paths_are_guarded_too() {
     for (path, token) in [
         ("/companies/unknown", None),
         ("/companies/x/y", None),
-        ("/companies/unknown", Some("not-a-valid-token")),
-        ("/companies", Some("not-a-valid-token")),
+        ("/companies/unknown", Some("not.a.token")),
+        ("/companies", Some("not.a.token")),
+        ("/companies", Some("not a key")),
     ] {
         let res = app
             .clone()
@@ -201,7 +200,12 @@ async fn companies_sub_paths_are_guarded_too() {
 #[tokio::test]
 async fn the_generic_mcp_path_is_not_served() {
     let res = server(&[])
-        .oneshot(rpc("/mcp", initialize(), Some(TOKEN), None))
+        .oneshot(rpc(
+            "/mcp",
+            initialize(),
+            Some(&access_token_for("companies")),
+            None,
+        ))
         .await
         .unwrap();
     assert_eq!(res.status(), StatusCode::NOT_FOUND);
@@ -223,8 +227,13 @@ async fn invalid_service_selection_fails_to_load() {
     );
 }
 
-/// An OAuth access token as `/token` issues it: bound to one service's resource.
+/// An OAuth access token as `/token` issues it: bound to one service's resource, carrying the
+/// person's sealed Companies House key.
 fn access_token_for(service: &str) -> String {
+    token_with(service, Some("test-api-key"))
+}
+
+fn token_with(service: &str, key: Option<&str>) -> String {
     let jwt = Jwt::new(
         SIGNING_KEY.as_bytes(),
         "https://ch.example.com",
@@ -238,6 +247,7 @@ fn access_token_for(service: &str) -> String {
             client_id: Some("e2e".into()),
             scope: Some(service.into()),
             resource: Some(resource.clone()),
+            credential: key.map(|k| Sealer::new(SIGNING_KEY.as_bytes()).seal(k).unwrap()),
             ..Payload::default()
         },
         &resource,
@@ -264,9 +274,79 @@ async fn oauth_tokens_are_accepted_only_for_their_service() {
 }
 
 #[tokio::test]
+async fn oauth_tokens_without_a_sealed_key_are_refused() {
+    let res = server(&[])
+        .oneshot(rpc(
+            "/companies",
+            initialize(),
+            Some(&token_with("companies", None)),
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn a_key_as_the_bearer_is_checked_with_companies_house() {
+    // Companies House is unreachable here, so the key cannot be checked: the caller is told to
+    // retry rather than that the key is wrong.
+    let res = server(&[])
+        .oneshot(rpc(
+            "/companies",
+            initialize(),
+            Some("0f1e2d3c-0000-4000-8000-000000000000"),
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(res.headers()["retry-after"], "30");
+    let body = res.into_body().collect().await.unwrap().to_bytes();
+    let text = String::from_utf8_lossy(&body);
+    assert!(
+        text.starts_with("Your Companies House API key could not be checked right now"),
+        "{text}"
+    );
+}
+
+#[tokio::test]
+async fn retired_settings_stop_startup() {
+    for retired in [
+        "COMPANIES_HOUSE_API_KEY",
+        "OAUTH_ADMIN_PASSWORD",
+        "MCP_AUTH_TOKEN",
+    ] {
+        let vars: HashMap<String, String> = [
+            ("PUBLIC_URL", "https://ch.example.com"),
+            ("OAUTH_SIGNING_KEY", SIGNING_KEY),
+            ("INSECURE_HTTP", "true"),
+            (retired, "something"),
+        ]
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+        let mut env = ServiceEnv::new(Box::new(move |k: &str| vars.get(k).cloned()));
+        assert!(load(&mut env, SERVICES).is_none(), "{retired}");
+        assert!(
+            env.errors
+                .iter()
+                .any(|e| e.starts_with(&format!("{retired} is no longer used"))),
+            "{retired}: {:?}",
+            env.errors
+        );
+    }
+}
+
+#[tokio::test]
 async fn the_service_sends_its_icons() {
     let res = server(&[])
-        .oneshot(rpc("/companies", initialize(), Some(TOKEN), None))
+        .oneshot(rpc(
+            "/companies",
+            initialize(),
+            Some(&access_token_for("companies")),
+            None,
+        ))
         .await
         .unwrap();
     let init = rpc_message(res).await;

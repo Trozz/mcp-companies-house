@@ -2,34 +2,43 @@
 use axum::body::Body;
 use axum::http::{Request, Response};
 use http_body_util::BodyExt;
+use mcp_server_core::credential::TestVerifier;
 use mcp_server_core::oauth::{AuthState, OAuthSettings, oauth_router};
 use std::net::IpAddr;
 use std::sync::Arc;
 use tower::ServiceExt;
 
 pub const PUBLIC_URL: &str = "https://mail.example.com";
-pub const PASSWORD: &str = "correct horse battery staple";
+/// A credential the test verifier accepts.
+pub const KEY: &str = "good-api-key-0123";
+/// A credential the test verifier cannot check ("upstream down").
+pub const DOWN_KEY: &str = "down-api-key";
+
+pub fn verifier() -> Arc<TestVerifier> {
+    TestVerifier::new(&[KEY], Some(DOWN_KEY))
+}
 
 /// One service, `mail`.
 pub fn state() -> Arc<AuthState> {
-    state_with_static(None)
-}
-
-pub fn state_with_static(token: Option<&str>) -> Arc<AuthState> {
-    state_with(token, Vec::new(), &["mail"])
+    state_with(verifier(), Vec::new(), &["mail"])
 }
 
 /// Two services, `mail` and `calendar`.
-pub fn state_two_services(token: Option<&str>) -> Arc<AuthState> {
-    state_with(token, Vec::new(), &["mail", "calendar"])
+pub fn state_two_services() -> Arc<AuthState> {
+    state_with(verifier(), Vec::new(), &["mail", "calendar"])
 }
 
 pub fn state_with_trusted_proxies(trusted_proxies: Vec<IpAddr>) -> Arc<AuthState> {
-    state_with(None, trusted_proxies, &["mail"])
+    state_with(verifier(), trusted_proxies, &["mail"])
+}
+
+/// One service, `mail`, checking credentials with `verifier`.
+pub fn state_with_verifier(verifier: Arc<TestVerifier>) -> Arc<AuthState> {
+    state_with(verifier, Vec::new(), &["mail"])
 }
 
 fn state_with(
-    token: Option<&str>,
+    verifier: Arc<TestVerifier>,
     trusted_proxies: Vec<IpAddr>,
     services: &[&str],
 ) -> Arc<AuthState> {
@@ -37,12 +46,16 @@ fn state_with(
         OAuthSettings {
             public_url: PUBLIC_URL.into(),
             signing_key: "0123456789abcdef0123456789abcdef".to_string().into(),
-            admin_password: PASSWORD.to_string().into(),
-            static_token: token.map(|t| t.to_string().into()),
             trusted_proxies,
         },
         services,
+        verifier,
     )
+}
+
+/// `KEY` sealed for tokens of `st`.
+pub fn sealed(st: &AuthState) -> Option<String> {
+    Some(st.sealer.seal(KEY).unwrap())
 }
 
 pub fn app(state: Arc<AuthState>) -> axum::Router {

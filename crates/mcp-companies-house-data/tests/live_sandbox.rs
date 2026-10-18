@@ -37,8 +37,13 @@ fn api_url() -> url::Url {
 
 fn server() -> CompaniesServer {
     CompaniesServer::new(Arc::new(
-        ChClient::new(ApiSettings::new(api_url(), key())).unwrap(),
+        ChClient::new(ApiSettings::new(api_url())).unwrap(),
     ))
+}
+
+/// Request details of a caller signed in with the sandbox key from the environment.
+fn live_auth() -> rmcp::handler::server::tool::Extension<axum::http::request::Parts> {
+    support::tools::auth_with(key().expose_secret())
 }
 
 fn http() -> reqwest::Client {
@@ -92,13 +97,13 @@ async fn get_company_round_trip_with_a_generated_company() {
     let (number, auth_code) = create_company().await;
     println!("created sandbox company {number}");
     let found = s
-        .get_company(params(json!({"company_number": number})))
+        .get_company(params(json!({"company_number": number})), live_auth())
         .await
         .unwrap();
     // Short form with the leading zeros dropped, when the number has any.
     let short = number.trim_start_matches('0').to_string();
     let found_short = s
-        .get_company(params(json!({"company_number": short})))
+        .get_company(params(json!({"company_number": short})), live_auth())
         .await
         .unwrap();
     delete_company(&number, &auth_code).await;
@@ -113,7 +118,7 @@ async fn get_company_round_trip_with_a_generated_company() {
     assert_eq!(json(&found_short)["company_number"], number.as_str());
 
     let gone = s
-        .get_company(params(json!({"company_number": number})))
+        .get_company(params(json!({"company_number": number})), live_auth())
         .await
         .unwrap();
     assert!(error_text(&gone).starts_with("not_found: "));
@@ -127,15 +132,15 @@ async fn company_report_on_a_generated_company() {
     let (number, auth_code) = create_company().await;
     println!("created sandbox company {number}");
     let report = s
-        .company_report(params(json!({"company_number": number})))
+        .company_report(params(json!({"company_number": number})), live_auth())
         .await
         .unwrap();
     let officers = s
-        .list_officers(params(json!({"company_number": number})))
+        .list_officers(params(json!({"company_number": number})), live_auth())
         .await
         .unwrap();
     let filings = s
-        .list_filing_history(params(json!({"company_number": number})))
+        .list_filing_history(params(json!({"company_number": number})), live_auth())
         .await
         .unwrap();
     delete_company(&number, &auth_code).await;
@@ -166,7 +171,7 @@ async fn company_report_on_a_generated_company() {
 async fn searches_answer_in_the_expected_shape() {
     let s = server();
     let v = json(
-        &s.search_companies(params(json!({"query": "limited", "limit": 5})))
+        &s.search_companies(params(json!({"query": "limited", "limit": 5})), live_auth())
             .await
             .unwrap(),
     );
@@ -175,9 +180,10 @@ async fn searches_answer_in_the_expected_shape() {
     assert!(v["items"].is_array(), "{v}");
 
     let v = json(
-        &s.filter_companies(params(
-            json!({"status": ["active"], "location": "London", "limit": 5}),
-        ))
+        &s.filter_companies(
+            params(json!({"status": ["active"], "location": "London", "limit": 5})),
+            live_auth(),
+        )
         .await
         .unwrap(),
     );
@@ -189,16 +195,27 @@ async fn searches_answer_in_the_expected_shape() {
 #[tokio::test]
 #[ignore = "needs network access"]
 async fn a_wrong_key_is_reported_as_auth() {
-    let s = CompaniesServer::new(Arc::new(
-        ChClient::new(ApiSettings::new(
-            api_url(),
-            SecretString::from("00000000-0000-0000-0000-000000000000"),
-        ))
-        .unwrap(),
-    ));
-    let r = s
-        .get_company(params(json!({"company_number": "00000001"})))
+    let r = server()
+        .get_company(
+            params(json!({"company_number": "00000001"})),
+            support::tools::auth_with("00000000-0000-0000-0000-000000000000"),
+        )
         .await
         .unwrap();
     assert!(error_text(&r).starts_with("auth: "), "{}", error_text(&r));
+}
+
+#[tokio::test]
+#[ignore = "needs a sandbox COMPANIES_HOUSE_API_KEY and network access"]
+async fn the_sign_in_check_accepts_a_real_key_and_rejects_a_wrong_one() {
+    use mcp_companies_house_data::verifier::ChKeyVerifier;
+    use mcp_server_core::credential::{CredentialCheck, CredentialVerifier};
+    let v = ChKeyVerifier::new(Arc::new(
+        ChClient::new(ApiSettings::new(api_url())).unwrap(),
+    ));
+    assert_eq!(v.check(key().expose_secret()).await, CredentialCheck::Valid);
+    assert_eq!(
+        v.check("00000000-0000-0000-0000-000000000000").await,
+        CredentialCheck::Invalid(None)
+    );
 }

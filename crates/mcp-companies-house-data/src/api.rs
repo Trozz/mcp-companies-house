@@ -3,11 +3,12 @@
 //! mapping, rate-limit tracking and metrics.
 
 use crate::error::{ChError, Result};
+use mcp_server_core::credential::Credential;
 use mcp_server_core::observability::content_logging_enabled;
 use reqwest::StatusCode;
 use reqwest::header::{HeaderMap, RETRY_AFTER};
-use secrecy::{ExposeSecret, SecretString};
 use serde_json::Value;
+use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use url::Url;
@@ -18,11 +19,12 @@ pub const RETRY_DELAY: Duration = Duration::from_millis(250);
 /// Largest response body read; Companies House responses are far smaller.
 pub const MAX_BODY_BYTES: usize = 8 * 1024 * 1024;
 const MAX_ERROR_DETAIL: usize = 300;
+/// Keys whose rate-limit window is remembered at once; expired windows are dropped first.
+const MAX_TRACKED_KEYS: usize = 10_000;
 
 pub struct ApiSettings {
     /// `COMPANIES_HOUSE_API_URL`: every request goes to this origin and below this path.
     pub base: Url,
-    pub api_key: SecretString,
     pub connect_timeout: Duration,
     pub request_timeout: Duration,
     pub retry_delay: Duration,
@@ -33,10 +35,9 @@ pub struct ApiSettings {
 }
 
 impl ApiSettings {
-    pub fn new(base: Url, api_key: SecretString) -> Self {
+    pub fn new(base: Url) -> Self {
         ApiSettings {
             base,
-            api_key,
             connect_timeout: CONNECT_TIMEOUT,
             request_timeout: REQUEST_TIMEOUT,
             retry_delay: RETRY_DELAY,
@@ -73,7 +74,9 @@ impl RateLimit {
 pub struct ChClient {
     http: reqwest::Client,
     settings: ApiSettings,
-    rate: Mutex<Option<RateLimit>>,
+    /// The latest rate-limit window of each key, by key fingerprint: every person's key has
+    /// its own 600 requests per 5 minutes.
+    rates: Mutex<HashMap<[u8; 32], RateLimit>>,
 }
 
 fn now_unix() -> u64 {
@@ -141,9 +144,7 @@ fn map_status(path: &str, status: StatusCode, body: &str, reset_in_secs: Option<
     };
     match status.as_u16() {
         401 => ChError::Auth,
-        403 => ChError::Upstream(with_detail(format!(
-            "GET {path} was refused (HTTP 403); check the API key's IP or domain restrictions in the Developer Hub"
-        ))),
+        403 => ChError::KeyRestricted,
         404 => ChError::NotFound(format!("nothing found at {path}")),
         429 => ChError::RateLimited { reset_in_secs },
         416 => ChError::Validation(
@@ -175,7 +176,7 @@ impl ChClient {
         Ok(ChClient {
             http,
             settings,
-            rate: Mutex::new(None),
+            rates: Mutex::new(HashMap::new()),
         })
     }
 
@@ -183,9 +184,17 @@ impl ChClient {
         &self.settings.base
     }
 
-    /// The rate-limit window from the latest response, if Companies House sent one.
-    pub fn rate_limit(&self) -> Option<RateLimit> {
-        *self.rate.lock().unwrap_or_else(|e| e.into_inner())
+    /// The rate-limit window of `key` from its latest response, if Companies House sent one.
+    pub fn rate_limit(&self, key: &Credential) -> Option<RateLimit> {
+        self.rate_of(&key.fingerprint())
+    }
+
+    fn rate_of(&self, fingerprint: &[u8; 32]) -> Option<RateLimit> {
+        self.rates
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(fingerprint)
+            .copied()
     }
 
     fn log_bodies(&self) -> bool {
@@ -209,13 +218,18 @@ impl ChClient {
     }
 
     /// Seconds until the window resets when the latest response said none are left.
-    fn exhausted_for(&self) -> Option<u64> {
-        let rate = self.rate_limit()?;
+    fn exhausted_for(&self, fingerprint: &[u8; 32]) -> Option<u64> {
+        let rate = self.rate_of(fingerprint)?;
         let now = now_unix();
         (rate.remaining == 0 && rate.reset_unix > now).then(|| rate.reset_unix - now)
     }
 
-    fn record_rate(&self, headers: &HeaderMap, status: StatusCode) -> Option<u64> {
+    fn record_rate(
+        &self,
+        fingerprint: [u8; 32],
+        headers: &HeaderMap,
+        status: StatusCode,
+    ) -> Option<u64> {
         let mut rate = RateLimit::from_headers(headers);
         if status == StatusCode::TOO_MANY_REQUESTS {
             let retry_after = headers
@@ -232,9 +246,16 @@ impl ChClient {
             });
         }
         let rate = rate?;
-        metrics::gauge!("companies_house_ratelimit_remaining").set(rate.remaining as f64);
-        *self.rate.lock().unwrap_or_else(|e| e.into_inner()) = Some(rate);
         let now = now_unix();
+        let mut rates = self.rates.lock().unwrap_or_else(|e| e.into_inner());
+        if rates.len() >= MAX_TRACKED_KEYS && !rates.contains_key(&fingerprint) {
+            rates.retain(|_, r| r.reset_unix > now);
+            if rates.len() >= MAX_TRACKED_KEYS {
+                rates.clear();
+            }
+        }
+        rates.insert(fingerprint, rate);
+        drop(rates);
         Some(rate.reset_unix.saturating_sub(now))
     }
 
@@ -242,13 +263,15 @@ impl ChClient {
     /// `query` are appended to the base URL. A 2xx response with an empty body is `Value::Null`.
     pub async fn get(
         &self,
+        key: &Credential,
         endpoint: &'static str,
         segments: &[&str],
         query: &[(&str, String)],
     ) -> Result<Value> {
         let url = self.url(segments, query);
         let path = url.path().to_string();
-        if let Some(reset_in_secs) = self.exhausted_for() {
+        let fingerprint = key.fingerprint();
+        if let Some(reset_in_secs) = self.exhausted_for(&fingerprint) {
             metrics::counter!("companies_house_rate_limited_total", "source" => "local")
                 .increment(1);
             tracing::warn!(
@@ -266,7 +289,7 @@ impl ChClient {
             let result = self
                 .http
                 .get(url.clone())
-                .basic_auth(self.settings.api_key.expose_secret(), Some(""))
+                .basic_auth(key.expose(), Some(""))
                 .header(reqwest::header::ACCEPT, "application/json")
                 .send()
                 .await;
@@ -309,7 +332,7 @@ impl ChClient {
                 tokio::time::sleep(self.settings.retry_delay).await;
                 continue;
             }
-            let reset_in_secs = self.record_rate(response.headers(), status);
+            let reset_in_secs = self.record_rate(fingerprint, response.headers(), status);
             let body = read_body(response, &path).await?;
             if self.log_bodies() {
                 tracing::debug!(endpoint, path = %path, status = status.as_u16(), body = %body, "companies house response");
@@ -372,11 +395,7 @@ mod tests {
     use reqwest::header::HeaderValue;
 
     fn client(base: &str) -> ChClient {
-        ChClient::new(ApiSettings::new(
-            Url::parse(base).unwrap(),
-            SecretString::from("test-api-key"),
-        ))
-        .unwrap()
+        ChClient::new(ApiSettings::new(Url::parse(base).unwrap())).unwrap()
     }
 
     #[test]
@@ -429,7 +448,7 @@ mod tests {
             .kind()
         };
         assert_eq!(kind(401), "auth");
-        assert_eq!(kind(403), "upstream");
+        assert_eq!(kind(403), "auth");
         assert_eq!(kind(404), "not_found");
         assert_eq!(kind(429), "rate_limited");
         assert_eq!(kind(400), "validation");
@@ -510,29 +529,58 @@ mod tests {
     #[test]
     fn a_429_without_rate_headers_uses_retry_after() {
         let c = client("https://api.company-information.service.gov.uk");
+        let key = Credential::new("key-a");
         let mut h = HeaderMap::new();
         h.insert(RETRY_AFTER, HeaderValue::from_static("30"));
-        let reset = c.record_rate(&h, StatusCode::TOO_MANY_REQUESTS);
+        let reset = c.record_rate(key.fingerprint(), &h, StatusCode::TOO_MANY_REQUESTS);
         assert!(matches!(reset, Some(29..=30)), "{reset:?}");
-        assert_eq!(c.rate_limit().unwrap().remaining, 0);
-        assert!(c.exhausted_for().is_some());
+        assert_eq!(c.rate_limit(&key).unwrap().remaining, 0);
+        assert!(c.exhausted_for(&key.fingerprint()).is_some());
+        // Another person's key has its own window.
+        assert!(
+            c.exhausted_for(&Credential::new("key-b").fingerprint())
+                .is_none()
+        );
     }
 
     #[test]
     fn an_exhausted_window_in_the_past_does_not_block() {
         let c = client("https://api.company-information.service.gov.uk");
-        *c.rate.lock().unwrap() = Some(RateLimit {
-            limit: Some(600),
-            remaining: 0,
-            reset_unix: now_unix() - 1,
-        });
-        assert_eq!(c.exhausted_for(), None);
-        *c.rate.lock().unwrap() = Some(RateLimit {
-            limit: Some(600),
-            remaining: 0,
-            reset_unix: now_unix() + 100,
-        });
-        assert!(matches!(c.exhausted_for(), Some(99..=100)));
+        let fp = Credential::new("key-a").fingerprint();
+        c.rates.lock().unwrap().insert(
+            fp,
+            RateLimit {
+                limit: Some(600),
+                remaining: 0,
+                reset_unix: now_unix() - 1,
+            },
+        );
+        assert_eq!(c.exhausted_for(&fp), None);
+        c.rates.lock().unwrap().insert(
+            fp,
+            RateLimit {
+                limit: Some(600),
+                remaining: 0,
+                reset_unix: now_unix() + 100,
+            },
+        );
+        assert!(matches!(c.exhausted_for(&fp), Some(99..=100)));
+    }
+
+    #[test]
+    fn tracked_keys_stay_bounded() {
+        let c = client("https://api.company-information.service.gov.uk");
+        let mut h = HeaderMap::new();
+        h.insert("x-ratelimit-remain", HeaderValue::from_static("599"));
+        h.insert("x-ratelimit-reset", HeaderValue::from_static("1"));
+        for i in 0..(MAX_TRACKED_KEYS + 5) {
+            c.record_rate(
+                Credential::new(format!("key-{i}")).fingerprint(),
+                &h,
+                StatusCode::OK,
+            );
+        }
+        assert!(c.rates.lock().unwrap().len() <= MAX_TRACKED_KEYS);
     }
 
     #[test]

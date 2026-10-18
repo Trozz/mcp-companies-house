@@ -1,7 +1,7 @@
 mod support;
 use serde_json::{Value, json};
 use support::fake_ch::{FakeCh, FakeState};
-use support::tools::{error_text, json, params, server};
+use support::tools::{auth, error_text, json, params, server};
 
 async fn fake() -> FakeCh {
     FakeCh::start(FakeState::register()).await
@@ -21,7 +21,7 @@ async fn list_officers_shows_current_and_resigned_with_ids() {
     let fake = fake().await;
     let v = json(
         &server(&fake)
-            .list_officers(params(json!({"company_number": "1"})))
+            .list_officers(params(json!({"company_number": "1"})), auth())
             .await
             .unwrap(),
     );
@@ -56,9 +56,12 @@ async fn list_officers_pages_and_orders() {
     let fake = fake().await;
     let v = json(
         &server(&fake)
-            .list_officers(params(json!({
-                "company_number": "00000001", "limit": 2, "order_by": "surname"
-            })))
+            .list_officers(
+                params(json!({
+                    "company_number": "00000001", "limit": 2, "order_by": "surname"
+                })),
+                auth(),
+            )
             .await
             .unwrap(),
     );
@@ -72,7 +75,7 @@ async fn list_officers_for_an_unknown_company_is_not_found() {
     let fake = fake().await;
     let text = error_text(
         &server(&fake)
-            .list_officers(params(json!({"company_number": "12345678"})))
+            .list_officers(params(json!({"company_number": "12345678"})), auth())
             .await
             .unwrap(),
     );
@@ -94,7 +97,7 @@ async fn a_company_without_officers_lists_none() {
     let fake = fake().await;
     let v = json(
         &server(&fake)
-            .list_officers(params(json!({"company_number": "5"})))
+            .list_officers(params(json!({"company_number": "5"})), auth())
             .await
             .unwrap(),
     );
@@ -107,7 +110,10 @@ async fn psc_for_an_unknown_company_is_not_found() {
     let fake = fake().await;
     let text = error_text(
         &server(&fake)
-            .list_persons_with_significant_control(params(json!({"company_number": "12345678"})))
+            .list_persons_with_significant_control(
+                params(json!({"company_number": "12345678"})),
+                auth(),
+            )
             .await
             .unwrap(),
     );
@@ -122,9 +128,10 @@ async fn unknown_disqualified_officers_are_not_found_although_the_api_answers_20
     let fake = fake().await;
     let text = error_text(
         &server(&fake)
-            .get_disqualified_officer(params(
-                json!({"officer_id": "nobody", "officer_kind": "natural"}),
-            ))
+            .get_disqualified_officer(
+                params(json!({"officer_id": "nobody", "officer_kind": "natural"})),
+                auth(),
+            )
             .await
             .unwrap(),
     );
@@ -137,7 +144,7 @@ async fn officer_search_pages_are_aligned() {
     let s = server(&fake);
     // limit 1 is requested as a page of two, so the best match is not skipped.
     let v = json(
-        &s.search_officers(params(json!({"query": "m", "limit": 1})))
+        &s.search_officers(params(json!({"query": "m", "limit": 1})), auth())
             .await
             .unwrap(),
     );
@@ -148,9 +155,12 @@ async fn officer_search_pages_are_aligned() {
     assert_eq!(log[0].param("items_per_page"), Some("2"));
     assert_eq!(log[0].param("start_index"), Some("0"));
     let v = json(
-        &s.search_officers(params(json!({"query": "m", "limit": 1, "start_index": 1})))
-            .await
-            .unwrap(),
+        &s.search_officers(
+            params(json!({"query": "m", "limit": 1, "start_index": 1})),
+            auth(),
+        )
+        .await
+        .unwrap(),
     );
     assert_eq!(v["items"][0]["officer_id"], "off-tom");
     assert_eq!(v["start_index"], 1);
@@ -162,7 +172,7 @@ async fn officer_appointments_list_other_companies() {
     let fake = fake().await;
     let s = server(&fake);
     let v = json(
-        &s.get_officer_appointments(params(json!({"officer_id": "off-jane"})))
+        &s.get_officer_appointments(params(json!({"officer_id": "off-jane"})), auth())
             .await
             .unwrap(),
     );
@@ -188,9 +198,10 @@ async fn officer_appointments_list_other_companies() {
     assert_eq!(v["items"][2]["resigned_on"], "2010-01-01");
 
     let v = json(
-        &s.get_officer_appointments(params(
-            json!({"officer_id": "off-jane", "active_only": true}),
-        ))
+        &s.get_officer_appointments(
+            params(json!({"officer_id": "off-jane", "active_only": true})),
+            auth(),
+        )
         .await
         .unwrap(),
     );
@@ -203,13 +214,13 @@ async fn officer_appointments_validate_the_id() {
     let fake = fake().await;
     let s = server(&fake);
     let text = error_text(
-        &s.get_officer_appointments(params(json!({"officer_id": "../company/1"})))
+        &s.get_officer_appointments(params(json!({"officer_id": "../company/1"})), auth())
             .await
             .unwrap(),
     );
     assert!(text.starts_with("validation: "), "{text}");
     let text = error_text(
-        &s.get_officer_appointments(params(json!({"officer_id": "unknown-id"})))
+        &s.get_officer_appointments(params(json!({"officer_id": "unknown-id"})), auth())
             .await
             .unwrap(),
     );
@@ -223,7 +234,7 @@ async fn search_officers_returns_officer_ids() {
     let fake = fake().await;
     let v = json(
         &server(&fake)
-            .search_officers(params(json!({"query": "smith"})))
+            .search_officers(params(json!({"query": "smith"})), auth())
             .await
             .unwrap(),
     );
@@ -244,7 +255,7 @@ async fn psc_lists_owners_and_statements() {
     let fake = fake().await;
     let s = server(&fake);
     let v = json(
-        &s.list_persons_with_significant_control(params(json!({"company_number": "1"})))
+        &s.list_persons_with_significant_control(params(json!({"company_number": "1"})), auth())
             .await
             .unwrap(),
     );
@@ -272,7 +283,7 @@ async fn psc_lists_owners_and_statements() {
 
     // No PSCs, only a statement.
     let v = json(
-        &s.list_persons_with_significant_control(params(json!({"company_number": "5"})))
+        &s.list_persons_with_significant_control(params(json!({"company_number": "5"})), auth())
             .await
             .unwrap(),
     );
@@ -294,7 +305,7 @@ async fn psc_are_listed_when_the_statements_fail() {
     fake.inject(support::fake_ch::Injected::status(500));
     let v = json(
         &server(&fake)
-            .list_persons_with_significant_control(params(json!({"company_number": "1"})))
+            .list_persons_with_significant_control(params(json!({"company_number": "1"})), auth())
             .await
             .unwrap(),
     );
@@ -314,9 +325,12 @@ async fn later_psc_pages_skip_the_statements() {
     let fake = fake().await;
     let v = json(
         &server(&fake)
-            .list_persons_with_significant_control(params(json!({
-                "company_number": "1", "start_index": 1, "limit": 1
-            })))
+            .list_persons_with_significant_control(
+                params(json!({
+                    "company_number": "1", "start_index": 1, "limit": 1
+                })),
+                auth(),
+            )
             .await
             .unwrap(),
     );
@@ -329,7 +343,7 @@ async fn disqualified_officers_can_be_searched_and_read() {
     let fake = fake().await;
     let s = server(&fake);
     let v = json(
-        &s.search_disqualified_officers(params(json!({"query": "bloggs"})))
+        &s.search_disqualified_officers(params(json!({"query": "bloggs"})), auth())
             .await
             .unwrap(),
     );
@@ -338,9 +352,10 @@ async fn disqualified_officers_can_be_searched_and_read() {
     assert_eq!(v["items"][0]["officer_kind"], "natural");
 
     let v = json(
-        &s.get_disqualified_officer(params(
-            json!({"officer_id": "dq-john", "officer_kind": "natural"}),
-        ))
+        &s.get_disqualified_officer(
+            params(json!({"officer_id": "dq-john", "officer_kind": "natural"})),
+            auth(),
+        )
         .await
         .unwrap(),
     );
@@ -359,7 +374,7 @@ async fn disqualified_officer_kind_is_found_when_not_given() {
     let fake = fake().await;
     let s = server(&fake);
     let v = json(
-        &s.get_disqualified_officer(params(json!({"officer_id": "dq-rogue"})))
+        &s.get_disqualified_officer(params(json!({"officer_id": "dq-rogue"})), auth())
             .await
             .unwrap(),
     );
@@ -374,7 +389,7 @@ async fn disqualified_officer_kind_is_found_when_not_given() {
         ]
     );
     let text = error_text(
-        &s.get_disqualified_officer(params(json!({"officer_id": "nobody"})))
+        &s.get_disqualified_officer(params(json!({"officer_id": "nobody"})), auth())
             .await
             .unwrap(),
     );

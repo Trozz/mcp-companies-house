@@ -1396,6 +1396,7 @@ dependencies = [
  "opentelemetry_sdk",
  "rcgen",
  "reqwest",
+ "ring",
  "rmcp",
  "rustls",
  "secrecy",

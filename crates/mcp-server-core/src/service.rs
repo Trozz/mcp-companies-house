@@ -53,6 +53,11 @@ pub trait Service: Send + Sync + 'static {
     }
     /// The rmcp Streamable HTTP service for this service, mounted by core at `/<name>`.
     fn router(self: Arc<Self>, ctx: &ServiceContext) -> axum::Router;
+    /// Checks the credential people sign in with, when this service defines one. The server uses
+    /// the first enabled service's verifier for sign-in and bearer credentials.
+    fn credential_verifier(&self) -> Option<Arc<dyn crate::credential::CredentialVerifier>> {
+        None
+    }
 }
 
 /// `scheme://host:port` for `public_url`, with the scheme's default port made explicit so rmcp

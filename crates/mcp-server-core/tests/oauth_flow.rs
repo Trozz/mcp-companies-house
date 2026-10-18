@@ -3,6 +3,7 @@ use axum::Extension;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use axum::routing::post;
+use mcp_server_core::credential::Credential;
 use mcp_server_core::jwt::{Claims, Payload, TokenKind};
 use mcp_server_core::server::build_app;
 use oauth_support::*;
@@ -44,6 +45,7 @@ fn access_for(st: &mcp_server_core::oauth::AuthState, service: &str) -> String {
             Some(Duration::from_secs(60)),
             Payload {
                 client_id: Some("client-1".into()),
+                credential: sealed(st),
                 ..Default::default()
             },
             &st.resource(service),
@@ -53,7 +55,7 @@ fn access_for(st: &mcp_server_core::oauth::AuthState, service: &str) -> String {
 
 #[tokio::test]
 async fn unauthenticated_service_gets_401_with_its_resource_metadata() {
-    let app = full_app(state_two_services(None));
+    let app = full_app(state_two_services());
     for service in ["mail", "calendar"] {
         let res = send(&app, call(&format!("/{service}"), None)).await;
         assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
@@ -69,7 +71,7 @@ async fn unauthenticated_service_gets_401_with_its_resource_metadata() {
 
 #[tokio::test]
 async fn access_token_reaches_its_own_service() {
-    let st = state_two_services(None);
+    let st = state_two_services();
     let app = full_app(st.clone());
     let res = send(&app, call("/calendar", Some(&access_for(&st, "calendar")))).await;
     assert_eq!(res.status(), StatusCode::OK);
@@ -78,7 +80,7 @@ async fn access_token_reaches_its_own_service() {
 
 #[tokio::test]
 async fn mail_token_is_rejected_on_calendar() {
-    let st = state_two_services(None);
+    let st = state_two_services();
     let app = full_app(st.clone());
     let res = send(&app, call("/calendar", Some(&access_for(&st, "mail")))).await;
     assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
@@ -112,13 +114,11 @@ async fn token_without_a_resource_audience_is_rejected() {
 }
 
 #[tokio::test]
-async fn static_token_works_on_every_service() {
-    let app = full_app(state_two_services(Some("static-secret-token")));
+async fn the_credential_itself_works_as_a_bearer_on_every_service() {
+    let app = full_app(state_two_services());
     for path in ["/mail", "/calendar"] {
         assert_eq!(
-            send(&app, call(path, Some("static-secret-token")))
-                .await
-                .status(),
+            send(&app, call(path, Some(KEY))).await.status(),
             StatusCode::OK,
             "{path}"
         );
@@ -127,13 +127,124 @@ async fn static_token_works_on_every_service() {
 
 #[tokio::test]
 async fn old_mcp_path_is_gone() {
-    let app = full_app(state_with_static(Some("static-secret-token")));
+    let app = full_app(state());
     assert_eq!(
-        send(&app, call("/mcp", Some("static-secret-token")))
-            .await
-            .status(),
+        send(&app, call("/mcp", Some(KEY))).await.status(),
         StatusCode::NOT_FOUND
     );
+}
+
+#[tokio::test]
+async fn bearer_credentials_are_checked_once_then_cached() {
+    let v = verifier();
+    let app = full_app(state_with_verifier(v.clone()));
+    for _ in 0..3 {
+        assert_eq!(
+            send(&app, mcp_call(Some(KEY))).await.status(),
+            StatusCode::OK
+        );
+    }
+    assert_eq!(v.checks(), 1);
+    for _ in 0..2 {
+        let res = send(&app, mcp_call(Some("wrong-key"))).await;
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+        assert!(
+            res.headers()["www-authenticate"]
+                .to_str()
+                .unwrap()
+                .ends_with(", error=\"invalid_token\"")
+        );
+    }
+    assert_eq!(v.checks(), 2, "a rejected credential is remembered too");
+}
+
+#[tokio::test]
+async fn rejected_bearer_credentials_are_rate_limited_per_client() {
+    let v = verifier();
+    let app = full_app(state_with_verifier(v.clone()));
+    let from = |token: &str| {
+        Request::post("/mail")
+            .header("authorization", format!("Bearer {token}"))
+            .extension(axum::extract::ConnectInfo(std::net::SocketAddr::from((
+                [10, 0, 0, 7],
+                5555,
+            ))))
+            .body(Body::empty())
+            .unwrap()
+    };
+    for i in 0..5 {
+        assert_eq!(
+            send(&app, from(&format!("wrong-{i}"))).await.status(),
+            StatusCode::UNAUTHORIZED
+        );
+    }
+    let res = send(&app, from("wrong-5")).await;
+    assert_eq!(res.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(v.checks(), 5, "the blocked attempt is not sent upstream");
+}
+
+#[tokio::test]
+async fn an_unavailable_check_is_503_with_retry_after() {
+    let res = send(&full_app(state()), mcp_call(Some(DOWN_KEY))).await;
+    assert_eq!(res.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(res.headers()["retry-after"], "30");
+    assert!(
+        body_text(res)
+            .await
+            .contains("could not be checked right now")
+    );
+}
+
+#[tokio::test]
+async fn implausible_or_expired_bearers_are_not_sent_upstream() {
+    let v = verifier();
+    let st = state_with_verifier(v.clone());
+    let app = full_app(st.clone());
+    let expired_looking = "aaa.bbb.ccc";
+    for token in [expired_looking, "has space", &"x".repeat(300)] {
+        let req = Request::post("/mail")
+            .header("authorization", format!("Bearer {token}"))
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            send(&app, req).await.status(),
+            StatusCode::UNAUTHORIZED,
+            "{token:?}"
+        );
+    }
+    assert_eq!(v.checks(), 0);
+}
+
+#[tokio::test]
+async fn access_tokens_without_a_valid_sealed_credential_are_rejected() {
+    let st = state();
+    let app = full_app(st.clone());
+    let issue = |credential: Option<String>| {
+        st.jwt
+            .issue_for(
+                TokenKind::Access,
+                Some(Duration::from_secs(60)),
+                Payload {
+                    client_id: Some("client-1".into()),
+                    credential,
+                    ..Default::default()
+                },
+                &st.resource("mail"),
+            )
+            .unwrap()
+    };
+    let other_key = mcp_server_core::credential::Sealer::new(b"some other signing key, 32 bytes")
+        .seal(KEY)
+        .unwrap();
+    for credential in [None, Some("garbage".to_string()), Some(other_key)] {
+        assert_eq!(
+            send(&app, mcp_call(Some(&issue(credential.clone()))))
+                .await
+                .status(),
+            StatusCode::UNAUTHORIZED,
+            "{credential:?}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -180,52 +291,42 @@ async fn non_access_tokens_are_rejected() {
 }
 
 #[tokio::test]
-async fn static_token_is_accepted_when_configured() {
-    let app = full_app(state_with_static(Some("static-secret-token")));
-    assert_eq!(
-        send(&app, mcp_call(Some("static-secret-token")))
-            .await
-            .status(),
-        StatusCode::OK
-    );
-    assert_eq!(
-        send(&app, mcp_call(Some("static-secret-tokeN")))
-            .await
-            .status(),
-        StatusCode::UNAUTHORIZED
-    );
-}
-
-#[tokio::test]
-async fn handler_sees_claims_only_for_oauth_access_tokens() {
-    let st = state_with_static(Some("static-secret-token"));
+async fn handler_gets_the_callers_credential_and_claims_only_for_oauth_tokens() {
+    let st = state();
     let app = build_app(
         st.clone(),
         vec![(
             "mail",
             axum::Router::new().route(
                 "/",
-                post(|claims: Option<Extension<Claims>>| async move {
-                    match claims {
-                        Some(Extension(c)) => c.payload.client_id.unwrap_or_default(),
-                        None => "no-claims".to_string(),
-                    }
-                }),
+                post(
+                    |claims: Option<Extension<Claims>>,
+                     credential: Option<Extension<Credential>>| async move {
+                        let who = match claims {
+                            Some(Extension(c)) => c.payload.client_id.unwrap_or_default(),
+                            None => "no-claims".to_string(),
+                        };
+                        let key = credential
+                            .map(|Extension(c)| c.expose().to_string())
+                            .unwrap_or_default();
+                        format!("{who} {key}")
+                    },
+                ),
             ),
         )],
     );
     let access = access_for(&st, "mail");
     let res = send(&app, mcp_call(Some(&access))).await;
     assert_eq!(res.status(), StatusCode::OK);
-    assert_eq!(body_text(res).await, "client-1");
-    let res = send(&app, mcp_call(Some("static-secret-token"))).await;
+    assert_eq!(body_text(res).await, format!("client-1 {KEY}"));
+    let res = send(&app, mcp_call(Some(KEY))).await;
     assert_eq!(res.status(), StatusCode::OK);
-    assert_eq!(body_text(res).await, "no-claims");
+    assert_eq!(body_text(res).await, format!("no-claims {KEY}"));
 }
 
 #[tokio::test]
 async fn oversized_body_is_rejected() {
-    let st = state_with_static(Some("t"));
+    let st = state();
     let req = Request::post("/register")
         .header("content-type", "application/json")
         .body(Body::from(vec![b' '; 2 * 1024 * 1024]))
@@ -238,7 +339,7 @@ async fn oversized_body_is_rejected() {
 
 #[tokio::test]
 async fn full_oauth_dance_reaches_the_requested_service_only() {
-    let st = state_two_services(None);
+    let st = state_two_services();
     let app = full_app(st.clone());
 
     let reg = body_json(
@@ -285,7 +386,7 @@ async fn full_oauth_dance_reaches_the_requested_service_only() {
                 ("scope", "mail"),
                 ("resource", "https://mail.example.com/mail"),
                 ("csrf", csrf),
-                ("password", PASSWORD),
+                ("credential", KEY),
             ],
         ),
     )

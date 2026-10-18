@@ -5,7 +5,7 @@ use serde_json::json;
 
 #[tokio::test]
 async fn protected_resource_metadata_per_service() {
-    let app = app(state_two_services(None));
+    let app = app(state_two_services());
     for service in ["mail", "calendar"] {
         let res = send(
             &app,
@@ -69,7 +69,7 @@ async fn authorization_server_metadata() {
     assert_eq!(v["scopes_supported"], json!(["mail"]));
     let v = body_json(
         send(
-            &app(state_two_services(None)),
+            &app(state_two_services()),
             get("/.well-known/oauth-authorization-server"),
         )
         .await,

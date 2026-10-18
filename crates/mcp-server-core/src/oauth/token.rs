@@ -61,12 +61,14 @@ fn granted_service(
         .ok_or(("invalid_target", "resource is not a service on this server"))
 }
 
-fn issue_pair(st: &AuthState, client_id: String, service: String) -> Response {
+/// Issues an access and a refresh token carrying the person's sealed credential.
+fn issue_pair(st: &AuthState, client_id: String, service: String, credential: String) -> Response {
     let resource = st.resource(&service);
     let payload = Payload {
         client_id: Some(client_id),
         scope: Some(service.clone()),
         resource: Some(resource.clone()),
+        credential: Some(credential),
         ..Default::default()
     };
     let (Ok(access), Ok(refresh)) = (
@@ -132,11 +134,21 @@ fn authorization_code(st: &AuthState, req: &TokenRequest) -> Response {
         Ok(s) => s,
         Err((code, description)) => return oauth_error(code, description),
     };
+    let Some(credential) = sealed_credential(st, p.credential.as_deref()) else {
+        return oauth_error("invalid_grant", "grant has no credential");
+    };
     if !st.replay.first_use(&claims.jti, claims.exp.unwrap_or(0)) {
         tracing::warn!("authorization code replay rejected");
         return oauth_error("invalid_grant", "code already used");
     }
-    issue_pair(st, client_id.clone(), service)
+    issue_pair(st, client_id.clone(), service, credential)
+}
+
+/// The grant's sealed credential, if it is present and still opens with the current key.
+fn sealed_credential(st: &AuthState, sealed: Option<&str>) -> Option<String> {
+    let sealed = sealed?;
+    st.sealer.open(sealed).ok()?;
+    Some(sealed.to_string())
 }
 
 fn refresh(st: &AuthState, req: &TokenRequest) -> Response {
@@ -169,7 +181,10 @@ fn refresh(st: &AuthState, req: &TokenRequest) -> Response {
         Ok(s) => s,
         Err((code, description)) => return oauth_error(code, description),
     };
-    issue_pair(st, client_id, service)
+    let Some(credential) = sealed_credential(st, claims.payload.credential.as_deref()) else {
+        return oauth_error("invalid_grant", "grant has no credential");
+    };
+    issue_pair(st, client_id, service, credential)
 }
 
 pub async fn token(State(st): State<Arc<AuthState>>, Form(req): Form<TokenRequest>) -> Response {

@@ -1,7 +1,7 @@
 mod support;
 use serde_json::json;
 use support::fake_ch::{FakeCh, FakeState, Injected};
-use support::tools::{error_text, json, params, server};
+use support::tools::{auth, error_text, json, params, server};
 
 async fn fake() -> FakeCh {
     FakeCh::start(FakeState::register()).await
@@ -18,7 +18,7 @@ async fn report_gathers_every_section_for_a_company() {
     let fake = fake().await;
     let v = json(
         &server(&fake)
-            .company_report(params(json!({"company_number": "1", "filings": 2})))
+            .company_report(params(json!({"company_number": "1", "filings": 2})), auth())
             .await
             .unwrap(),
     );
@@ -59,7 +59,7 @@ async fn report_reads_charges_and_insolvency_when_the_profile_lists_them() {
     let fake = fake().await;
     let v = json(
         &server(&fake)
-            .company_report(params(json!({"company_number": "6", "filings": 0})))
+            .company_report(params(json!({"company_number": "6", "filings": 0})), auth())
             .await
             .unwrap(),
     );
@@ -98,7 +98,7 @@ async fn report_lists_sections_that_failed() {
     }
     let v = json(
         &server(&fake)
-            .company_report(params(json!({"company_number": "1"})))
+            .company_report(params(json!({"company_number": "1"})), auth())
             .await
             .unwrap(),
     );
@@ -130,7 +130,7 @@ async fn report_fails_when_the_company_does_not_exist() {
     let fake = fake().await;
     let s = server(&fake);
     let text = error_text(
-        &s.company_report(params(json!({"company_number": "12345678"})))
+        &s.company_report(params(json!({"company_number": "12345678"})), auth())
             .await
             .unwrap(),
     );
@@ -140,9 +140,12 @@ async fn report_fails_when_the_company_does_not_exist() {
     );
     assert_eq!(fake.requests().len(), 1);
     let text = error_text(
-        &s.company_report(params(json!({"company_number": "1", "filings": 51})))
-            .await
-            .unwrap(),
+        &s.company_report(
+            params(json!({"company_number": "1", "filings": 51})),
+            auth(),
+        )
+        .await
+        .unwrap(),
     );
     assert!(text.starts_with("validation: "), "{text}");
 }

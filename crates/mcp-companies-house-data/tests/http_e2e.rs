@@ -15,7 +15,8 @@ use support::tools::client;
 use tokio_util::sync::CancellationToken;
 use tower::ServiceExt;
 
-const TOKEN: &str = "static-test-token-0123456789";
+/// Callers send their own Companies House key as the bearer token.
+const TOKEN: &str = support::fake_ch::API_KEY;
 const HOST: &str = "ch.example.com";
 
 /// Builds the full application (auth, OAuth routes, company data at /companies) the way the
@@ -25,8 +26,6 @@ async fn app() -> (axum::Router, FakeCh) {
     let vars: HashMap<&str, &str> = HashMap::from([
         ("PUBLIC_URL", "https://ch.example.com"),
         ("OAUTH_SIGNING_KEY", "0123456789abcdef0123456789abcdef"),
-        ("OAUTH_ADMIN_PASSWORD", "a long password"),
-        ("MCP_AUTH_TOKEN", TOKEN),
         ("INSECURE_HTTP", "true"),
     ]);
     let mut env = EnvReader::new(move |k: &str| vars.get(k).map(|v| v.to_string()));
@@ -37,11 +36,20 @@ async fn app() -> (axum::Router, FakeCh) {
         shutdown: CancellationToken::new(),
     };
     let service = Arc::new(DataService::new(client(&fake)));
-    let auth = AuthState::new(core.oauth, &["companies"]);
+    let verifier = service.credential_verifier().expect("a key check");
+    let auth = AuthState::new(core.oauth, &["companies"], verifier);
     (
         build_app(auth, vec![("companies", service.router(&ctx))]),
         fake,
     )
+}
+
+/// Requests the tools made, leaving out the check of the caller's key.
+fn tool_requests(fake: &FakeCh) -> Vec<support::fake_ch::Logged> {
+    fake.requests()
+        .into_iter()
+        .filter(|r| r.param("q") != Some("companies house"))
+        .collect()
 }
 
 fn request(body: Value, session: Option<&str>) -> Request<Body> {
@@ -215,7 +223,7 @@ async fn tools_call_reaches_companies_house() {
     let v: Value = serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap();
     assert_eq!(v["total"], 1);
     assert_eq!(v["items"][0]["company_name"], "THISTLE SOFTWARE LTD");
-    assert_eq!(fake.requests().len(), 1);
+    assert_eq!(tool_requests(&fake).len(), 1);
 
     let res = call(
         &app,
@@ -250,7 +258,7 @@ async fn invalid_codes_are_rejected_as_invalid_params() {
         res.get("error").is_some() || res["result"]["isError"] == true,
         "{res}"
     );
-    assert!(fake.requests().is_empty());
+    assert!(tool_requests(&fake).is_empty());
 }
 
 #[tokio::test]
@@ -271,4 +279,37 @@ async fn requests_without_a_token_are_refused() {
         .unwrap();
     assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
     assert!(fake.requests().is_empty());
+}
+
+#[tokio::test]
+async fn the_bearer_key_is_checked_once_per_server() {
+    let (app, fake) = app().await;
+    let (session, _) = handshake(&app).await;
+    call(&app, &session, 2, "tools/list", json!({})).await;
+    let checks: Vec<_> = fake
+        .requests()
+        .into_iter()
+        .filter(|r| r.param("q") == Some("companies house"))
+        .collect();
+    assert_eq!(checks.len(), 1);
+}
+
+#[tokio::test]
+async fn a_wrong_bearer_key_is_refused() {
+    let (app, _fake) = app().await;
+    let res = app
+        .oneshot(
+            Request::post("/companies")
+                .header("host", HOST)
+                .header("authorization", "Bearer not-a-real-key")
+                .header("content-type", "application/json")
+                .header("accept", "application/json, text/event-stream")
+                .body(Body::from(
+                    json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
 }

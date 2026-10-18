@@ -1,4 +1,5 @@
 use mcp_server_core::config::CoreConfig;
+use mcp_server_core::credential::CredentialVerifier;
 use mcp_server_core::oauth::{AuthState, OAuthSettings};
 use mcp_server_core::server::build_app;
 use mcp_server_core::service::{Service, ServiceContext, ServiceEnv, ServiceFactory};
@@ -60,6 +61,11 @@ pub struct Loaded {
     pub services: Vec<Arc<dyn Service>>,
 }
 
+/// The credential check people sign in with: the first enabled service that defines one.
+pub fn verifier(services: &[Arc<dyn Service>]) -> Option<Arc<dyn CredentialVerifier>> {
+    services.iter().find_map(|s| s.credential_verifier())
+}
+
 /// Reads the core configuration and builds every selected service. All errors are collected in
 /// `env.errors`; `None` means the server cannot start. Unselected services never read their config.
 pub fn load(env: &mut ServiceEnv, registry: &[(&'static str, ServiceFactory)]) -> Option<Loaded> {
@@ -78,7 +84,11 @@ pub fn load(env: &mut ServiceEnv, registry: &[(&'static str, ServiceFactory)]) -
             services.push(s);
         }
     }
-    // Services may share variables (COMPANIES_HOUSE_API_KEY): report each error once.
+    if !services.is_empty() && verifier(&services).is_none() {
+        env.errors
+            .push("no enabled service defines how people sign in".to_string());
+    }
+    // Services may share variables (COMPANIES_HOUSE_API_URL): report each error once.
     let mut seen = std::collections::HashSet::new();
     env.errors.retain(|e| seen.insert(e.clone()));
     if !env.errors.is_empty() {
@@ -98,7 +108,8 @@ pub fn app(
     ctx: &ServiceContext,
 ) -> axum::Router {
     let names: Vec<&str> = services.iter().map(|s| s.name()).collect();
-    let auth = AuthState::new(oauth, &names);
+    let verifier = verifier(services).expect("load() requires a service that checks credentials");
+    let auth = AuthState::new(oauth, &names, verifier);
     let routers = services
         .iter()
         .map(|s| (s.name(), s.clone().router(ctx)))
@@ -131,6 +142,7 @@ pub fn log_filter(level: &str, caps: &[&str]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mcp_server_core::service::ServiceContext;
     use std::collections::HashMap;
 
     fn env(pairs: &[(&str, &str)]) -> ServiceEnv {
@@ -144,8 +156,6 @@ mod tests {
     const CORE: &[(&str, &str)] = &[
         ("PUBLIC_URL", "https://ch.example.com"),
         ("OAUTH_SIGNING_KEY", "0123456789abcdef0123456789abcdef"),
-        ("OAUTH_ADMIN_PASSWORD", "a long password"),
-        ("COMPANIES_HOUSE_API_KEY", "test-api-key"),
     ];
 
     fn with_core(extra: &[(&str, &str)]) -> ServiceEnv {
@@ -159,10 +169,29 @@ mod tests {
         None
     }
 
-    /// Reads the same variable as the companies service, like a future streaming service would.
+    /// Two services reading the same variable, like a future streaming service would.
     fn sharing(env: &mut ServiceEnv) -> Option<Arc<dyn Service>> {
-        env.required("COMPANIES_HOUSE_API_KEY");
+        env.required("SHARED_TOKEN");
         None
+    }
+
+    /// A service that defines no way to sign in.
+    struct Plain;
+
+    impl Service for Plain {
+        fn name(&self) -> &'static str {
+            "plain"
+        }
+        fn tool_names(&self) -> Vec<String> {
+            Vec::new()
+        }
+        fn router(self: Arc<Self>, _: &ServiceContext) -> axum::Router {
+            axum::Router::new()
+        }
+    }
+
+    fn plain(_: &mut ServiceEnv) -> Option<Arc<dyn Service>> {
+        Some(Arc::new(Plain))
     }
 
     const TWO: &[(&str, ServiceFactory)] = &[
@@ -246,20 +275,45 @@ mod tests {
 
     #[test]
     fn shared_variable_errors_are_reported_once() {
-        const SHARED: &[(&str, ServiceFactory)] = &[
-            ("companies", mcp_companies_house_data::from_env),
-            ("sharing", sharing),
-        ];
-        let mut e = env(&[
-            ("PUBLIC_URL", "https://ch.example.com"),
-            ("OAUTH_SIGNING_KEY", "0123456789abcdef0123456789abcdef"),
-            ("OAUTH_ADMIN_PASSWORD", "a long password"),
-        ]);
+        const SHARED: &[(&str, ServiceFactory)] = &[("one", sharing), ("two", sharing)];
+        let mut e = with_core(&[]);
         assert!(load(&mut e, SHARED).is_none());
+        assert_eq!(e.errors, vec!["SHARED_TOKEN is required".to_string()]);
+    }
+
+    #[test]
+    fn a_service_must_define_how_people_sign_in() {
+        const PLAIN: &[(&str, ServiceFactory)] = &[("plain", plain)];
+        let mut e = with_core(&[]);
+        assert!(load(&mut e, PLAIN).is_none());
         assert_eq!(
             e.errors,
-            vec!["COMPANIES_HOUSE_API_KEY is required".to_string()]
+            vec!["no enabled service defines how people sign in".to_string()]
         );
+        let mut e = with_core(&[]);
+        let loaded = load(&mut e, SERVICES).expect("loads");
+        assert!(verifier(&loaded.services).is_some());
+    }
+
+    #[test]
+    fn retired_secrets_stop_startup() {
+        for var in [
+            "OAUTH_ADMIN_PASSWORD",
+            "MCP_AUTH_TOKEN",
+            "COMPANIES_HOUSE_API_KEY",
+        ] {
+            let mut e = with_core(&[(var, "some-old-secret")]);
+            assert!(load(&mut e, SERVICES).is_none(), "{var}");
+            let joined = e.errors.join("\n");
+            assert!(
+                joined.contains(&format!("{var} is no longer used")),
+                "{joined}"
+            );
+            assert!(
+                !joined.contains("some-old-secret"),
+                "secret leaked: {joined}"
+            );
+        }
     }
 
     #[test]

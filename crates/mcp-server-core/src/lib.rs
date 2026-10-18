@@ -1,4 +1,5 @@
 pub mod config;
+pub mod credential;
 pub mod guards;
 pub mod jwt;
 pub mod oauth;

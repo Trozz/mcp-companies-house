@@ -15,6 +15,7 @@ fn client(st: &mcp_server_core::oauth::AuthState) -> String {
             None,
             Payload {
                 redirect_uris: Some(vec![REDIRECT.into()]),
+                credential: sealed(st),
                 ..Default::default()
             },
         )
@@ -32,6 +33,7 @@ fn code(st: &mcp_server_core::oauth::AuthState, client_id: &str) -> String {
                 code_challenge: Some(CHALLENGE.into()),
                 scope: Some("mail".into()),
                 resource: Some("https://mail.example.com/mail".into()),
+                credential: sealed(st),
                 ..Default::default()
             },
         )
@@ -156,6 +158,7 @@ async fn access_token_is_not_accepted_as_code() {
             Some(Duration::from_secs(60)),
             Payload {
                 client_id: Some(cid.clone()),
+                credential: sealed(&st),
                 ..Default::default()
             },
         )
@@ -181,6 +184,7 @@ async fn refresh_grant_returns_new_pair() {
                 client_id: Some(cid.clone()),
                 scope: Some("mail".into()),
                 resource: Some("https://mail.example.com/mail".into()),
+                credential: sealed(&st),
                 ..Default::default()
             },
         )
@@ -222,6 +226,7 @@ async fn access_token_is_not_accepted_as_refresh() {
             Some(Duration::from_secs(60)),
             Payload {
                 client_id: Some(cid.clone()),
+                credential: sealed(&st),
                 ..Default::default()
             },
         )
@@ -253,6 +258,7 @@ async fn refresh_grant_requires_client_id() {
             Payload {
                 client_id: Some(cid),
                 scope: Some("mail".into()),
+                credential: sealed(&st),
                 ..Default::default()
             },
         )
@@ -292,6 +298,7 @@ fn refresh_token(
                 client_id: Some(cid.into()),
                 scope: Some("mail".into()),
                 resource: resource.map(String::from),
+                credential: sealed(st),
                 ..Default::default()
             },
         )
@@ -342,6 +349,7 @@ async fn refresh_minted_for_the_old_mcp_audience_is_rejected() {
         Payload {
             client_id: Some(cid.clone()),
             scope: Some("mail".into()),
+            credential: sealed(&st),
             ..Default::default()
         },
     )
@@ -361,7 +369,7 @@ async fn refresh_for_a_disabled_service_is_rejected() {
 
 #[tokio::test]
 async fn token_request_resource_must_match_the_grant() {
-    let st = state_two_services(None);
+    let st = state_two_services();
     let cid = client(&st);
     let token = refresh_token(&st, &cid, Some("https://mail.example.com/mail"));
     let app = app(st.clone());
@@ -389,4 +397,69 @@ async fn token_request_resource_must_match_the_grant() {
     req_pairs.push(("code", c.as_str()));
     let res = send(&app, form_post("/token", &req_pairs)).await;
     assert_eq!(body_json(res).await["error"], "invalid_target");
+}
+
+#[tokio::test]
+async fn grants_without_a_sealed_credential_are_refused() {
+    let st = state();
+    let cid = client(&st);
+    let bare_code = |credential: Option<String>| {
+        st.jwt
+            .issue(
+                TokenKind::Code,
+                Some(Duration::from_secs(60)),
+                Payload {
+                    client_id: Some(cid.clone()),
+                    redirect_uri: Some(REDIRECT.into()),
+                    code_challenge: Some(CHALLENGE.into()),
+                    scope: Some("mail".into()),
+                    resource: Some("https://mail.example.com/mail".into()),
+                    credential,
+                    ..Default::default()
+                },
+            )
+            .unwrap()
+    };
+    for credential in [None, Some("not-a-sealed-value".to_string())] {
+        let res = send(
+            &app(st.clone()),
+            exchange(&bare_code(credential), &cid, VERIFIER, REDIRECT),
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        let v = body_json(res).await;
+        assert_eq!(v["error"], "invalid_grant");
+        assert_eq!(v["error_description"], "grant has no credential");
+    }
+}
+
+#[tokio::test]
+async fn issued_tokens_carry_the_sealed_credential() {
+    let st = state();
+    let cid = client(&st);
+    let v = body_json(
+        send(
+            &app(st.clone()),
+            exchange(&code(&st, &cid), &cid, VERIFIER, REDIRECT),
+        )
+        .await,
+    )
+    .await;
+    for (token, kind, aud) in [
+        (
+            v["access_token"].as_str().unwrap(),
+            TokenKind::Access,
+            "https://mail.example.com/mail",
+        ),
+        (
+            v["refresh_token"].as_str().unwrap(),
+            TokenKind::Refresh,
+            "https://mail.example.com",
+        ),
+    ] {
+        assert!(!token.contains(KEY));
+        let claims = st.jwt.verify_for(token, kind, aud).unwrap();
+        let sealed = claims.payload.credential.expect("sealed credential");
+        assert_eq!(st.sealer.open(&sealed).unwrap().expose(), KEY);
+    }
 }

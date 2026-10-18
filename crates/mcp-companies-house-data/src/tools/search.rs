@@ -2,7 +2,7 @@
 //! availability, company profiles and SIC codes.
 
 use super::{
-    CompaniesServer, Query, count, date_range, items, json_result, limit_arg,
+    Caller, CompaniesServer, Query, count, date_range, items, json_result, limit_arg,
     normalise_company_number, required_text, run, text_arg,
 };
 use crate::codes::{self, CompanyStatus, CompanySubtype, CompanyType};
@@ -11,6 +11,8 @@ use crate::sic;
 use crate::view::{
     advanced_item, alphabetical_item, company_profile, dissolved_item, page, search_item,
 };
+use axum::http::request::Parts;
+use rmcp::handler::server::tool::Extension;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::CallToolResult;
 use rmcp::schemars::JsonSchema;
@@ -235,7 +237,7 @@ pub(crate) fn nature_of_business(codes: Option<&Value>) -> Option<Value> {
     (!described.is_empty()).then_some(Value::Array(described))
 }
 
-impl CompaniesServer {
+impl Caller {
     /// The profile of one company, shaped for output, with SIC descriptions.
     pub(crate) async fn profile(&self, number: &str) -> error::Result<Value> {
         let profile = self
@@ -265,9 +267,11 @@ impl CompaniesServer {
     pub async fn search_companies(
         &self,
         Parameters(p): Parameters<SearchCompaniesParams>,
+        Extension(parts): Extension<Parts>,
     ) -> Result<CallToolResult, McpError> {
         tracing::debug!(args = ?p, "search_companies");
         run("search_companies", async {
+            let c = self.caller(&parts)?;
             let query = required_text("query", &p.query)?;
             let limit = limit_arg(p.limit)?;
             let start = p.start_index.unwrap_or(0);
@@ -275,7 +279,7 @@ impl CompaniesServer {
             if p.active_only == Some(true) {
                 q.push(("restrictions", "active-companies".to_string()));
             }
-            let out = self
+            let out = c
                 .search_page(
                     "search_companies",
                     &["search", "companies"],
@@ -297,13 +301,15 @@ impl CompaniesServer {
     pub async fn filter_companies(
         &self,
         Parameters(p): Parameters<FilterCompaniesParams>,
+        Extension(parts): Extension<Parts>,
     ) -> Result<CallToolResult, McpError> {
         tracing::debug!(args = ?p, "filter_companies");
         run("filter_companies", async {
+            let c = self.caller(&parts)?;
             let q = filter_query(&p)?;
             let start = p.start_index.unwrap_or(0);
             // The advanced search answers 404 when no company matches.
-            let found = self
+            let found = c
                 .get_optional("advanced_search", &["advanced-search", "companies"], &q)
                 .await?
                 .unwrap_or_default();
@@ -321,11 +327,13 @@ impl CompaniesServer {
     pub async fn get_company(
         &self,
         Parameters(p): Parameters<CompanyNumberParams>,
+        Extension(parts): Extension<Parts>,
     ) -> Result<CallToolResult, McpError> {
         tracing::debug!(args = ?p, "get_company");
         run("get_company", async {
+            let c = self.caller(&parts)?;
             let number = normalise_company_number(&p.company_number)?;
-            Ok(json_result(&self.profile(&number).await?))
+            Ok(json_result(&c.profile(&number).await?))
         })
         .await
     }
@@ -337,9 +345,11 @@ impl CompaniesServer {
     pub async fn search_dissolved_companies(
         &self,
         Parameters(p): Parameters<SearchDissolvedParams>,
+        Extension(parts): Extension<Parts>,
     ) -> Result<CallToolResult, McpError> {
         tracing::debug!(args = ?p, "search_dissolved_companies");
         run("search_dissolved_companies", async {
+            let c = self.caller(&parts)?;
             let query = required_text("query", &p.query)?;
             let limit = limit_arg(p.limit)?;
             let start = p.start_index.unwrap_or(0);
@@ -353,7 +363,7 @@ impl CompaniesServer {
                 ("size", limit.to_string()),
                 ("start_index", start.to_string()),
             ];
-            let found = self
+            let found = c
                 .get_optional("dissolved_search", &["dissolved-search", "companies"], &q)
                 .await?
                 .unwrap_or_default();
@@ -371,9 +381,11 @@ impl CompaniesServer {
     pub async fn check_company_name_availability(
         &self,
         Parameters(p): Parameters<NameAvailabilityParams>,
+        Extension(parts): Extension<Parts>,
     ) -> Result<CallToolResult, McpError> {
         tracing::debug!(args = ?p, "check_company_name_availability");
         run("check_company_name_availability", async {
+            let c = self.caller(&parts)?;
             let name = required_text("name", &p.name)?;
             let q = vec![
                 ("q", name.clone()),
@@ -383,7 +395,7 @@ impl CompaniesServer {
                     "active-companies legally-equivalent-company-name".to_string(),
                 ),
             ];
-            let found = self
+            let found = c
                 .get_optional("search_companies", &["search", "companies"], &q)
                 .await?
                 .unwrap_or_default();
@@ -406,13 +418,15 @@ impl CompaniesServer {
     pub async fn browse_company_names(
         &self,
         Parameters(p): Parameters<BrowseCompanyNamesParams>,
+        Extension(parts): Extension<Parts>,
     ) -> Result<CallToolResult, McpError> {
         tracing::debug!(args = ?p, "browse_company_names");
         run("browse_company_names", async {
+            let c = self.caller(&parts)?;
             let name = required_text("name", &p.name)?;
             let limit = limit_arg(p.limit)?.min(MAX_NEARBY);
             let q = vec![("q", name), ("size", limit.to_string())];
-            let found = self
+            let found = c
                 .get_optional(
                     "alphabetical_search",
                     &["alphabetical-search", "companies"],

@@ -1,7 +1,7 @@
 mod support;
 use serde_json::json;
 use support::fake_ch::{FakeCh, FakeState};
-use support::tools::{error_text, json, params, server};
+use support::tools::{auth, error_text, json, params, server};
 
 async fn fake() -> FakeCh {
     FakeCh::start(FakeState::register()).await
@@ -12,7 +12,7 @@ async fn filing_history_lists_filings_with_document_ids() {
     let fake = fake().await;
     let v = json(
         &server(&fake)
-            .list_filing_history(params(json!({"company_number": "1", "limit": 2})))
+            .list_filing_history(params(json!({"company_number": "1", "limit": 2})), auth())
             .await
             .unwrap(),
     );
@@ -36,9 +36,12 @@ async fn filing_history_filters_by_category() {
     let fake = fake().await;
     let v = json(
         &server(&fake)
-            .list_filing_history(params(json!({
-                "company_number": "1", "categories": ["Accounts", "officers"]
-            })))
+            .list_filing_history(
+                params(json!({
+                    "company_number": "1", "categories": ["Accounts", "officers"]
+                })),
+                auth(),
+            )
             .await
             .unwrap(),
     );
@@ -61,9 +64,10 @@ async fn filing_history_rejects_bad_categories_before_calling() {
     let fake = fake().await;
     let text = error_text(
         &server(&fake)
-            .list_filing_history(params(
-                json!({"company_number": "1", "categories": ["acc,ounts"]}),
-            ))
+            .list_filing_history(
+                params(json!({"company_number": "1", "categories": ["acc,ounts"]})),
+                auth(),
+            )
             .await
             .unwrap(),
     );
@@ -76,7 +80,7 @@ async fn charges_are_listed_with_counts() {
     let fake = fake().await;
     let v = json(
         &server(&fake)
-            .list_charges(params(json!({"company_number": "6"})))
+            .list_charges(params(json!({"company_number": "6"})), auth())
             .await
             .unwrap(),
     );
@@ -101,7 +105,7 @@ async fn a_company_without_charges_has_none() {
     let fake = fake().await;
     let v = json(
         &server(&fake)
-            .list_charges(params(json!({"company_number": "1"})))
+            .list_charges(params(json!({"company_number": "1"})), auth())
             .await
             .unwrap(),
     );
@@ -116,9 +120,12 @@ async fn get_charge_returns_the_full_record() {
     let fake = fake().await;
     let s = server(&fake);
     let v = json(
-        &s.get_charge(params(json!({"company_number": "6", "charge_id": "ch-1"})))
-            .await
-            .unwrap(),
+        &s.get_charge(
+            params(json!({"company_number": "6", "charge_id": "ch-1"})),
+            auth(),
+        )
+        .await
+        .unwrap(),
     );
     assert_eq!(v["charge_id"], "ch-1");
     assert_eq!(
@@ -136,18 +143,22 @@ async fn get_charge_returns_the_full_record() {
     assert_eq!(fake.requests()[0].path, "/company/00000006/charges/ch-1");
 
     let text = error_text(
-        &s.get_charge(params(json!({"company_number": "6", "charge_id": "ch-9"})))
-            .await
-            .unwrap(),
+        &s.get_charge(
+            params(json!({"company_number": "6", "charge_id": "ch-9"})),
+            auth(),
+        )
+        .await
+        .unwrap(),
     );
     assert!(
         text.starts_with("not_found: no charge ch-9 for company 00000006"),
         "{text}"
     );
     let text = error_text(
-        &s.get_charge(params(
-            json!({"company_number": "6", "charge_id": "ch/../1"}),
-        ))
+        &s.get_charge(
+            params(json!({"company_number": "6", "charge_id": "ch/../1"})),
+            auth(),
+        )
         .await
         .unwrap(),
     );
@@ -159,7 +170,7 @@ async fn insolvency_cases_are_shown() {
     let fake = fake().await;
     let v = json(
         &server(&fake)
-            .get_insolvency(params(json!({"company_number": "6"})))
+            .get_insolvency(params(json!({"company_number": "6"})), auth())
             .await
             .unwrap(),
     );
@@ -177,7 +188,7 @@ async fn no_insolvency_record_is_an_empty_list() {
     let fake = fake().await;
     let v = json(
         &server(&fake)
-            .get_insolvency(params(json!({"company_number": "1"})))
+            .get_insolvency(params(json!({"company_number": "1"})), auth())
             .await
             .unwrap(),
     );
@@ -190,10 +201,10 @@ async fn charges_and_insolvency_of_an_unknown_company_are_not_found() {
     let fake = fake().await;
     let s = server(&fake);
     for r in [
-        s.list_charges(params(json!({"company_number": "12345678"})))
+        s.list_charges(params(json!({"company_number": "12345678"})), auth())
             .await
             .unwrap(),
-        s.get_insolvency(params(json!({"company_number": "12345678"})))
+        s.get_insolvency(params(json!({"company_number": "12345678"})), auth())
             .await
             .unwrap(),
     ] {
