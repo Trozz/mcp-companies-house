@@ -150,7 +150,7 @@ claude mcp add --transport http companies-house https://companies-house.example.
 
 Every secret can also be read from a file by appending `_FILE` to its name, for example `OAUTH_SIGNING_KEY_FILE=/run/secrets/oauth-signing-key`. A directly set value wins over the file.
 
-The server has no Companies House key of its own, and has no admin password or static token. `COMPANIES_HOUSE_API_KEY`, `OAUTH_ADMIN_PASSWORD` and `MCP_AUTH_TOKEN` from earlier versions stop startup with a message to remove them.
+The server has no Companies House key of its own, and has no admin password or static token.
 
 ### Server
 

@@ -311,34 +311,6 @@ async fn a_key_as_the_bearer_is_checked_with_companies_house() {
 }
 
 #[tokio::test]
-async fn retired_settings_stop_startup() {
-    for retired in [
-        "COMPANIES_HOUSE_API_KEY",
-        "OAUTH_ADMIN_PASSWORD",
-        "MCP_AUTH_TOKEN",
-    ] {
-        let vars: HashMap<String, String> = [
-            ("PUBLIC_URL", "https://ch.example.com"),
-            ("OAUTH_SIGNING_KEY", SIGNING_KEY),
-            ("INSECURE_HTTP", "true"),
-            (retired, "something"),
-        ]
-        .iter()
-        .map(|(k, v)| (k.to_string(), v.to_string()))
-        .collect();
-        let mut env = ServiceEnv::new(Box::new(move |k: &str| vars.get(k).cloned()));
-        assert!(load(&mut env, SERVICES).is_none(), "{retired}");
-        assert!(
-            env.errors
-                .iter()
-                .any(|e| e.starts_with(&format!("{retired} is no longer used"))),
-            "{retired}: {:?}",
-            env.errors
-        );
-    }
-}
-
-#[tokio::test]
 async fn the_service_sends_its_icons() {
     let res = server(&[])
         .oneshot(rpc(

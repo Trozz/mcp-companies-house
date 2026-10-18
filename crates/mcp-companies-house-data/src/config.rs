@@ -15,12 +15,6 @@ pub struct DataConfig {
 impl DataConfig {
     pub fn from_env<F: Fn(&str) -> Option<String>>(env: &mut EnvReader<F>) -> Option<Self> {
         let errors_before = env.errors.len();
-        if env.optional("COMPANIES_HOUSE_API_KEY").is_some() {
-            env.errors.push(
-                "COMPANIES_HOUSE_API_KEY is no longer used: each person signs in with their own Companies House API key. Remove it"
-                    .into(),
-            );
-        }
         let raw_url = env
             .optional("COMPANIES_HOUSE_API_URL")
             .unwrap_or_else(|| DEFAULT_API_URL.to_string());
@@ -129,18 +123,6 @@ mod tests {
             errors.iter().any(|e| e.contains("COMPANIES_HOUSE_API_URL")),
             "{errors:?}"
         );
-    }
-
-    #[test]
-    fn a_server_key_is_refused_without_echoing_it() {
-        let (c, errors) = load(&[("COMPANIES_HOUSE_API_KEY", "0f1e2d3c-secret")]);
-        assert!(c.is_none());
-        let joined = errors.join("\n");
-        assert!(
-            joined.contains("COMPANIES_HOUSE_API_KEY is no longer used"),
-            "{joined}"
-        );
-        assert!(!joined.contains("0f1e2d3c"), "secret leaked: {joined}");
     }
 
     #[test]

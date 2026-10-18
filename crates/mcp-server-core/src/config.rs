@@ -163,15 +163,6 @@ impl CoreConfig {
                     .push("OAUTH_SIGNING_KEY must be at least 32 bytes".into());
             }
         }
-        // People sign in with their own credential (see `credential`); a shared password or
-        // static token would be a second, weaker way in, so refuse to start with one set.
-        for retired in ["OAUTH_ADMIN_PASSWORD", "MCP_AUTH_TOKEN"] {
-            if env.optional(retired).is_some() {
-                env.errors.push(format!(
-                    "{retired} is no longer used: each person signs in with their own credential. Remove it"
-                ));
-            }
-        }
         let mut trusted_proxies = Vec::new();
         for raw in env.list("TRUSTED_PROXIES") {
             match raw.parse::<IpAddr>() {
@@ -390,25 +381,6 @@ mod tests {
         assert_eq!(c.unwrap().public_url, "http://localhost:8443");
         let (_, errors) = core(core_env(&[("PUBLIC_URL", "http://mail.example.com")]));
         assert!(!errors.is_empty());
-    }
-
-    #[test]
-    fn retired_password_and_static_token_stop_startup_without_echoing_them() {
-        let (c, errors) = core(core_env(&[
-            ("OAUTH_ADMIN_PASSWORD", "hunter2-secret"),
-            ("MCP_AUTH_TOKEN", "static-secret"),
-        ]));
-        assert!(c.is_none());
-        let joined = errors.join("\n");
-        assert!(
-            joined.contains("OAUTH_ADMIN_PASSWORD is no longer used"),
-            "{joined}"
-        );
-        assert!(
-            joined.contains("MCP_AUTH_TOKEN is no longer used"),
-            "{joined}"
-        );
-        assert!(!joined.contains("secret"), "secret leaked: {joined}");
     }
 
     #[test]

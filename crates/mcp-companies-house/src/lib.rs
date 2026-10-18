@@ -250,14 +250,13 @@ mod tests {
     fn core_and_service_errors_are_reported_together() {
         let mut e = env(&[
             ("PUBLIC_URL", "ftp://x"),
-            ("COMPANIES_HOUSE_API_KEY", "abc:secret-value"),
+            ("COMPANIES_HOUSE_API_URL", "http://example.com"),
         ]);
         assert!(load(&mut e, SERVICES).is_none());
         let joined = e.errors.join("\n");
         assert!(joined.contains("PUBLIC_URL"), "{joined}");
         assert!(joined.contains("OAUTH_SIGNING_KEY is required"), "{joined}");
-        assert!(joined.contains("COMPANIES_HOUSE_API_KEY"), "{joined}");
-        assert!(!joined.contains("secret-value"), "secret leaked: {joined}");
+        assert!(joined.contains("COMPANIES_HOUSE_API_URL"), "{joined}");
     }
 
     #[test]
@@ -293,27 +292,6 @@ mod tests {
         let mut e = with_core(&[]);
         let loaded = load(&mut e, SERVICES).expect("loads");
         assert!(verifier(&loaded.services).is_some());
-    }
-
-    #[test]
-    fn retired_secrets_stop_startup() {
-        for var in [
-            "OAUTH_ADMIN_PASSWORD",
-            "MCP_AUTH_TOKEN",
-            "COMPANIES_HOUSE_API_KEY",
-        ] {
-            let mut e = with_core(&[(var, "some-old-secret")]);
-            assert!(load(&mut e, SERVICES).is_none(), "{var}");
-            let joined = e.errors.join("\n");
-            assert!(
-                joined.contains(&format!("{var} is no longer used")),
-                "{joined}"
-            );
-            assert!(
-                !joined.contains("some-old-secret"),
-                "secret leaked: {joined}"
-            );
-        }
     }
 
     #[test]
