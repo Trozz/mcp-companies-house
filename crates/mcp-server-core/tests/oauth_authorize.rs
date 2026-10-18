@@ -338,6 +338,25 @@ async fn login_page_names_the_service() {
 }
 
 #[tokio::test]
+async fn the_combined_endpoint_is_named_as_every_service() {
+    let st = state_with_combined();
+    let q = format!(
+        "{}&resource={}",
+        query(&client_id(&st), "https://app.example.com/cb"),
+        "https%3A%2F%2Fmail.example.com%2Fmcp"
+    );
+    let res = send(&app(st.clone()), get(&format!("/authorize?{q}"))).await;
+    assert_eq!(res.status(), StatusCode::OK);
+    let html = body_text(res).await;
+    assert!(
+        html.contains(
+            "requesting access to <strong>every service</strong> on this server, through <code>/mcp</code>."
+        ),
+        "{html}"
+    );
+}
+
+#[tokio::test]
 async fn granted_scope_is_the_resource_service() {
     let st = state();
     let app = app(st.clone());

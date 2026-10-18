@@ -261,13 +261,20 @@ fn login_page(
     let error_html = error
         .map(|e| format!("<p style=\"color:#b00\">{}</p>", escape(e)))
         .unwrap_or_default();
-    let service = escape(&v.scope);
+    let target = if v.scope == crate::combined::COMBINED {
+        "<strong>every service</strong> on this server, through <code>/mcp</code>".to_string()
+    } else {
+        format!(
+            "the <strong>{}</strong> service on this server",
+            escape(&v.scope)
+        )
+    };
     let label = escape(st.verifier.label());
     let help = escape(st.verifier.help());
     let html = format!(
         "<!doctype html><html><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width\">\
 <title>Authorize</title><style>body{{font-family:system-ui;max-width:24rem;margin:4rem auto;padding:0 1rem}}input[type=password]{{width:100%;padding:.5rem}}button{{margin-top:1rem;padding:.5rem 1rem}}small{{color:#555}}</style></head>\
-<body><h1>Authorize access</h1><p>An MCP client is requesting access to the <strong>{service}</strong> service on this server.</p>{client_html}{destination}\
+<body><h1>Authorize access</h1><p>An MCP client is requesting access to {target}.</p>{client_html}{destination}\
 <p>Sign in with your own {label}. It is checked once, then kept only in encrypted form inside this connection's tokens; this server does not store it.</p>{error_html}\
 <form method=\"post\" action=\"/authorize\">{hidden}<label>{label}<input type=\"password\" name=\"credential\" autocomplete=\"off\" spellcheck=\"false\" autofocus required></label>\
 <p><small>{help}</small></p><button type=\"submit\">Authorize</button></form></body></html>"

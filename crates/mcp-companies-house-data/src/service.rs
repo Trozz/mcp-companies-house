@@ -2,6 +2,7 @@ use crate::api::{ApiSettings, ChClient};
 use crate::config::DataConfig;
 use crate::tools::CompaniesServer;
 use crate::verifier::ChKeyVerifier;
+use mcp_server_core::combined::ToolSet;
 use mcp_server_core::credential::CredentialVerifier;
 use mcp_server_core::service::{Service, ServiceContext, ServiceEnv, mcp_service};
 use std::sync::Arc;
@@ -41,6 +42,10 @@ impl Service for DataService {
     fn credential_verifier(&self) -> Option<Arc<dyn CredentialVerifier>> {
         Some(Arc::new(ChKeyVerifier::new(self.client.clone())))
     }
+
+    fn tool_set(&self) -> Option<Box<dyn ToolSet>> {
+        Some(Box::new(self.server()))
+    }
 }
 
 /// Reads the company data configuration and builds the service. Errors go to `env.errors`.
@@ -78,6 +83,7 @@ mod tests {
         assert_eq!(svc.name(), "companies");
         assert!(svc.log_caps().is_empty());
         let verifier = svc.credential_verifier().expect("a key verifier");
+        assert!(svc.tool_set().is_some(), "offered on /mcp");
         assert_eq!(verifier.label(), "Companies House API key");
         assert_eq!(
             svc.tool_names(),

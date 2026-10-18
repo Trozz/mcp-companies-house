@@ -58,6 +58,11 @@ pub trait Service: Send + Sync + 'static {
     fn credential_verifier(&self) -> Option<Arc<dyn crate::credential::CredentialVerifier>> {
         None
     }
+    /// This service's tools for the combined `/mcp` endpoint, built once per MCP session there.
+    /// `None` keeps the service off `/mcp`.
+    fn tool_set(&self) -> Option<Box<dyn crate::combined::ToolSet>> {
+        None
+    }
 }
 
 /// `scheme://host:port` for `public_url`, with the scheme's default port made explicit so rmcp

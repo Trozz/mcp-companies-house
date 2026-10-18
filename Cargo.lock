@@ -1348,6 +1348,7 @@ dependencies = [
  "http-body-util",
  "mcp-companies-house-data",
  "mcp-server-core",
+ "rmcp",
  "serde_json",
  "tokio",
  "tokio-util",

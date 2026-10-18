@@ -1,4 +1,4 @@
-use mcp_companies_house::{Loaded, SERVICES, VERSION, app, load, log_filter};
+use mcp_companies_house::{Loaded, SERVICES, VERSION, app, combined_tool_names, load, log_filter};
 use mcp_server_core::config::EnvReader;
 use mcp_server_core::service::{HttpSettings, ServiceContext, ServiceEnv};
 use mcp_server_core::{install_crypto_provider, observability, shutdown_signal, tls};
@@ -73,6 +73,14 @@ async fn run(loaded: Loaded) -> anyhow::Result<()> {
             url = core.service_url(s.name()),
             tools = ?s.tool_names(),
             "service enabled"
+        );
+    }
+    let combined = combined_tool_names(&services);
+    if !combined.is_empty() {
+        tracing::info!(
+            url = core.service_url(mcp_server_core::combined::COMBINED),
+            tools = combined.len(),
+            "combined endpoint enabled"
         );
     }
 

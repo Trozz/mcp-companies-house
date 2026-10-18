@@ -28,6 +28,11 @@ pub fn state_two_services() -> Arc<AuthState> {
     state_with(verifier(), Vec::new(), &["mail", "calendar"])
 }
 
+/// `mail` and the combined endpoint, `mcp`.
+pub fn state_with_combined() -> Arc<AuthState> {
+    state_with(verifier(), Vec::new(), &["mail", "mcp"])
+}
+
 pub fn state_with_trusted_proxies(trusted_proxies: Vec<IpAddr>) -> Arc<AuthState> {
     state_with(verifier(), trusted_proxies, &["mail"])
 }

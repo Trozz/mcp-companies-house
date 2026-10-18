@@ -198,17 +198,121 @@ async fn companies_sub_paths_are_guarded_too() {
 }
 
 #[tokio::test]
-async fn the_generic_mcp_path_is_not_served() {
-    let res = server(&[])
+async fn mcp_serves_every_tool_with_its_service_prefix() {
+    let app = server(&[]);
+    let token = access_token_for("mcp");
+    let res = app
+        .clone()
+        .oneshot(rpc("/mcp", initialize(), Some(&token), None))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let session = res.headers()["mcp-session-id"]
+        .to_str()
+        .unwrap()
+        .to_string();
+    let init = rpc_message(res).await;
+    assert_eq!(init["result"]["serverInfo"]["name"], "mcp-companies-house");
+    assert_eq!(
+        init["result"]["serverInfo"]["icons"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+    let res = app
+        .clone()
         .oneshot(rpc(
             "/mcp",
-            initialize(),
-            Some(&access_token_for("companies")),
-            None,
+            json!({"jsonrpc": "2.0", "method": "notifications/initialized"}),
+            Some(&token),
+            Some(&session),
         ))
         .await
         .unwrap();
-    assert_eq!(res.status(), StatusCode::NOT_FOUND);
+    assert_eq!(res.status(), StatusCode::ACCEPTED);
+    let res = app
+        .clone()
+        .oneshot(rpc(
+            "/mcp",
+            json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}}),
+            Some(&token),
+            Some(&session),
+        ))
+        .await
+        .unwrap();
+    let list = rpc_message(res).await;
+    let names: Vec<&str> = list["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(names.len(), 18, "{names:?}");
+    assert!(
+        names.iter().all(|n| n.starts_with("companies_")),
+        "{names:?}"
+    );
+    // The SIC lookup works offline, so it runs here without Companies House.
+    let res = app
+        .oneshot(rpc(
+            "/mcp",
+            json!({"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {
+                "name": "companies_lookup_sic_codes", "arguments": {"query": "bakery"}
+            }}),
+            Some(&token),
+            Some(&session),
+        ))
+        .await
+        .unwrap();
+    let call = rpc_message(res).await;
+    assert_ne!(call["result"]["isError"], true, "{call}");
+    assert!(
+        call["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("10710"),
+        "{call}"
+    );
+}
+
+#[tokio::test]
+async fn mcp_and_service_tokens_are_not_interchangeable() {
+    let app = server(&[]);
+    for (path, token) in [
+        ("/mcp", access_token_for("companies")),
+        ("/companies", access_token_for("mcp")),
+    ] {
+        let res = app
+            .clone()
+            .oneshot(rpc(path, initialize(), Some(&token), None))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED, "{path}");
+    }
+    let res = app
+        .clone()
+        .oneshot(rpc("/mcp", initialize(), None, None))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        res.headers()["www-authenticate"].to_str().unwrap(),
+        "Bearer resource_metadata=\"https://ch.example.com/.well-known/oauth-protected-resource/mcp\""
+    );
+    let res = app
+        .oneshot(
+            Request::get("/.well-known/oauth-protected-resource/mcp")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let bytes = res.into_body().collect().await.unwrap().to_bytes();
+    let v: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(v["resource"], "https://ch.example.com/mcp");
+    assert_eq!(v["scopes_supported"], json!(["mcp"]));
 }
 
 #[tokio::test]

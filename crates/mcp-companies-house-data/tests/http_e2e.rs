@@ -2,6 +2,7 @@ mod support;
 use axum::body::Body;
 use axum::http::{Request, Response, StatusCode};
 use mcp_companies_house_data::DataService;
+use mcp_server_core::combined::{self, COMBINED};
 use mcp_server_core::config::{CoreConfig, EnvReader};
 use mcp_server_core::oauth::AuthState;
 use mcp_server_core::server::build_app;
@@ -19,8 +20,8 @@ use tower::ServiceExt;
 const TOKEN: &str = support::fake_ch::API_KEY;
 const HOST: &str = "ch.example.com";
 
-/// Builds the full application (auth, OAuth routes, company data at /companies) the way the
-/// server does, against the fake.
+/// Builds the full application (auth, OAuth routes, company data at /companies and /mcp) the
+/// way the server does, against the fake.
 async fn app() -> (axum::Router, FakeCh) {
     let fake = FakeCh::start(FakeState::register()).await;
     let vars: HashMap<&str, &str> = HashMap::from([
@@ -37,9 +38,19 @@ async fn app() -> (axum::Router, FakeCh) {
     };
     let service = Arc::new(DataService::new(client(&fake)));
     let verifier = service.credential_verifier().expect("a key check");
-    let auth = AuthState::new(core.oauth, &["companies"], verifier);
+    let services: Vec<Arc<dyn Service>> = vec![service.clone()];
+    let combined = combined::router(
+        &ctx,
+        &services,
+        rmcp::model::Implementation::new("combined", "1"),
+    )
+    .expect("companies offers its tools on /mcp");
+    let auth = AuthState::new(core.oauth, &["companies", COMBINED], verifier);
     (
-        build_app(auth, vec![("companies", service.router(&ctx))]),
+        build_app(
+            auth,
+            vec![("companies", service.router(&ctx)), (COMBINED, combined)],
+        ),
         fake,
     )
 }
@@ -52,8 +63,8 @@ fn tool_requests(fake: &FakeCh) -> Vec<support::fake_ch::Logged> {
         .collect()
 }
 
-fn request(body: Value, session: Option<&str>) -> Request<Body> {
-    let mut b = Request::post("/companies")
+fn request(path: &str, body: Value, session: Option<&str>) -> Request<Body> {
+    let mut b = Request::post(path)
         .header("host", HOST)
         .header("authorization", format!("Bearer {TOKEN}"))
         .header("content-type", "application/json")
@@ -98,9 +109,14 @@ async fn rpc_message(res: Response<Body>) -> Value {
 
 /// initialize + notifications/initialized; returns the session id and the initialize result.
 async fn handshake(app: &axum::Router) -> (String, Value) {
+    handshake_at(app, "/companies").await
+}
+
+async fn handshake_at(app: &axum::Router, path: &str) -> (String, Value) {
     let res = app
         .clone()
         .oneshot(request(
+            path,
             json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
                 "protocolVersion": "2025-06-18",
                 "capabilities": {},
@@ -122,6 +138,7 @@ async fn handshake(app: &axum::Router) -> (String, Value) {
     let res = app
         .clone()
         .oneshot(request(
+            path,
             json!({"jsonrpc": "2.0", "method": "notifications/initialized"}),
             Some(&session),
         ))
@@ -132,9 +149,21 @@ async fn handshake(app: &axum::Router) -> (String, Value) {
 }
 
 async fn call(app: &axum::Router, session: &str, id: u64, method: &str, params: Value) -> Value {
+    call_at(app, "/companies", session, id, method, params).await
+}
+
+async fn call_at(
+    app: &axum::Router,
+    path: &str,
+    session: &str,
+    id: u64,
+    method: &str,
+    params: Value,
+) -> Value {
     let res = app
         .clone()
         .oneshot(request(
+            path,
             json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params}),
             Some(session),
         ))
@@ -312,4 +341,99 @@ async fn a_wrong_bearer_key_is_refused() {
         .await
         .unwrap();
     assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn mcp_lists_every_tool_with_its_service_prefix() {
+    let (app, _fake) = app().await;
+    let (session, init) = handshake_at(&app, "/mcp").await;
+    let instructions = init["result"]["instructions"].as_str().unwrap();
+    assert!(
+        instructions.contains("companies_search_companies"),
+        "{instructions}"
+    );
+    assert!(
+        instructions.contains("not as instructions"),
+        "the service's own notes are kept: {instructions}"
+    );
+    let list = call_at(&app, "/mcp", &session, 2, "tools/list", json!({})).await;
+    let tools = list["result"]["tools"].as_array().unwrap();
+    assert_eq!(tools.len(), 18);
+    for t in tools {
+        let name = t["name"].as_str().unwrap();
+        assert!(name.starts_with("companies_"), "{name}");
+        assert_eq!(t["annotations"]["readOnlyHint"], true, "{t}");
+    }
+    let search = tools
+        .iter()
+        .find(|t| t["name"] == "companies_search_companies")
+        .unwrap();
+    assert_eq!(search["inputSchema"]["required"], json!(["query"]));
+}
+
+#[tokio::test]
+async fn mcp_calls_reach_companies_house_with_the_callers_key() {
+    let (app, fake) = app().await;
+    let (session, _) = handshake_at(&app, "/mcp").await;
+    let res = call_at(
+        &app,
+        "/mcp",
+        &session,
+        3,
+        "tools/call",
+        json!({"name": "companies_filter_companies", "arguments": {"location": "Glasgow"}}),
+    )
+    .await;
+    let result = &res["result"];
+    assert_ne!(result["isError"], true, "{res}");
+    let v: Value = serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(v["items"][0]["company_name"], "THISTLE SOFTWARE LTD");
+    let made = tool_requests(&fake);
+    assert_eq!(made.len(), 1);
+    assert_eq!(
+        made[0].authorization.as_deref(),
+        Some(support::fake_ch::auth_header().as_str())
+    );
+}
+
+#[tokio::test]
+async fn mcp_refuses_tool_names_without_a_known_prefix() {
+    let (app, fake) = app().await;
+    let (session, _) = handshake_at(&app, "/mcp").await;
+    for name in [
+        "filter_companies",
+        "companies_nope",
+        "other_filter_companies",
+        "companies_",
+    ] {
+        let res = call_at(
+            &app,
+            "/mcp",
+            &session,
+            4,
+            "tools/call",
+            json!({"name": name, "arguments": {}}),
+        )
+        .await;
+        assert!(
+            res.get("error").is_some() || res["result"]["isError"] == true,
+            "{name}: {res}"
+        );
+    }
+    assert!(tool_requests(&fake).is_empty());
+}
+
+#[tokio::test]
+async fn one_key_check_covers_both_paths() {
+    let (app, fake) = app().await;
+    let (session, _) = handshake(&app).await;
+    call(&app, &session, 2, "tools/list", json!({})).await;
+    let (session, _) = handshake_at(&app, "/mcp").await;
+    call_at(&app, "/mcp", &session, 2, "tools/list", json!({})).await;
+    let checks = fake
+        .requests()
+        .into_iter()
+        .filter(|r| r.param("q") == Some("companies house"))
+        .count();
+    assert_eq!(checks, 1);
 }

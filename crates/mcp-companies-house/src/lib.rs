@@ -1,8 +1,10 @@
+use mcp_server_core::combined::{self, COMBINED};
 use mcp_server_core::config::CoreConfig;
 use mcp_server_core::credential::CredentialVerifier;
 use mcp_server_core::oauth::{AuthState, OAuthSettings};
 use mcp_server_core::server::build_app;
-use mcp_server_core::service::{Service, ServiceContext, ServiceEnv, ServiceFactory};
+use mcp_server_core::service::{Service, ServiceContext, ServiceEnv, ServiceFactory, icons};
+use rmcp::model::Implementation;
 use std::sync::Arc;
 
 pub const VERSION: &str = match option_env!("APP_VERSION") {
@@ -100,20 +102,24 @@ pub fn load(env: &mut ServiceEnv, registry: &[(&'static str, ServiceFactory)]) -
     })
 }
 
-/// The full HTTP application: health, favicon, OAuth routes and each service at `/<name>`, every
-/// service its own OAuth protected resource.
+/// The full HTTP application: health, favicon, OAuth routes, each service at `/<name>` and every
+/// service's tools together at `/mcp`. Each path is its own OAuth protected resource.
 pub fn app(
     oauth: OAuthSettings,
     services: &[Arc<dyn Service>],
     ctx: &ServiceContext,
 ) -> axum::Router {
-    let names: Vec<&str> = services.iter().map(|s| s.name()).collect();
+    let mut names: Vec<&str> = services.iter().map(|s| s.name()).collect();
     let verifier = verifier(services).expect("load() requires a service that checks credentials");
-    let auth = AuthState::new(oauth, &names, verifier);
-    let routers = services
+    let mut routers: Vec<(&'static str, axum::Router)> = services
         .iter()
         .map(|s| (s.name(), s.clone().router(ctx)))
         .collect();
+    if let Some(router) = combined::router(ctx, services, combined_info()) {
+        names.push(COMBINED);
+        routers.push((COMBINED, router));
+    }
+    let auth = AuthState::new(oauth, &names, verifier);
     build_app(auth, routers).route(
         "/favicon.ico",
         axum::routing::get(|| async {
@@ -123,6 +129,23 @@ pub fn app(
             )
         }),
     )
+}
+
+/// `serverInfo` of the combined `/mcp` endpoint.
+fn combined_info() -> Implementation {
+    Implementation::new(SERVICE_NAME, VERSION).with_icons(icons(
+        include_bytes!("../assets/favicon.png"),
+        include_str!("../assets/favicon.svg"),
+    ))
+}
+
+/// The tool names `/mcp` offers, in order.
+pub fn combined_tool_names(services: &[Arc<dyn Service>]) -> Vec<String> {
+    services
+        .iter()
+        .filter(|s| s.tool_set().is_some())
+        .flat_map(|s| combined::tool_names(s.as_ref()))
+        .collect()
 }
 
 /// Drops any user directive for a capped target and caps it at info, for dependencies that log
@@ -303,6 +326,26 @@ mod tests {
             assert!(
                 name.chars().all(|c| c.is_ascii_lowercase() || c == '-'),
                 "{name} must be a lowercase path segment"
+            );
+            assert_ne!(*name, COMBINED, "{COMBINED} is the combined endpoint");
+        }
+    }
+
+    #[test]
+    fn combined_tool_names_are_unique_and_fit_clients() {
+        let mut e = with_core(&[]);
+        let loaded = load(&mut e, SERVICES).expect("loads");
+        let names = combined_tool_names(&loaded.services);
+        assert_eq!(names.len(), 18);
+        assert!(names.contains(&"companies_search_companies".to_string()));
+        let unique: std::collections::HashSet<_> = names.iter().collect();
+        assert_eq!(unique.len(), names.len());
+        for n in &names {
+            assert!(
+                n.len() <= combined::MAX_TOOL_NAME
+                    && n.chars()
+                        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-'),
+                "{n}"
             );
         }
     }

@@ -104,12 +104,12 @@ jobs:
 
           ### Connect
 
-          Each service is its own MCP server at \`https://<your PUBLIC_URL host>/<service>\`: company data at \`/companies\`. Set \`COMPANIES_HOUSE_SERVICES\` to run only some of them.
+          Every service is at \`https://<your PUBLIC_URL host>/mcp\`, with tool names prefixed by their service (\`companies_search_companies\`). Each service also has its own path: company data at \`/companies\`. Set \`COMPANIES_HOUSE_SERVICES\` to run only some of them.
 
           Each person signs in with their own Companies House REST API key (the server has none). Add \`-e COMPANIES_HOUSE_API_URL=https://api-sandbox.company-information.service.gov.uk\` to serve the sandbox, for sandbox keys.
 
-          - claude.ai: add a custom connector for \`https://<your PUBLIC_URL host>/companies\` and sign in with your Companies House API key.
-          - Claude Code: \`claude mcp add --transport http companies-house https://<host>/companies --header "Authorization: Bearer <your Companies House API key>"\`
+          - claude.ai: add a custom connector for \`https://<your PUBLIC_URL host>/mcp\` and sign in with your Companies House API key.
+          - Claude Code: \`claude mcp add --transport http companies-house https://<host>/mcp --header "Authorization: Bearer <your Companies House API key>"\`
 
           Full configuration reference: https://github.com/${REPO}/blob/${TAG}/README.md
           EOF

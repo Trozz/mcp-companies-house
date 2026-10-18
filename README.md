@@ -5,6 +5,7 @@ A self-hosted [Model Context Protocol](https://modelcontextprotocol.io) server f
 | Service | Path | What it does |
 |---|---|---|
 | Companies | `/companies` | Search and filter companies; read profiles, officers and their appointments, persons with significant control, filing history, charges, insolvency and disqualifications; look up SIC codes; one-call company reports |
+| All services | `/mcp` | Every enabled service's tools in one connector, each name prefixed with its service: `companies_search_companies` |
 
 - Single static Rust binary, shipped as a `FROM scratch` container image.
 - TLS end to end: the server terminates TLS itself, and every call to Companies House is verified.
@@ -25,7 +26,7 @@ The server calls the Companies House [Public Data API](https://developer-specs.c
 
 Keys belong to one environment: a sandbox key is rejected by the live API and the other way round. `COMPANIES_HOUSE_API_URL` sets the environment for the whole server, so everyone needs a key for that environment.
 
-MCP clients reach each service over HTTPS at its path (`https://<host>/companies`). Each person brings their own Companies House REST API key, in one of two ways:
+MCP clients reach each service over HTTPS at its path (`https://<host>/companies`), or every service at once at `https://<host>/mcp`. On `/mcp` each tool name starts with its service's name and an underscore (`companies_get_company`), so tools from different services cannot clash; calls go to the same tools as on the service's own path. Each person brings their own Companies House REST API key, in one of two ways:
 
 - **Sign in (OAuth, for claude.ai and Claude Desktop).** The server's sign-in page asks for the key and checks it with Companies House. It is then encrypted into that connection's OAuth tokens; the server stores nothing.
 - **Key as the bearer token (Claude Code and other clients that can send a header).** The client sends `Authorization: Bearer <key>`. The server checks the key with Companies House the first time it sees it.
@@ -117,7 +118,7 @@ PUBLIC_URL=... OAUTH_SIGNING_KEY=... ./mcp-companies-house
 
 ## Connecting clients
 
-Each service is a separate MCP server, so add one connector per service you want.
+Add one connector for `/mcp` to get every service, or one connector per service you want (`/companies`). They work the same way; `/mcp` only adds the service prefix to tool names.
 
 ### Get your API key
 
@@ -130,7 +131,7 @@ Everyone who uses the server needs their own key:
 ### claude.ai, Claude Desktop and Claude mobile (remote connector)
 
 1. In claude.ai open **Settings**, then **Connectors**, then **Add custom connector**.
-2. Enter `https://<your PUBLIC_URL host>/companies`.
+2. Enter `https://<your PUBLIC_URL host>/mcp` (or `/companies`).
 3. A sign-in page from this server opens, naming the service. Enter your Companies House REST API key.
 
 claude.ai connects from Anthropic's servers, so the server must be reachable from the internet with a **publicly trusted** certificate (directly through `TLS_CERT_PATH`/`TLS_KEY_PATH`, or at a reverse proxy or tunnel in front of it).
@@ -140,7 +141,7 @@ claude.ai connects from Anthropic's servers, so the server must be reachable fro
 Send your key as the bearer token:
 
 ```bash
-claude mcp add --transport http companies-house https://companies-house.example.com/companies \
+claude mcp add --transport http companies-house https://companies-house.example.com/mcp \
   --header "Authorization: Bearer $COMPANIES_HOUSE_API_KEY"
 ```
 
@@ -209,7 +210,7 @@ TLS_CERT_PATH=$PWD/cert.pem TLS_KEY_PATH=$PWD/key.pem ./mcp-companies-house
 - **Who can use it.** Anyone with a valid Companies House REST key for the server's environment. Keys are free, so treat a server reachable from the internet as public; limit who can reach it at the network if that matters. Each person's requests use, and are limited by, their own key.
 - **No stored keys.** At sign-in the key is checked with one Companies House search request, then sealed (ChaCha20-Poly1305, under a key derived from `OAUTH_SIGNING_KEY` with HKDF-SHA256) into that client's access and refresh tokens, and opened again on each request. The server writes no key to disk or logs. The client holds the sealed key inside its tokens and cannot read it.
 - **Keys as bearer tokens** are checked with Companies House on first use. The verdict is cached in memory for 10 minutes (1 minute for a rejected key) under the key's SHA-256, never the key itself. Every Companies House request still uses the key, so a key revoked at Companies House stops working at once.
-- Each service is its own OAuth protected resource (RFC 9728), with metadata at `/.well-known/oauth-protected-resource/<service>`. Access tokens are bound to the service they were issued for (RFC 8707).
+- Each service, and `/mcp`, is its own OAuth protected resource (RFC 9728), with metadata at `/.well-known/oauth-protected-resource/<service>`. Access tokens are bound to the path they were issued for (RFC 8707): a `/companies` token is refused on `/mcp` and the other way round. A `/mcp` token reaches every service's tools.
 - Rejected keys, at the sign-in page or as bearer tokens, are limited to 5 per minute per client, plus 30 per minute across all clients. Behind a reverse proxy, set `TRUSTED_PROXIES` so the per-client limit uses the real client address. When Companies House cannot be reached, the key is not counted as rejected and the client is asked to retry.
 - Access tokens last 1 hour, refresh tokens 30 days. There is no per-client revocation: rotate `OAUTH_SIGNING_KEY` to sign every client out, which also makes every sealed key unreadable.
 - Keys are sent only to `COMPANIES_HOUSE_API_URL`; redirects are not followed.
@@ -244,11 +245,13 @@ pub trait Service: Send + Sync + 'static {
     fn router(self: Arc<Self>, ctx: &ServiceContext) -> axum::Router;
     // How people sign in: checks their credential with the upstream service.
     fn credential_verifier(&self) -> Option<Arc<dyn CredentialVerifier>> { None }
+    // This service's tools on /mcp, built once per session there; None keeps it off /mcp.
+    fn tool_set(&self) -> Option<Box<dyn ToolSet>> { None }
 }
 ```
 
 1. Create `crates/mcp-companies-house-<name>` as a library. Read its own variables in `pub fn from_env(env: &mut ServiceEnv) -> Option<Arc<dyn Service>>`, reporting problems through `env.errors`. Never read the server variables.
-2. Build the MCP endpoint in `router()` with `mcp_server_core::service::mcp_service(ctx, move || Ok(MyServer::new(...)))`. Tools read the caller's key from the request: take `Extension(parts): Extension<http::request::Parts>` and get `mcp_server_core::credential::Credential` from `parts.extensions`.
+2. Build the MCP endpoint in `router()` with `mcp_server_core::service::mcp_service(ctx, move || Ok(MyServer::new(...)))`, and return `Some(Box::new(MyServer::new(...)))` from `tool_set()` to put the tools on `/mcp` too (any rmcp `ServerHandler` is a `ToolSet`). Tools read the caller's key from the request: take `Extension(parts): Extension<http::request::Parts>` and get `mcp_server_core::credential::Credential` from `parts.extensions`.
 3. Add the crate to `crates/mcp-companies-house/Cargo.toml` and one line to `SERVICES` in `crates/mcp-companies-house/src/lib.rs`.
 
 Routing, OAuth metadata, token audiences, `COMPANIES_HOUSE_SERVICES` and the release pipeline pick the new service up without further changes. The server has one sign-in, taken from the first enabled service that defines `credential_verifier`, so a service that needs a different credential (for example a stream key) needs a core change first.
