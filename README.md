@@ -1,254 +1,66 @@
 # mcp-companies-house
 
-A self-hosted [Model Context Protocol](https://modelcontextprotocol.io) server for the UK [Companies House](https://developer.company-information.service.gov.uk) register. MCP clients such as claude.ai, Claude Desktop and Claude Code can search and filter the register, read company profiles, officers, owners, filings, charges and insolvency records, and put together a due-diligence overview of a company.
+A self-hosted [Model Context Protocol](https://modelcontextprotocol.io) server for the UK [Companies House](https://developer.company-information.service.gov.uk) register. MCP clients such as claude.ai, Claude Desktop and Claude Code can search and filter the register, read company profiles, officers, owners, filings, charges and insolvency records, download filed accounts, and screen a company before you deal with it.
 
-| Service | Path | What it does |
-|---|---|---|
-| Companies | `/companies` | Search and filter companies; read profiles, officers and their appointments, persons with significant control, filing history, charges, insolvency and disqualifications; look up SIC codes; one-call company reports |
-| All services | `/mcp` | Every enabled service's tools in one connector, each name prefixed with its service: `companies_search_companies` |
+**Documentation: [trozz.github.io/mcp-companies-house](https://trozz.github.io/mcp-companies-house/)**
 
-- Single static Rust binary, shipped as a `FROM scratch` container image.
-- TLS end to end: the server terminates TLS itself, and every call to Companies House is verified.
-- Each person signs in with their own Companies House API key, so one server serves many people. The server holds no Companies House key.
-- Built-in OAuth 2.1 authorization server so each service works as a claude.ai remote connector. No database, no volume.
+| Endpoint | What it does |
+|---|---|
+| `/companies` | 26 read-only tools and 8 prompts for the register: search and filter companies; profiles, officers and their other appointments, persons with significant control, filing history and filed documents, charges, insolvency, registers, exemptions and disqualifications; SIC code lookup; one-call company reports and due diligence screens |
+| `/mcp` | Every enabled service's tools and prompts in one connector, named `<service>_<tool>`, for example `companies_search_companies` |
+
+- Each person signs in with their own Companies House API key, so one server serves many people. The server holds no key of its own and stores none.
+- A single static Rust binary, also shipped as a `FROM scratch` container image.
+- TLS end to end, and a built-in OAuth 2.1 server so the server works as a claude.ai custom connector. No database.
 - Read only: the public data API cannot change anything at Companies House.
-
-The server is built on [mcp-server-core](https://github.com/Trozz/mcp-server-core-rs), the open-source base for MCP servers it shares with [mcp-icloud](https://github.com/Trozz/mcp-icloud): OAuth, sign-in, TLS, routing and observability live there.
-
-## How it works
-
-The server calls the Companies House [Public Data API](https://developer-specs.company-information.service.gov.uk/companies-house-public-data-api/reference) with the REST API key of the person using it, sent as the HTTP Basic username with a blank password:
-
-| Environment | Host | Data |
-|---|---|---|
-| Live (default) | `api.company-information.service.gov.uk` | The real register |
-| Sandbox | `api-sandbox.company-information.service.gov.uk` | Test companies you create with the test data generator; search answers are mostly empty |
-
-Keys belong to one environment: a sandbox key is rejected by the live API and the other way round. `COMPANIES_HOUSE_API_URL` sets the environment for the whole server, so everyone needs a key for that environment.
-
-MCP clients reach each service over HTTPS at its path (`https://<host>/companies`), or every service at once at `https://<host>/mcp`. On `/mcp` each tool name starts with its service's name and an underscore (`companies_get_company`), so tools from different services cannot clash; calls go to the same tools as on the service's own path. Each person brings their own Companies House REST API key, in one of two ways:
-
-- **Sign in (OAuth, for claude.ai and Claude Desktop).** The server's sign-in page asks for the key and checks it with Companies House. It is then encrypted into that connection's OAuth tokens; the server stores nothing.
-- **Key as the bearer token (Claude Code and other clients that can send a header).** The client sends `Authorization: Bearer <key>`. The server checks the key with Companies House the first time it sees it.
-
-Every Companies House request then uses the caller's own key, so each person has their own rate limit and sees only what their key may see.
-
-`COMPANIES_HOUSE_SERVICES` chooses which services run (default: all). A service that is not enabled is not mounted and does not read its configuration.
-
-## Company tools (`/companies`)
-
-### Finding companies
-
-| Tool | What it does |
-|---|---|
-| `search_companies` | Search by company name or number, best match first. Optional `active_only`. Paged with `limit` (1 to 100, default 20) and `start_index` |
-| `search_all` | One search across companies, officers and disqualified officers, each result with its `kind` and the id the other tools take |
-| `filter_companies` | The Companies House advanced search: `name_includes`, `name_excludes`, `status`, `company_type`, `subtype`, `sic_codes`, `location` (registered office), `incorporated_from`/`incorporated_to`, `dissolved_from`/`dissolved_to`. Filters combine with AND, values within a filter with OR. `total` counts every match, so `limit: 1` counts cheaply |
-| `search_dissolved_companies` | Search dissolved companies by name, or by a name they had before (`match_on: previous_names`) |
-| `check_company_name_availability` | Active companies whose name Companies House treats as the same as a proposed name; `available` is true when there are none. Sensitive words and "too like" rules are not checked |
-| `browse_company_names` | Companies in register (alphabetical) order around a name |
-| `lookup_sic_codes` | Find SIC 2007 codes by words ("bakery", "software development") or digits, or describe codes. Works offline from the Companies House condensed list |
-
-### Reading a company
-
-| Tool | What it does |
-|---|---|
-| `get_company` | Profile: status, type, dates, registered office, SIC codes with descriptions (`nature_of_business`), previous names, accounts and confirmation statement due dates (and whether overdue), and `records_available` (for example `officers`, `charges`, `insolvency`) |
-| `company_report` | One call for due diligence: profile, current officers, current persons with significant control and PSC statements, recent filings, charges not yet satisfied and insolvency cases. Up to 7 Companies House requests (charges and insolvency only when the company has them); sections that fail are listed under `unavailable` instead of failing the call |
-| `due_diligence_check` | Screens a company and returns observations for a reviewer: each a `flag` (look into it) or a `note` (context). Covers status and status detail, insolvency cases, charges not satisfied, overdue accounts and confirmation statement, registered office disputes and undeliverable addresses, directors in post, officer changes in the last 12 months, ownership (PSCs, PSC statements, exemptions), company age and recent name changes. It also tallies identity verification statements of the directors and individual PSCs in post, and flags any past due. Lists `checks_run` and `checks_not_run` (sanctions, politically exposed persons, credit, disqualifications, litigation). Officers and owners are judged by company type: an overseas entity's managing officers count as the people in charge (and are required only when it has not identified all its beneficial owners), limited partnerships and UK establishments have no officer records to check, and missing PSCs are flagged only for the kinds of company the PSC rules cover. It never says a company is sound. Up to 7 requests |
-| `list_officers` | Directors, secretaries, LLP members and others, current and resigned, with `officer_id`, `appointment_id` and `identity_verification` (when Companies House received the person's identity verification statement and when it is due; absent means none on record yet). `current_only` lists only officers in post, using Companies House's `filter=active` (a closed company has none). `role` (`directors`, `secretaries`, `llp_members`) is filtered by the server, which reads up to 500 from `start_index` to fill the page and says how many it read (`officers_read`) |
-| `list_persons_with_significant_control` | Owners and controllers (and beneficial owners of overseas entities) with natures of control, `psc_id` and `identity_verification`; the first page also has the newest 100 PSC statements (`statements_total` when there are more), each with `statement_id` and the `psc_id` it concerns. When there are neither, `note` says whether the company is exempt or the register has a gap |
-| `list_filing_history` | Filings newest first, optionally by `categories` (for example `accounts`, `officers`), with the Companies House description key, `transaction_id` and `document_id` |
-| `get_filing` | One filing by `transaction_id`: the filing record, not the document |
-| `download_filing_document` | A filed document from the Companies House Document API, by `document_id` (or its `document_metadata` link). `format`: `pdf` (default), `xhtml`, `xml` or `json`; a PDF comes back as an embedded resource, the others as text. The formats and size are checked first, so a format the document is not held in, or a document larger than `max_bytes` (default 1 MiB, at most 10 MiB), is refused before downloading. `metadata_only` gives the pages, formats and sizes. The server downloads at most 64 MiB of documents at once across everyone (each download reserves its `max_bytes`), and answers `rate_limited` while that is in use. Live API only: the sandbox has no documents |
-| `list_charges`, `get_charge` | Mortgages and other secured lending: status, lender, what is charged, dates; `get_charge` gives the full record |
-| `get_insolvency` | Insolvency cases with their dates and practitioners |
-| `get_company_registers` | Where the statutory registers (directors, secretaries, PSCs, members) are kept: at Companies House (`public-register`), the registered office or an inspection location, with each move. No record usually means the registered office |
-| `get_exemptions` | Exemptions from disclosure, such as from the PSC rules for companies traded on a regulated market, with the periods they apply and whether they still do |
-| `get_uk_establishments` | The UK branches (`BR` numbers) of an overseas (`FC`) company, with status and locality |
-
-### People
-
-| Tool | What it does |
-|---|---|
-| `search_officers` | Officers by name, with `officer_id` and number of appointments |
-| `get_officer_appointments` | Every appointment of one officer across companies, optionally only current ones, with each appointment's `identity_verification` |
-| `officer_network` | Every company one officer is or was appointed to, split into `current` and `past` (resigned, or the company dissolved or closed), with each company's status and a count by status. Reads the whole appointment list, up to 1000. Takes `officer_id`, or `officer_name` when it matches exactly one officer: names are not unique, so otherwise it lists the candidates |
-| `search_disqualified_officers`, `get_disqualified_officer` | People and companies disqualified from being directors, and the details of each disqualification |
-
-### Prompts
-
-Ready-made requests for common jobs. Clients show them as slash commands or in a prompt menu (on `/mcp` they are prefixed too: `companies_due_diligence`). Each one tells the model which tools to call, in what order, how many requests it may spend, how to set out the answer and what the register cannot say.
-
-| Prompt | Arguments | What it does |
-|---|---|---|
-| `overview` | `company`, optional `since` | A factual summary of one company; with `since`, a timeline of what it has filed since that date |
-| `due_diligence` | `company`, optional `context` | A screen before dealing with a company: the register's flags, disqualification searches and other companies for its directors, who controls it, and, given what the business told you, how that compares with the register. It never clears a company |
-| `director_check` | `name`, optional `company`, `born` | Picks the right person among people with the same name, then maps their appointments, what became of those companies, and any matching disqualification |
-| `ownership_chain` | `company` | Follows corporate owners up the PSC register to the people at the top, and says where the trail stops |
-| `read_accounts` | `company`, optional `focus` | Downloads and reads the latest filed accounts: key figures for two years, the audit position and notes such as going concern (live API only) |
-| `find_companies` | `criteria` | Turns a description such as "active craft breweries in Leeds" into SIC codes and advanced-search filters |
-| `name_check` | `names`, optional `business` | Checks proposed company names for same-name conflicts and close names, and lists what the check does not cover |
-| `watchlist` | `companies`, optional `since` | Status and filing deadlines for up to 20 companies, most urgent first |
-
-Arguments are plain text (up to 2000 characters); a company can be given by name or number. Text that may come from someone else (`context`, the `watchlist` list) is fenced as data, and a value cannot close its fence.
-
-### Conventions
-
-- Companies are addressed by company number. Tools ignore spaces, upper-case letters and pad short numbers with zeros (`445790` becomes `00445790`, `SC1234` becomes `SC001234`). Officers, charges, filings, documents and disqualified officers are addressed by the ids the list and search tools return.
-- Status, type and subtype are the exact Companies House codes (`active`, `liquidation`, `ltd`, `llp`, `community-interest-company`, ...). The tool schema lists every accepted value, so clients cannot send a code the API does not know.
-- Dates are `YYYY-MM-DD`. SIC codes are the 4 or 5 digit SIC 2007 codes, for example `62012`; `lookup_sic_codes` finds them.
-- Officers' and owners' dates of birth are shown as month and year only, as Companies House publishes them.
-- Filing descriptions are Companies House description keys (for example `accounts-with-accounts-type-micro-entity`) with their values, not the wording shown on the Companies House website.
-- List results share one shape: `total`, `start_index`, `count`, `items` and, when more results exist, `next_start_index` to pass as the next `start_index`.
-- `search_companies`, `search_officers` and `search_disqualified_officers` reach only the first 1000 matches (a Companies House limit) and serve pages aligned to `limit`: a `start_index` that is not a multiple of `limit` returns the rest of that page, and `note` says when matches exist beyond the first 1000.
-- Errors are tool results whose text starts with a kind: `validation`, `not_found`, `auth`, `rate_limited`, `upstream` or `internal`.
-
-### Rate limit
-
-Companies House allows 600 requests per 5 minutes per key and answers `429` for the rest of the window once it is used up; applications that keep exceeding it can be banned. The server tracks the `X-Ratelimit-*` headers separately for each person's key: when a key's window is used up, that person's tools return `rate_limited` with the seconds until it resets, without calling Companies House again until then. Other people are not affected. A request is retried once only after a network error or a `5xx`.
-
-### SIC codes
-
-`lookup_sic_codes` and the `nature_of_business` descriptions use Companies House's [SIC 2007 condensed list](https://www.gov.uk/government/publications/standard-industrial-classification-of-economic-activities-sic) (731 codes, including the Companies House codes `74990` Non-trading company and `99999` Dormant Company), stored in `crates/mcp-companies-house-data/data/sic2007.tsv`. Contains public sector information licensed under the Open Government Licence v3.0.
 
 ## Quick start
 
-### 1. Run with Docker
+1. Get a free REST API key: register at the [Companies House Developer Hub](https://developer.company-information.service.gov.uk/get-started/), create a **live** application and add a **REST** key to it. Everyone who uses the server needs their own.
+2. Run the server:
 
-```bash
-docker run -d --name mcp-companies-house -p 8443:8443 \
-  -e PUBLIC_URL=https://companies-house.example.com \
-  -e OAUTH_SIGNING_KEY="$(openssl rand -hex 32)" \
-  -v /path/to/certs:/certs:ro \
-  -e TLS_CERT_PATH=/certs/fullchain.pem \
-  -e TLS_KEY_PATH=/certs/privkey.pem \
-  ghcr.io/trozz/mcp-companies-house:latest
-```
+   ```bash
+   docker run -d --name mcp-companies-house -p 8443:8443 \
+     -e PUBLIC_URL=https://companies-house.example.com \
+     -e OAUTH_SIGNING_KEY="$(openssl rand -hex 32)" \
+     -v /path/to/certs:/certs:ro \
+     -e TLS_CERT_PATH=/certs/fullchain.pem \
+     -e TLS_KEY_PATH=/certs/privkey.pem \
+     ghcr.io/trozz/mcp-companies-house:latest
+   ```
 
-This serves the live register. To serve the sandbox instead, add `-e COMPANIES_HOUSE_API_URL=https://api-sandbox.company-information.service.gov.uk`; people then need sandbox keys. Keep `OAUTH_SIGNING_KEY` stable: changing it signs everyone out. Store it in a secret store, not in shell history.
+   Keep `OAUTH_SIGNING_KEY` stable (changing it signs everyone out) and in a secret store. For the sandbox, add `-e COMPANIES_HOUSE_API_URL=https://api-sandbox.company-information.service.gov.uk` and use keys from a test application.
+3. Connect a client:
+   - **claude.ai, Claude Desktop and mobile**: add a custom connector for `https://companies-house.example.com/mcp` and enter your API key on the sign-in page. claude.ai needs a publicly trusted certificate.
+   - **Claude Code**: `claude mcp add --transport http companies-house https://companies-house.example.com/mcp --header "Authorization: Bearer $COMPANIES_HOUSE_API_KEY"`
 
-### 2. Or run the binary
+See [getting started](https://trozz.github.io/mcp-companies-house/getting-started.html), [connecting clients](https://trozz.github.io/mcp-companies-house/connecting-clients.html), [TLS and public access](https://trozz.github.io/mcp-companies-house/tls.html) and the [configuration reference](https://trozz.github.io/mcp-companies-house/configuration.html).
 
-Download the archive for your platform from [Releases](https://github.com/Trozz/mcp-companies-house/releases), verify the checksum, extract it and run:
+## Using it
 
-```bash
-shasum -a 256 -c mcp-companies-house-<version>-<target>.tar.gz.sha256
-tar -xzf mcp-companies-house-<version>-<target>.tar.gz
-cd mcp-companies-house-<version>-<target>
-PUBLIC_URL=... OAUTH_SIGNING_KEY=... ./mcp-companies-house
-```
+Ask in plain words; the model picks the tools. Give a company number when you have one (`00445790`, `SC123456`), and say which company you mean when several share a name.
 
-`./mcp-companies-house --version` prints the version. `./mcp-companies-house --healthcheck` connects to `127.0.0.1` and exits 0 when the local server answers `/healthz` (used by the image `HEALTHCHECK`). `BIND_ADDR` must therefore listen on loopback; the default `0.0.0.0` does.
+| You want to | Ask, for example | What the model uses |
+|---|---|---|
+| Check a supplier or customer | "Screen ACME WIDGETS LIMITED before I pay their £5,000 deposit invoice" | `due_diligence_check`, `company_report`, disqualified officer searches |
+| Get the facts on a company | "Give me an overview of 00445790 and what it has filed since January" | `company_report`, `list_filing_history` |
+| Look into a director | "What other companies has Jane Anne Smith, born April 1980, been a director of?" | `search_officers`, `officer_network`, `search_disqualified_officers` |
+| Trace who owns a company | "Who ultimately controls 00445790?" | `list_persons_with_significant_control`, followed up the chain |
+| Read the latest accounts | "What were the net assets and cash in the latest accounts of 00445790?" | `list_filing_history`, `download_filing_document` |
+| Find companies | "Active craft breweries in Leeds incorporated since 2022" | `lookup_sic_codes`, `filter_companies` |
+| Check a name before registering | "Is Bright Lane Bakery Ltd available as a company name?" | `check_company_name_availability`, `browse_company_names` |
+| Watch filing deadlines | "Which of these 12 companies have accounts overdue or due this month?" | `get_company` for each |
 
-## Connecting clients
+Each of these jobs is also a ready-made **prompt** that clients show as a slash command or in a menu: `overview`, `due_diligence`, `director_check`, `ownership_chain`, `read_accounts`, `find_companies`, `name_check` and `watchlist` (on `/mcp`, `companies_due_diligence` and so on). A prompt tells the model which tools to call, how many requests to spend and how to set out the answer.
 
-Add one connector for `/mcp` to get every service, or one connector per service you want (`/companies`). They work the same way; `/mcp` only adds the service prefix to tool names. Use one or the other, not both: with both, every tool appears twice. `/mcp` is served whenever a service runs; set `COMPANIES_HOUSE_COMBINED=false` to turn it off.
+Good to know:
 
-### Get your API key
+- The register is public and unverified: companies file it themselves. Nothing here is a credit, sanctions, politically exposed person or identity check, and the due diligence tools never say a company is safe.
+- Each key may make 600 Companies House requests per 5 minutes. When yours is used up, tools say how long to wait; other people are not affected.
+- Officers' dates of birth are month and year only, as Companies House publishes them. Names of people are not unique.
+- The sandbox serves only test companies you generate, and has no filed documents.
 
-Everyone who uses the server needs their own key:
-
-1. Register at the [Companies House Developer Hub](https://developer.company-information.service.gov.uk/get-started/) and create an application. Choose a **live** application for a server on the live register, or **test** for a sandbox server.
-2. In the application, create a **REST** API key. (Stream keys and web OAuth clients are for other APIs and do not work here.)
-3. If you restrict the key to IP addresses, include the address the server calls Companies House from.
-
-### claude.ai, Claude Desktop and Claude mobile (remote connector)
-
-1. In claude.ai open **Settings**, then **Connectors**, then **Add custom connector**.
-2. Enter `https://<your PUBLIC_URL host>/mcp` (or `/companies`).
-3. A sign-in page from this server opens, naming the service. Enter your Companies House REST API key.
-
-claude.ai connects from Anthropic's servers, so the server must be reachable from the internet with a **publicly trusted** certificate (directly through `TLS_CERT_PATH`/`TLS_KEY_PATH`, or at a reverse proxy or tunnel in front of it).
-
-### Claude Code
-
-Send your key as the bearer token:
-
-```bash
-claude mcp add --transport http companies-house https://companies-house.example.com/mcp \
-  --header "Authorization: Bearer $COMPANIES_HOUSE_API_KEY"
-```
-
-`$COMPANIES_HOUSE_API_KEY` here is your own key on your own machine. Keep the client's name for the server short (`companies-house` or `ch`): some clients and model providers limit the full tool name, including the prefix they add, to 64 characters. Without `--header`, Claude Code uses the sign-in page instead (run `/mcp` to authenticate).
-
-## Configuration
-
-Every secret can also be read from a file by appending `_FILE` to its name, for example `OAUTH_SIGNING_KEY_FILE=/run/secrets/oauth-signing-key`. A directly set value wins over the file.
-
-The server has no Companies House key of its own, and has no admin password or static token: setting `MCP_AUTH_TOKEN` stops startup, because everyone signs in with their own key.
-
-### Server
-
-| Variable | Required | Default | Description |
-|---|---|---|---|
-| `COMPANIES_HOUSE_SERVICES` | no | all (`companies`) | Comma separated services to run. An unknown name or an empty list stops startup |
-| `COMPANIES_HOUSE_COMBINED` | no | `true` | Serve every running service's tools together at `/mcp`. `false` turns `/mcp` off (it then answers 404) |
-| `COMPANIES_HOUSE_READ_ONLY` | no | | Comma separated services, or `all`, whose tools that change anything are hidden and refused. No effect today: every tool only reads |
-| `AUDIT_LOG_PATH` | no | | Append a JSON line for every call of a tool that changes anything. No effect today: every tool only reads |
-| `PUBLIC_URL` | yes | | External base URL, for example `https://companies-house.example.com`. `http` is accepted only for `localhost` |
-| `OAUTH_SIGNING_KEY` | yes | | At least 32 bytes. Signs OAuth tokens and encrypts the keys inside them. Rotating it signs everyone out |
-| `TRUSTED_PROXIES` | no | | Comma separated proxy IPs whose `X-Forwarded-For` is trusted for sign-in rate limiting |
-| `ALLOWED_ORIGINS` | no | | Extra allowed `Origin` values, comma separated |
-| `BIND_ADDR` | no | `0.0.0.0:8443` | Listen address. Must listen on loopback (`0.0.0.0` does) so `--healthcheck` can connect to `127.0.0.1` |
-| `TLS_CERT_PATH`, `TLS_KEY_PATH` | no | | PEM certificate chain and key. Reloaded automatically when the files change |
-| `INSECURE_HTTP` | no | `false` | Serve plain HTTP without TLS |
-| `LOG_LEVEL` | no | `info` | Log filter, for example `info,mcp_companies_house_data::api=debug` |
-| `LOG_FORMAT` | no | `json` | `json` or `pretty` |
-| `DEBUG` | no | off | Debug logging: tool arguments, error messages, Companies House paths, statuses and timings. Never logs API keys |
-| `DEBUG_UNSAFE_LOG_CONTENT` | no | off | Also logs full tool results and Companies House response bodies. API keys are never logged |
-| `METRICS_ADDR` | no | | Enables a Prometheus listener, for example `0.0.0.0:9090` |
-| `OTEL_EXPORTER_OTLP_ENDPOINT` | no | | Enables OpenTelemetry trace export over OTLP/HTTP |
-
-### Companies
-
-| Variable | Required | Default | Description |
-|---|---|---|---|
-| `COMPANIES_HOUSE_API_URL` | no | `https://api.company-information.service.gov.uk` | API base URL, and so the environment everyone's keys must belong to. Use `https://api-sandbox.company-information.service.gov.uk` for the sandbox. Must be `https`, except a loopback address for testing |
-| `COMPANIES_HOUSE_DOCUMENT_API_URL` | no | the live Document API with the live API, none otherwise | Where `download_filing_document` fetches filed documents. Companies House has no sandbox Document API, so with the sandbox (or a proxy URL) document downloads are off unless this is set. Same rules as `COMPANIES_HOUSE_API_URL` |
-
-## TLS
-
-The server picks its certificate at startup:
-
-1. `INSECURE_HTTP=true`: plain HTTP. Use only when TLS is terminated elsewhere on a network you trust.
-2. `TLS_CERT_PATH` and `TLS_KEY_PATH` both set: load them. If either file is missing or invalid the server refuses to start; it never falls back silently. Setting only one of them is an error.
-3. Neither set: an in-memory self-signed certificate is generated for the `PUBLIC_URL` host, `localhost`, `127.0.0.1` and `::1`. It is never written to disk and changes on every restart. The log shows its SHA-256 fingerprint.
-
-The self-signed certificate is fine for local use, Claude Code, or encrypting the hop from a reverse proxy or tunnel that skips verification or pins the fingerprint. **It does not work for claude.ai directly**, which requires a publicly trusted certificate.
-
-With certificate files the server sends `Strict-Transport-Security: max-age=31536000`. With a self-signed certificate or plain HTTP it does not, so a proxy or tunnel in front sets its own policy.
-
-### A stable local certificate with mkcert
-
-```bash
-brew install mkcert
-mkcert -install
-mkcert -cert-file cert.pem -key-file key.pem localhost 127.0.0.1 ::1
-TLS_CERT_PATH=$PWD/cert.pem TLS_KEY_PATH=$PWD/key.pem ./mcp-companies-house
-```
-
-## Observability
-
-- Logs go to stdout as JSON by default. Every tool call is a span and is logged with its outcome and duration; OAuth requests are logged the same way. Companies House requests inside a tool call are logged at debug level.
-- Failed tool calls are logged at `warn` with the tool and the error kind only. `DEBUG=1` adds tool arguments (search terms included), error messages, Companies House paths, statuses and timings. API keys and the `Authorization` header are never logged.
-- `DEBUG_UNSAFE_LOG_CONTENT=1` also writes tool results and Companies House response bodies into the logs. The server prints a warning at startup.
-- `METRICS_ADDR` starts a separate Prometheus listener (plain HTTP, keep it on an internal network): `mcp_tool_calls_total`, `mcp_tool_duration_seconds`, `companies_house_requests_total`, `companies_house_request_duration_seconds`, `companies_house_rate_limited_total`, `oauth_requests_total`, `oauth_login_failures_total`, `bearer_credential_checks_total`, `http_requests_total`.
-- `OTEL_EXPORTER_OTLP_ENDPOINT` (with the standard `OTEL_EXPORTER_OTLP_HEADERS`) exports traces over OTLP/HTTP. Nothing is exported unless it is set.
-
-## Security notes
-
-- **Who can use it.** Anyone with a valid Companies House REST key for the server's environment. Keys are free, so treat a server reachable from the internet as public; limit who can reach it at the network if that matters. Each person's requests use, and are limited by, their own key.
-- **No stored keys.** At sign-in the key is checked with one Companies House search request, then sealed (ChaCha20-Poly1305, under a key derived from `OAUTH_SIGNING_KEY` with HKDF-SHA256) into that client's access and refresh tokens, and opened again on each request. The server writes no key to disk or logs. The client holds the sealed key inside its tokens and cannot read it.
-- **Keys as bearer tokens** are checked with Companies House on first use. The verdict is cached in memory for up to 10 minutes (1 minute for a rejected key) under the key's SHA-256, never the key itself. Every Companies House request still uses the key, so a key revoked at Companies House stops working at once. Only values shaped like a Companies House key (8 to 64 letters, digits, dashes and underscores) are ever sent to Companies House; other tokens are refused locally.
-- **Sessions belong to whoever opened them.** Each MCP session is tied to the key that started it. A request naming someone else's session id is answered as if the session did not exist, so a leaked session id is of no use to another person. One key holds at most 50 sessions on each path (`/companies` and `/mcp` count separately); opening another closes that key's least recently used one. When a path holds 10,000 sessions, ended and idle ones are cleared first, then a new session takes a slot from whoever holds clearly more, so nobody is pushed out by someone holding fewer; a key that already holds sessions replaces its own least recently used one instead. Only a key with no session is refused, and only when every key holds about the same share (503 with `Retry-After`). rmcp's session logging is kept out of the logs.
-- Each service, and `/mcp`, is its own OAuth protected resource (RFC 9728), with metadata at `/.well-known/oauth-protected-resource/<service>`. Access tokens are bound to the path they were issued for (RFC 8707): a `/companies` token is refused on `/mcp` and the other way round. A `/mcp` token reaches every service's tools.
-- **Limits on key checks.** Each attempt counts from the moment its check starts. A client (an IP address, or an IPv6 /64) is refused for the rest of the minute once it has 5 attempts that were rejected or are still being checked, and a wider block (an IPv4 /24 or IPv6 /48) once it has 25, so one allocation cannot spread over thousands of addresses (429 with `Retry-After`). Once 30 keys across all clients have been rejected within a minute, a client with a rejection of its own is refused too; checks still in flight never count toward that ceiling. When so many addresses are failing that new ones cannot be tracked, a new address is judged by its block, and only if the blocks cannot be tracked either is it refused as "busy" (503). A check the client abandons still finishes, so it counts only if the key was rejected. Input that cannot be a key is refused without being checked or counted. A key found valid in the last 10 minutes is let in even from a blocked address: its holder has already shown they have it. Behind a reverse proxy, set `TRUSTED_PROXIES` so the limits use the real client address.
-- **Load on Companies House.** At most 16 key checks run at once, each for at most 15 seconds; a check that finds them all busy waits up to 5 seconds for a free one. Parallel requests with the same new key share one check. When Companies House cannot be reached or the server is busy, the key is not counted as rejected and the client is asked to retry (503 with `Retry-After`, on the sign-in page as well as for bearer keys). These limits keep one server usable for its people; a public server facing a large botnet still needs rate limiting at the network or a reverse proxy.
-- Access tokens last 1 hour, refresh tokens 30 days, and every sign-in ends 90 days after it was made however often the client refreshes; then the person signs in again. People are named in logs and the audit log as `key:` and a short hash of their key, keyed by `OAUTH_SIGNING_KEY`. There is no per-client revocation. To end your own sign-ins, revoke the key at Companies House. To sign every client out, rotate `OAUTH_SIGNING_KEY`. If `OAUTH_SIGNING_KEY` ever leaks, rotate it and ask everyone to replace their Companies House key: anyone holding the old signing key could open the sealed keys in codes and tokens they captured.
-- Keys are sent only to `COMPANIES_HOUSE_API_URL` and the Document API (`COMPANIES_HOUSE_DOCUMENT_API_URL`); redirects are not followed, except one: the Document API answers a document download with a redirect to its storage, which is fetched without the key, and only over `https`.
-- Company names, addresses and other filed text are written by the public. The server instructions tell the model to treat them as data, not as instructions.
-- The container runs as UID 65532 with nothing else in the image.
+The documentation describes [what you can ask](https://trozz.github.io/mcp-companies-house/usage.html), [every prompt](https://trozz.github.io/mcp-companies-house/prompts.html) and every tool: [finding companies](https://trozz.github.io/mcp-companies-house/tools/finding.html), [reading a company](https://trozz.github.io/mcp-companies-house/tools/company.html), [filed documents](https://trozz.github.io/mcp-companies-house/tools/documents.html), [people and ownership](https://trozz.github.io/mcp-companies-house/tools/people.html) and [due diligence](https://trozz.github.io/mcp-companies-house/tools/due-diligence.html). [Security](https://trozz.github.io/mcp-companies-house/security.html) explains how keys are handled, and [operations](https://trozz.github.io/mcp-companies-house/operations.html) covers logs, metrics and limits.
 
 ## Development
 
@@ -258,54 +70,11 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all --check
 cargo deny check
 bash scripts/test-next-version.sh
+bash scripts/build-docs.sh
 ```
 
-The tests run against an in-memory fake of the Companies House API. Live smoke tests against the sandbox are ignored by default; they need a sandbox REST key in `COMPANIES_HOUSE_API_KEY` (read only by the tests) and create test companies with the [test data generator](https://developer.company-information.service.gov.uk/api-testing), which they always delete again. The sandbox serves profiles, officers and PSCs for generated companies, but its search index is empty and filing history and PSC statements answer HTTP 500, so those tests check shapes and graceful failure rather than content:
-
-```bash
-COMPANIES_HOUSE_API_KEY=... cargo test -p mcp-companies-house-data --test live_sandbox -- --ignored --nocapture
-```
-
-### Adding a service
-
-Each service is a library crate that implements the `Service` trait from [mcp-server-core](https://github.com/Trozz/mcp-server-core-rs) (`mcp_server_core::service::Service`): a name (its path, OAuth resource and scope, e.g. `companies`) and its rmcp handler, plus optionally its tool names for the startup log, its own router and how people sign in.
-
-1. Create `crates/mcp-companies-house-<name>` as a library. Read its own variables in `pub fn from_env(env: &mut ServiceEnv) -> Option<Arc<dyn Service>>`, reporting problems through `env.errors`. Never read the server variables.
-2. Return `DynHandler::new(MyServer::new(...))` from `handler()` (any rmcp `ServerHandler` fits); the default `router()` serves it at `/<name>` and the combined endpoint serves it at `/mcp`. Mark tools that only read with `read_only_hint = true`. Tools read the caller's key from the request: take `Extension(parts): Extension<http::request::Parts>` and get `mcp_server_core::credential::Credential` from `parts.extensions`.
-3. Add the crate to `crates/mcp-companies-house/Cargo.toml` and one line to `SERVICES` in `crates/mcp-companies-house/src/lib.rs`.
-
-Routing, OAuth metadata, token audiences, `COMPANIES_HOUSE_SERVICES` and the release pipeline pick the new service up without further changes. The server has one sign-in: exactly one enabled service may define `credential_verifier`, and a second one stops the server at startup, so a service that needs a different credential (for example a stream key) needs a core change first.
-
-### Planned services
-
-`docs/plans/streaming-and-filing.md` proposes a `/streaming` service (Streaming API, needs a stream key from a live application) and a `/filing` service (registered office and registered email address changes through the Companies House filing API and OAuth). Neither is built yet.
-
-### The core
-
-OAuth, sign-in, TLS, routing, limits and observability come from [mcp-server-core](https://github.com/Trozz/mcp-server-core-rs) on crates.io, required in the workspace `Cargo.toml`. Fix them there, release it, then raise the version here.
-
-## Releases
-
-- Work happens on `feature/*` and `bugfix/*` branches merged into `develop` by pull request.
-- Every merge into `develop` that touches the server publishes a **pre-release** `vX.Y.Z-dev.N` (GitHub pre-release, image tags `X.Y.Z-dev.N` and `develop`).
-- A pull request from `develop` into `main` publishes a **release** `vX.Y.Z` when merged (image tags `X.Y.Z`, `X.Y`, `X`, `latest`).
-- The version bump comes from the `develop` to `main` pull request: a `major`, `minor` or `patch` label, otherwise `[major]`, `[minor]` or `[patch]` in its title, otherwise patch. Pre-releases on `develop` follow the currently open release pull request.
-- Only merge commits are allowed. Squash and rebase merging are disabled so `develop` and `main` never diverge.
-- Pull requests into `main` must come from `develop` in this repository.
-
-### Repository setup (once)
-
-```bash
-git push origin main:develop
-gh label create major --color B60205 --description "Release: major version bump"
-gh label create minor --color FBCA04 --description "Release: minor version bump"
-gh label create patch --color 0E8A16 --description "Release: patch version bump"
-```
-
-Under **Settings > Actions > General > Workflow permissions**, the workflows must be allowed to grant `contents: write`, `packages: write`, `id-token: write` and `attestations: write` (the jobs request them explicitly through `permissions` blocks).
-
-After the first image is published, set the `mcp-companies-house` package visibility to public under **Packages** on GitHub if you want anonymous pulls.
+The tests run against an in-memory fake of the Companies House API. See [Contributing](https://trozz.github.io/mcp-companies-house/contributing.html) for the live sandbox tests, the documentation tools and adding a tool, prompt or service, and [Releases](https://trozz.github.io/mcp-companies-house/releases.html) for how versions are published. The server is built on [mcp-server-core](https://github.com/Trozz/mcp-server-core-rs), which it shares with [mcp-icloud](https://github.com/Trozz/mcp-icloud).
 
 ## License
 
-MIT
+MIT. The SIC 2007 list in `crates/mcp-companies-house-data/data/sic2007.tsv` contains public sector information licensed under the Open Government Licence v3.0.

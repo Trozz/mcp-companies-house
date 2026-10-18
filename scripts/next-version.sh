@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Computes the next version of the mcp-companies-house server.
-# See README "Releases" for the rules. Writes key=value lines to stdout and $GITHUB_OUTPUT.
+# See docs/src/releases.md for the rules. Writes key=value lines to stdout and $GITHUB_OUTPUT.
 set -euo pipefail
 
 bump_rank() {
