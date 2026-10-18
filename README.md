@@ -13,7 +13,7 @@ A self-hosted [Model Context Protocol](https://modelcontextprotocol.io) server f
 - Built-in OAuth 2.1 authorization server so each service works as a claude.ai remote connector. No database, no volume.
 - Read only: the public data API cannot change anything at Companies House.
 
-The core (OAuth, TLS, routing, observability) started as a copy of `mcp-server-core` from [mcp-icloud](https://github.com/Trozz/mcp-icloud) and lives in `crates/mcp-server-core`, where it gained per-person sign-in.
+The server is built on [mcp-server-core](https://github.com/Trozz/mcp-server-core-rs), the open-source base for MCP servers it shares with [mcp-icloud](https://github.com/Trozz/mcp-icloud): OAuth, sign-in, TLS, routing and observability live there.
 
 ## How it works
 
@@ -151,7 +151,7 @@ claude mcp add --transport http companies-house https://companies-house.example.
 
 Every secret can also be read from a file by appending `_FILE` to its name, for example `OAUTH_SIGNING_KEY_FILE=/run/secrets/oauth-signing-key`. A directly set value wins over the file.
 
-The server has no Companies House key of its own, and has no admin password or static token.
+The server has no Companies House key of its own, and has no admin password or static token: setting `MCP_AUTH_TOKEN` stops startup, because everyone signs in with their own key.
 
 ### Server
 
@@ -159,6 +159,8 @@ The server has no Companies House key of its own, and has no admin password or s
 |---|---|---|---|
 | `COMPANIES_HOUSE_SERVICES` | no | all (`companies`) | Comma separated services to run. An unknown name or an empty list stops startup |
 | `COMPANIES_HOUSE_COMBINED` | no | `true` | Serve every running service's tools together at `/mcp`. `false` turns `/mcp` off (it then answers 404) |
+| `COMPANIES_HOUSE_READ_ONLY` | no | | Comma separated services, or `all`, whose tools that change anything are hidden and refused. No effect today: every tool only reads |
+| `AUDIT_LOG_PATH` | no | | Append a JSON line for every call of a tool that changes anything. No effect today: every tool only reads |
 | `PUBLIC_URL` | yes | | External base URL, for example `https://companies-house.example.com`. `http` is accepted only for `localhost` |
 | `OAUTH_SIGNING_KEY` | yes | | At least 32 bytes. Signs OAuth tokens and encrypts the keys inside them. Rotating it signs everyone out |
 | `TRUSTED_PROXIES` | no | | Comma separated proxy IPs whose `X-Forwarded-For` is trusted for sign-in rate limiting |
@@ -238,23 +240,10 @@ COMPANIES_HOUSE_API_KEY=... cargo test -p mcp-companies-house-data --test live_s
 
 ### Adding a service
 
-Each service is a library crate that implements the `Service` trait from `mcp-server-core::service`:
-
-```rust
-pub trait Service: Send + Sync + 'static {
-    fn name(&self) -> &'static str;            // path, OAuth resource and scope, e.g. "companies"
-    fn tool_names(&self) -> Vec<String>;
-    fn log_caps(&self) -> &'static [&'static str] { &[] }
-    fn router(self: Arc<Self>, ctx: &ServiceContext) -> axum::Router;
-    // How people sign in: checks their credential with the upstream service.
-    fn credential_verifier(&self) -> Option<Arc<dyn CredentialVerifier>> { None }
-    // This service's handler for /mcp, built once per session there.
-    fn handler(&self) -> DynHandler;
-}
-```
+Each service is a library crate that implements the `Service` trait from [mcp-server-core](https://github.com/Trozz/mcp-server-core-rs) (`mcp_server_core::service::Service`): a name (its path, OAuth resource and scope, e.g. `companies`) and its rmcp handler, plus optionally its tool names for the startup log, its own router and how people sign in.
 
 1. Create `crates/mcp-companies-house-<name>` as a library. Read its own variables in `pub fn from_env(env: &mut ServiceEnv) -> Option<Arc<dyn Service>>`, reporting problems through `env.errors`. Never read the server variables.
-2. Build the MCP endpoint in `router()` with `mcp_server_core::service::mcp_service(ctx, move || Ok(MyServer::new(...)))`, and return `DynHandler::new(MyServer::new(...))` from `handler()` so the tools are on `/mcp` too (any rmcp `ServerHandler` fits). The combined endpoint is the same as mcp-icloud's (`mcp_server_core::combined`). Tools read the caller's key from the request: take `Extension(parts): Extension<http::request::Parts>` and get `mcp_server_core::credential::Credential` from `parts.extensions`.
+2. Return `DynHandler::new(MyServer::new(...))` from `handler()` (any rmcp `ServerHandler` fits); the default `router()` serves it at `/<name>` and the combined endpoint serves it at `/mcp`. Mark tools that only read with `read_only_hint = true`. Tools read the caller's key from the request: take `Extension(parts): Extension<http::request::Parts>` and get `mcp_server_core::credential::Credential` from `parts.extensions`.
 3. Add the crate to `crates/mcp-companies-house/Cargo.toml` and one line to `SERVICES` in `crates/mcp-companies-house/src/lib.rs`.
 
 Routing, OAuth metadata, token audiences, `COMPANIES_HOUSE_SERVICES` and the release pipeline pick the new service up without further changes. The server has one sign-in, taken from the first enabled service that defines `credential_verifier`, so a service that needs a different credential (for example a stream key) needs a core change first.
@@ -265,7 +254,7 @@ Routing, OAuth metadata, token audiences, `COMPANIES_HOUSE_SERVICES` and the rel
 
 ### The core
 
-`crates/mcp-server-core` was copied from `Trozz/mcp-icloud` at commit `d98557d` and has since gained per-person sign-in (`src/credential.rs`; `OAUTH_ADMIN_PASSWORD` and `MCP_AUTH_TOKEN` removed). Port fixes between the two by hand.
+OAuth, sign-in, TLS, routing, limits and observability come from [mcp-server-core](https://github.com/Trozz/mcp-server-core-rs), pinned in the workspace `Cargo.toml`. Fix them there and update the pin.
 
 ## Releases
 
